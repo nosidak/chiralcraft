@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ChiralCraft
+GenericName=Chemical Structure Editor
+Comment=Pure-Rust scientific chemical structure editor with PubChem/ChEMBL search and editable SVG round-trip
+Exec=chiralcraft %f
+Icon=chiralcraft
+Terminal=false
+Categories=Science;Chemistry;Education;Graphics;
+MimeType=chemical/x-cdx;chemical/x-cdxml;chemical/x-mdl-molfile;chemical/x-mdl-sdfile;image/svg+xml;
+StartupWMClass=ChiralCraft

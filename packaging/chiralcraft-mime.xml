@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="chemical/x-cdxml">
+    <comment>CDXML Chemical Document</comment>
+    <glob pattern="*.cdxml"/>
+  </mime-type>
+  <mime-type type="chemical/x-cdx">
+    <comment>CDX Binary Chemical Document</comment>
+    <glob pattern="*.cdx"/>
+  </mime-type>
+  <mime-type type="chemical/x-mdl-molfile">
+    <comment>MDL Molfile Chemical Structure</comment>
+    <glob pattern="*.mol"/>
+  </mime-type>
+  <mime-type type="chemical/x-mdl-sdfile">
+    <comment>MDL Structure-Data File</comment>
+    <glob pattern="*.sdf"/>
+    <glob pattern="*.sd"/>
+  </mime-type>
+  <mime-type type="chemical/x-xyz">
+    <comment>XYZ 3D Molecular Coordinates</comment>
+    <glob pattern="*.xyz"/>
+  </mime-type>
+  <mime-type type="chemical/x-cif">
+    <comment>Crystallographic Information File</comment>
+    <glob pattern="*.cif"/>
+  </mime-type>
+  <mime-type type="chemical/x-pdb">
+    <comment>Protein Data Bank 3D Structure</comment>
+    <glob pattern="*.pdb"/>
+  </mime-type>
+</mime-info>

@@ -1,0 +1,636 @@
+//! Pure-Rust 3D `.xyz` & `.cif` (Crystallographic Information File) Importers
+//!
+//! - Parses Cartesian `.xyz` coordinates and crystallographic fractional `.cif` coordinates
+//!   (full triclinic/monoclinic/orthorhombic/hexagonal/cubic fractional→Cartesian transform)
+//! - Infers covalent bonds automatically via standard Pyykkö/Cordero covalent radii
+//! - Preserves full `z_coord` (`has_3d_coords = true`) for 3D perspective tilt & Rear Opacity depth cueing
+
+use chiralcraft_chem::{get_element_by_symbol, BondDisplay, ChemAtom, ChemMolecule};
+
+/// Crystallographic unit cell in the same scaled coordinate frame as the imported `ChemMolecule`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrystalUnitCell {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub alpha: f64,
+    pub beta: f64,
+    pub gamma: f64,
+    pub origin: (f64, f64, f64),
+    pub va: (f64, f64, f64),
+    pub vb: (f64, f64, f64),
+    pub vc: (f64, f64, f64),
+}
+
+impl CrystalUnitCell {
+    /// Returns the 8 corner vertices of the parallelepiped unit cell.
+    pub fn corners(&self) -> [(f64, f64, f64); 8] {
+        let (ox, oy, oz) = self.origin;
+        let add = |u: (f64, f64, f64), v: (f64, f64, f64)| (u.0 + v.0, u.1 + v.1, u.2 + v.2);
+        let c000 = (ox, oy, oz);
+        let c100 = add(c000, self.va);
+        let c010 = add(c000, self.vb);
+        let c001 = add(c000, self.vc);
+        let c110 = add(c100, self.vb);
+        let c101 = add(c100, self.vc);
+        let c011 = add(c010, self.vc);
+        let c111 = add(c110, self.vc);
+        [c000, c100, c010, c110, c001, c101, c011, c111]
+    }
+
+    /// Standard 12 edges indexing into `corners()`.
+    pub fn edge_indices() -> [(usize, usize); 12] {
+        [
+            (0, 1), (0, 2), (0, 4),
+            (1, 3), (1, 5),
+            (2, 3), (2, 6),
+            (4, 5), (4, 6),
+            (3, 7), (5, 7), (6, 7),
+        ]
+    }
+}
+
+/// Approximate single-bond covalent radius in Ångströms for automatic 3D bond perception.
+fn covalent_radius_angstrom(z: i32) -> f64 {
+    match z {
+        1 => 0.31,
+        5 => 0.84,
+        6 => 0.76,
+        7 => 0.71,
+        8 => 0.66,
+        9 => 0.57,
+        14 => 1.11,
+        15 => 1.07,
+        16 => 1.05,
+        17 => 1.02,
+        26 => 1.32,
+        27 => 1.26,
+        28 => 1.24,
+        29 => 1.32,
+        30 => 1.22,
+        35 => 1.20,
+        44 => 1.46,
+        45 => 1.42,
+        46 => 1.39,
+        53 => 1.39,
+        77 => 1.41,
+        78 => 1.36,
+        79 => 1.36,
+        _ if z <= 10 => 0.75,
+        _ if z <= 18 => 1.10,
+        _ => 1.35,
+    }
+}
+
+/// Infer bonds from 3D Cartesian coordinates (in Å) using covalent radii, then scale `(x, y, z)` to `bond_length_pt`.
+/// Returns `(scale, (cx, cy, cz))` so crystallographic unit cell vectors can be transformed into the same coordinate frame.
+fn perceive_3d_bonds_and_scale_with_transform(
+    mol: &mut ChemMolecule,
+    coords_ang: &[(f64, f64, f64)],
+    target_blen: f64,
+    perceive_bonds: bool,
+) -> (f64, (f64, f64, f64)) {
+    let n = mol.atoms.len();
+    let mut next_bid = (mol.bonds.len() as u32) + (n as u32) + 1;
+    let mut bond_lens_ang = Vec::new();
+
+    if perceive_bonds {
+        for i in 0..n {
+            let zi = mol.atoms[i].z;
+            let ri = covalent_radius_angstrom(zi);
+            let (xi, yi, zci) = coords_ang[i];
+            for j in (i + 1)..n {
+                let zj = mol.atoms[j].z;
+                if zi == 1 && zj == 1 && n > 2 {
+                    continue;
+                }
+                let rj = covalent_radius_angstrom(zj);
+                let (xj, yj, zcj) = coords_ang[j];
+                let d = ((xj - xi).powi(2) + (yj - yi).powi(2) + (zcj - zci).powi(2)).sqrt();
+                let max_d = (ri + rj) * 1.22;
+                if d > 0.42 && d <= max_d {
+                    let ord = if zi == 6 && zj == 6 && d < 1.24 {
+                        3
+                    } else if zi == 6 && zj == 6 && d < 1.37 {
+                        2
+                    } else if ((zi == 6 && zj == 8) || (zi == 8 && zj == 6)) && d < 1.27 {
+                        2
+                    } else if ((zi == 6 && zj == 7) || (zi == 7 && zj == 6)) && d < 1.19 {
+                        3
+                    } else if ((zi == 6 && zj == 7) || (zi == 7 && zj == 6)) && d < 1.32 {
+                        2
+                    } else {
+                        1
+                    };
+                    mol.add_bond(next_bid, i, j, ord, BondDisplay::Solid);
+                    next_bid += 1;
+                    if zi > 1 && zj > 1 {
+                        bond_lens_ang.push(d);
+                    }
+                }
+            }
+        }
+    } else {
+        for b in &mol.bonds {
+            if b.begin_atom < n && b.end_atom < n {
+                let (xi, yi, zci) = coords_ang[b.begin_atom];
+                let (xj, yj, zcj) = coords_ang[b.end_atom];
+                let d = ((xj - xi).powi(2) + (yj - yi).powi(2) + (zcj - zci).powi(2)).sqrt();
+                if d > 0.4 {
+                    bond_lens_ang.push(d);
+                }
+            }
+        }
+    }
+
+    let median_ang = if !bond_lens_ang.is_empty() {
+        bond_lens_ang.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        bond_lens_ang[bond_lens_ang.len() / 2]
+    } else {
+        1.50
+    };
+    let scale = target_blen / median_ang.max(0.5);
+
+    let mut cx = 0.0;
+    let mut cy = 0.0;
+    let mut cz = 0.0;
+    for &(x, y, z) in coords_ang {
+        cx += x;
+        cy += y;
+        cz += z;
+    }
+    let nf = (n.max(1)) as f64;
+    cx /= nf;
+    cy /= nf;
+    cz /= nf;
+
+    for (i, &(x, y, z)) in coords_ang.iter().enumerate() {
+        mol.atoms[i].x = 220.0 + (x - cx) * scale;
+        mol.atoms[i].y = 170.0 - (y - cy) * scale;
+        mol.atoms[i].z_coord = (z - cz) * scale;
+    }
+    mol.has_3d_coords = true;
+    (scale, (cx, cy, cz))
+}
+
+fn perceive_3d_bonds_and_scale(mol: &mut ChemMolecule, coords_ang: &[(f64, f64, f64)], target_blen: f64) {
+    let _ = perceive_3d_bonds_and_scale_with_transform(mol, coords_ang, target_blen, true);
+}
+
+/// Parses an `.xyz` 3D molecular coordinate file into a `ChemMolecule` with perceived bonds and `has_3d_coords = true`.
+pub fn xyz_to_molecule(xyz: &str) -> Result<ChemMolecule, String> {
+    let lines: Vec<&str> = xyz.lines().collect();
+    if lines.len() < 3 {
+        return Err("XYZ file too short (expected atom count, comment, and coordinates)".to_string());
+    }
+    let expected_n: usize = lines[0]
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid atom count on line 1 of XYZ file".to_string())?;
+    let mut mol = ChemMolecule::new();
+    let mut coords = Vec::new();
+    for (idx, line) in lines.iter().skip(2).enumerate() {
+        if coords.len() >= expected_n {
+            break;
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() < 4 {
+            continue;
+        }
+        let sym = toks[0].trim_end_matches(|c: char| c.is_ascii_digit() || c == '+' || c == '-');
+        let z = get_element_by_symbol(sym).map(|e| e.z).unwrap_or(6);
+        let x: f64 = toks[1].parse().map_err(|_| format!("Bad X coord at XYZ line {}", idx + 3))?;
+        let y: f64 = toks[2].parse().map_err(|_| format!("Bad Y coord at XYZ line {}", idx + 3))?;
+        let zc: f64 = toks[3].parse().map_err(|_| format!("Bad Z coord at XYZ line {}", idx + 3))?;
+        mol.add_atom(ChemAtom::new((coords.len() + 1) as u32, z));
+        coords.push((x, y, zc));
+    }
+    if mol.atoms.is_empty() {
+        return Err("No valid atom coordinates found in XYZ file".to_string());
+    }
+    perceive_3d_bonds_and_scale(&mut mol, &coords, 14.40);
+    Ok(mol)
+}
+
+fn parse_cif_float(s: &str) -> Option<f64> {
+    // Strip crystallographic standard uncertainty in parentheses, e.g. "12.345(6)" -> 12.345
+    let clean = s.split('(').next()?.trim();
+    clean.parse::<f64>().ok()
+}
+
+fn extract_cif_element(raw: &str) -> i32 {
+    let letters: String = raw
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    if letters.len() >= 2 {
+        let two = format!(
+            "{}{}",
+            letters.chars().next().unwrap().to_ascii_uppercase(),
+            letters.chars().nth(1).unwrap().to_ascii_lowercase()
+        );
+        if let Some(el) = get_element_by_symbol(&two) {
+            return el.z;
+        }
+    }
+    if let Some(ch) = letters.chars().next() {
+        let one = ch.to_ascii_uppercase().to_string();
+        if let Some(el) = get_element_by_symbol(&one) {
+            return el.z;
+        }
+    }
+    6
+}
+
+/// Parses a `.cif` (Crystallographic Information File) asymmetric unit into a 3D `ChemMolecule`
+/// AND its scaled `CrystalUnitCell` using the exact crystallographic fractional-to-Cartesian matrix.
+pub fn cif_to_molecule_with_cell(cif: &str) -> Result<(ChemMolecule, CrystalUnitCell), String> {
+    let mut a = 10.0_f64;
+    let mut b = 10.0_f64;
+    let mut c = 10.0_f64;
+    let mut alpha = 90.0_f64;
+    let mut beta = 90.0_f64;
+    let mut gamma = 90.0_f64;
+
+    let lines: Vec<&str> = cif.lines().collect();
+    for line in &lines {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let mut parts = t.split_whitespace();
+        let Some(key) = parts.next() else { continue };
+        let Some(val) = parts.next() else { continue };
+        match key {
+            "_cell_length_a" => { if let Some(v) = parse_cif_float(val) { a = v; } }
+            "_cell_length_b" => { if let Some(v) = parse_cif_float(val) { b = v; } }
+            "_cell_length_c" => { if let Some(v) = parse_cif_float(val) { c = v; } }
+            "_cell_angle_alpha" => { if let Some(v) = parse_cif_float(val) { alpha = v; } }
+            "_cell_angle_beta" => { if let Some(v) = parse_cif_float(val) { beta = v; } }
+            "_cell_angle_gamma" => { if let Some(v) = parse_cif_float(val) { gamma = v; } }
+            _ => {}
+        }
+    }
+
+    // Build fractional -> Cartesian orthogonalization matrix (standard crystallographic convention)
+    let ar = alpha.to_radians();
+    let br = beta.to_radians();
+    let gr = gamma.to_radians();
+    let cos_a = ar.cos();
+    let cos_b = br.cos();
+    let cos_g = gr.cos();
+    let sin_g = gr.sin().max(1e-6);
+    let vol_factor = (1.0 - cos_a * cos_a - cos_b * cos_b - cos_g * cos_g + 2.0 * cos_a * cos_b * cos_g)
+        .max(1e-9)
+        .sqrt();
+    let m11 = a;
+    let m12 = b * cos_g;
+    let m13 = c * cos_b;
+    let m22 = b * sin_g;
+    let m23 = c * (cos_a - cos_b * cos_g) / sin_g;
+    let m33 = c * vol_factor / sin_g;
+
+    let mut mol = ChemMolecule::new();
+    let mut coords = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().eq_ignore_ascii_case("loop_") {
+            i += 1;
+            let mut cols = Vec::new();
+            while i < lines.len() && lines[i].trim().starts_with('_') {
+                cols.push(lines[i].trim().to_string());
+                i += 1;
+            }
+            let ix = cols.iter().position(|k| k == "_atom_site_fract_x");
+            let iy = cols.iter().position(|k| k == "_atom_site_fract_y");
+            let iz = cols.iter().position(|k| k == "_atom_site_fract_z");
+            let isym = cols
+                .iter()
+                .position(|k| k == "_atom_site_type_symbol")
+                .or_else(|| cols.iter().position(|k| k == "_atom_site_label"));
+            if let (Some(ix), Some(iy), Some(iz), Some(isym)) = (ix, iy, iz, isym) {
+                while i < lines.len() {
+                    let row = lines[i].trim();
+                    if row.is_empty()
+                        || row.starts_with('#')
+                        || row.starts_with("loop_")
+                        || row.starts_with('_')
+                        || row.starts_with("data_")
+                    {
+                        break;
+                    }
+                    let toks: Vec<&str> = row.split_whitespace().collect();
+                    let need = ix.max(iy).max(iz).max(isym);
+                    if toks.len() > need {
+                        if let (Some(fx), Some(fy), Some(fz)) = (
+                            parse_cif_float(toks[ix]),
+                            parse_cif_float(toks[iy]),
+                            parse_cif_float(toks[iz]),
+                        ) {
+                            let z = extract_cif_element(toks[isym]);
+                            let cx = m11 * fx + m12 * fy + m13 * fz;
+                            let cy = m22 * fy + m23 * fz;
+                            let cz = m33 * fz;
+                            mol.add_atom(ChemAtom::new((coords.len() + 1) as u32, z));
+                            coords.push((cx, cy, cz));
+                        }
+                    }
+                    i += 1;
+                }
+                if !mol.atoms.is_empty() {
+                    break;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    if mol.atoms.is_empty() {
+        return Err("No _atom_site_fract_x/y/z records found in CIF file".to_string());
+    }
+    let (scale, (cx, cy, cz)) = perceive_3d_bonds_and_scale_with_transform(&mut mol, &coords, 14.40, true);
+    let cell = CrystalUnitCell {
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+        gamma,
+        origin: (220.0 - cx * scale, 170.0 + cy * scale, -cz * scale),
+        va: (m11 * scale, 0.0, 0.0),
+        vb: (m12 * scale, -m22 * scale, 0.0),
+        vc: (m13 * scale, -m23 * scale, m33 * scale),
+    };
+    Ok((mol, cell))
+}
+
+/// Parses a `.cif` (Crystallographic Information File) asymmetric unit into a 3D `ChemMolecule`.
+pub fn cif_to_molecule(cif: &str) -> Result<ChemMolecule, String> {
+    cif_to_molecule_with_cell(cif).map(|(m, _)| m)
+}
+
+/// Parses a Protein Data Bank (`.pdb`) structure (`ATOM` / `HETATM` + optional `CONECT` records)
+/// into a 3D `ChemMolecule` (`has_3d_coords = true`).
+pub fn pdb_to_molecule(pdb: &str) -> Result<ChemMolecule, String> {
+    let mut mol = ChemMolecule::new();
+    let mut coords = Vec::new();
+    let mut serial_to_idx: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    let mut conect_pairs: Vec<(i32, i32)> = Vec::new();
+
+    for line in pdb.lines() {
+        if line.starts_with("ATOM  ") || line.starts_with("HETATM") {
+            let serial: i32 = line
+                .get(6..11)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or((coords.len() + 1) as i32);
+            let x = line.get(30..38).and_then(|s| s.trim().parse::<f64>().ok());
+            let y = line.get(38..46).and_then(|s| s.trim().parse::<f64>().ok());
+            let zc = line.get(46..54).and_then(|s| s.trim().parse::<f64>().ok());
+            let (Some(x), Some(y), Some(zc)) = (x, y, zc) else {
+                continue;
+            };
+            let elem_raw = line
+                .get(76..78)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| line.get(12..16).map(|s| s.trim()).unwrap_or("C"));
+            let z = extract_cif_element(elem_raw);
+            let idx = mol.atoms.len();
+            serial_to_idx.insert(serial, idx);
+            mol.add_atom(ChemAtom::new((idx + 1) as u32, z));
+            coords.push((x, y, zc));
+        } else if line.starts_with("CONECT") {
+            let toks: Vec<i32> = line[6..]
+                .split_whitespace()
+                .filter_map(|t| t.parse::<i32>().ok())
+                .collect();
+            if toks.len() >= 2 {
+                let a = toks[0];
+                for &b in &toks[1..] {
+                    if a < b {
+                        conect_pairs.push((a, b));
+                    }
+                }
+            }
+        }
+    }
+    if mol.atoms.is_empty() {
+        return Err("No ATOM/HETATM coordinate records found in PDB file".to_string());
+    }
+    let mut used_conect = false;
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut next_bid = (mol.atoms.len() as u32) + 1;
+    for (sa, sb) in conect_pairs {
+        if let (Some(&ia), Some(&ib)) = (serial_to_idx.get(&sa), serial_to_idx.get(&sb)) {
+            let key = if ia < ib { (ia, ib) } else { (ib, ia) };
+            if ia != ib && seen.insert(key) {
+                mol.add_bond(next_bid, ia, ib, 1, BondDisplay::Solid);
+                next_bid += 1;
+                used_conect = true;
+            }
+        }
+    }
+    let _ = perceive_3d_bonds_and_scale_with_transform(&mut mol, &coords, 14.40, !used_conect);
+    Ok(mol)
+}
+
+/// Parses a VASP `POSCAR` / `CONTCAR` crystal file into a 3D `ChemMolecule` + `CrystalUnitCell`.
+pub fn poscar_to_molecule_with_cell(poscar: &str) -> Result<(ChemMolecule, CrystalUnitCell), String> {
+    let lines: Vec<&str> = poscar.lines().map(|l| l.trim()).collect();
+    if lines.len() < 8 {
+        return Err("POSCAR/CONTCAR file too short".to_string());
+    }
+    let scale_factor: f64 = lines[1]
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "Invalid scale factor on line 2 of POSCAR".to_string())?;
+    let parse_vec3 = |line: &str| -> Result<(f64, f64, f64), String> {
+        let vals: Vec<f64> = line
+            .split_whitespace()
+            .take(3)
+            .filter_map(|t| t.parse::<f64>().ok())
+            .collect();
+        if vals.len() < 3 {
+            return Err(format!("Expected 3 lattice vector components in POSCAR line: {line}"));
+        }
+        Ok((vals[0] * scale_factor, vals[1] * scale_factor, vals[2] * scale_factor))
+    };
+    let va_ang = parse_vec3(lines[2])?;
+    let vb_ang = parse_vec3(lines[3])?;
+    let vc_ang = parse_vec3(lines[4])?;
+
+    // Line 6 may be element symbols (VASP 5+) or counts (VASP 4)
+    let tok5: Vec<&str> = lines[5].split_whitespace().collect();
+    let (species, counts_line_idx): (Vec<i32>, usize) = if tok5.iter().all(|t| t.parse::<usize>().is_ok()) {
+        (vec![6; tok5.len()], 5)
+    } else {
+        let zs = tok5.iter().map(|s| extract_cif_element(s)).collect();
+        (zs, 6)
+    };
+    let counts: Vec<usize> = lines
+        .get(counts_line_idx)
+        .ok_or_else(|| "Missing atom counts line in POSCAR".to_string())?
+        .split_whitespace()
+        .filter_map(|t| t.parse::<usize>().ok())
+        .collect();
+    if counts.is_empty() {
+        return Err("No atom counts found in POSCAR".to_string());
+    }
+    let mut mode_idx = counts_line_idx + 1;
+    if lines
+        .get(mode_idx)
+        .map(|l| l.to_ascii_lowercase().starts_with('s'))
+        .unwrap_or(false)
+    {
+        mode_idx += 1; // Skip "Selective dynamics"
+    }
+    let mode_line = lines
+        .get(mode_idx)
+        .ok_or_else(|| "Missing Direct/Cartesian line in POSCAR".to_string())?;
+    let is_direct = !mode_line.to_ascii_lowercase().starts_with('c')
+        && !mode_line.to_ascii_lowercase().starts_with('k');
+
+    let mut atom_zs = Vec::new();
+    for (si, &cnt) in counts.iter().enumerate() {
+        let z = species.get(si).copied().unwrap_or(6);
+        for _ in 0..cnt {
+            atom_zs.push(z);
+        }
+    }
+    let mut mol = ChemMolecule::new();
+    let mut coords = Vec::new();
+    for (k, &z) in atom_zs.iter().enumerate() {
+        let Some(line) = lines.get(mode_idx + 1 + k) else {
+            break;
+        };
+        let vals: Vec<f64> = line
+            .split_whitespace()
+            .take(3)
+            .filter_map(|t| t.parse::<f64>().ok())
+            .collect();
+        if vals.len() < 3 {
+            continue;
+        }
+        let (x, y, zc) = if is_direct {
+            (
+                vals[0] * va_ang.0 + vals[1] * vb_ang.0 + vals[2] * vc_ang.0,
+                vals[0] * va_ang.1 + vals[1] * vb_ang.1 + vals[2] * vc_ang.1,
+                vals[0] * va_ang.2 + vals[1] * vb_ang.2 + vals[2] * vc_ang.2,
+            )
+        } else {
+            (vals[0] * scale_factor, vals[1] * scale_factor, vals[2] * scale_factor)
+        };
+        mol.add_atom(ChemAtom::new((coords.len() + 1) as u32, z));
+        coords.push((x, y, zc));
+    }
+    if mol.atoms.is_empty() {
+        return Err("No valid atom positions found in POSCAR".to_string());
+    }
+    let (scale, (cx, cy, cz)) = perceive_3d_bonds_and_scale_with_transform(&mut mol, &coords, 14.40, true);
+    let norm = |v: (f64, f64, f64)| (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt();
+    let dot = |u: (f64, f64, f64), v: (f64, f64, f64)| u.0 * v.0 + u.1 * v.1 + u.2 * v.2;
+    let a = norm(va_ang).max(1e-6);
+    let b = norm(vb_ang).max(1e-6);
+    let c = norm(vc_ang).max(1e-6);
+    let alpha = (dot(vb_ang, vc_ang) / (b * c)).clamp(-1.0, 1.0).acos().to_degrees();
+    let beta = (dot(va_ang, vc_ang) / (a * c)).clamp(-1.0, 1.0).acos().to_degrees();
+    let gamma = (dot(va_ang, vb_ang) / (a * b)).clamp(-1.0, 1.0).acos().to_degrees();
+    let cell = CrystalUnitCell {
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+        gamma,
+        origin: (220.0 - cx * scale, 170.0 + cy * scale, -cz * scale),
+        va: (va_ang.0 * scale, -va_ang.1 * scale, va_ang.2 * scale),
+        vb: (vb_ang.0 * scale, -vb_ang.1 * scale, vb_ang.2 * scale),
+        vc: (vc_ang.0 * scale, -vc_ang.1 * scale, vc_ang.2 * scale),
+    };
+    Ok((mol, cell))
+}
+
+/// Parses a VASP `POSCAR` / `CONTCAR` file into a 3D `ChemMolecule`.
+pub fn poscar_to_molecule(poscar: &str) -> Result<ChemMolecule, String> {
+    poscar_to_molecule_with_cell(poscar).map(|(m, _)| m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xyz_and_cif_3d_import_and_bonding() {
+        let water_xyz = "\
+3
+Water molecule
+O   0.0000   0.0000   0.0000
+H   0.7570   0.5860   0.0000
+H  -0.7570   0.5860   0.0000
+";
+        let w = xyz_to_molecule(water_xyz).expect("xyz water");
+        assert_eq!(w.atoms.len(), 3);
+        assert_eq!(w.bonds.len(), 2);
+        assert!(w.has_3d_coords);
+
+        let sample_cif = "\
+data_ethanol
+_cell_length_a   10.000(2)
+_cell_length_b   10.000(2)
+_cell_length_c   10.000(2)
+_cell_angle_alpha 90.0
+_cell_angle_beta  90.0
+_cell_angle_gamma 90.0
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+C1 C 0.000 0.000 0.000
+C2 C 0.154 0.000 0.000
+O1 O 0.220 0.125 0.050
+";
+        let (eth, cell) = cif_to_molecule_with_cell(sample_cif).expect("cif ethanol");
+        assert_eq!(eth.atoms.len(), 3);
+        assert_eq!(eth.bonds.len(), 2);
+        assert!(eth.has_3d_coords);
+        assert!(eth.atoms[2].z_coord.abs() > 0.1);
+        assert!((cell.a - 10.0).abs() < 1e-6);
+        assert_eq!(cell.corners().len(), 8);
+
+        let sample_pdb = "\
+ATOM      1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C
+ATOM      2  C2  LIG A   1       1.520   0.000   0.000  1.00  0.00           C
+ATOM      3  O1  LIG A   1       2.150   1.210   0.450  1.00  0.00           O
+CONECT    1    2
+CONECT    2    3
+END
+";
+        let pdb_mol = pdb_to_molecule(sample_pdb).expect("pdb ethanol");
+        assert_eq!(pdb_mol.atoms.len(), 3);
+        assert_eq!(pdb_mol.bonds.len(), 2);
+        assert!(pdb_mol.has_3d_coords);
+
+        let sample_poscar = "\
+Si2 diamond demo
+1.0
+5.43 0.00 0.00
+0.00 5.43 0.00
+0.00 0.00 5.43
+Si
+2
+Direct
+0.00 0.00 0.00
+0.25 0.25 0.25
+";
+        let (si_mol, si_cell) = poscar_to_molecule_with_cell(sample_poscar).expect("poscar Si");
+        assert_eq!(si_mol.atoms.len(), 2);
+        assert_eq!(si_mol.atoms[0].z, 14);
+        assert_eq!(si_mol.bonds.len(), 1);
+        assert!((si_cell.a - 5.43).abs() < 1e-6);
+    }
+}

@@ -1,0 +1,29 @@
+name: ChiralCraft CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run full workspace tests
+        run: cargo test --workspace
+      - name: Build optimized release binary
+        run: cargo build -p chiralcraft-app --release
+      - name: Smoke-test CLI & MCP server
+        run: |
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | ./target/release/chiralcraft --mcp

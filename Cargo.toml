@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chiralcraft-tables",
+    "crates/chiralcraft-chem",
+    "crates/chiralcraft-formats",
+    "crates/chiralcraft-doc",
+    "crates/chiralcraft-app",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["nosidak"]
+repository = "https://github.com/nosidak/chiralcraft"
+homepage = "https://github.com/nosidak/chiralcraft"
+
+[profile.release]
+strip = "symbols"

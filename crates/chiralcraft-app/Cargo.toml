@@ -1,0 +1,20 @@
+[package]
+name = "chiralcraft-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "ChiralCraft — Pure-Rust scientific chemical structure editor & CLI"
+
+[[bin]]
+name = "chiralcraft"
+path = "src/main.rs"
+
+[dependencies]
+chiralcraft-chem = { path = "../chiralcraft-chem" }
+chiralcraft-formats = { path = "../chiralcraft-formats" }
+chiralcraft-doc = { path = "../chiralcraft-doc" }
+eframe = "0.31"
+egui = "0.31"
