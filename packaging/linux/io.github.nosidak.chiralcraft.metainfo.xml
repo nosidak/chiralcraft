@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nosidak.chiralcraft</id>
+  <name>ChiralCraft</name>
+  <summary>Pure-Rust chemical structure editor, spectroscopy, MedChem, and 3D cheminformatics studio</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <developer id="io.github.nosidak">
+    <name>nosidak</name>
+  </developer>
+  <description>
+    <p>
+      ChiralCraft is a free, open-source, pure-Rust desktop chemical structure editor,
+      cheminformatics workbench, CLI batch converter, and Model Context Protocol (MCP) server.
+    </p>
+    <p>
+      Draw publication-grade ACS 1996 / RSC / Nature / Wiley reaction schemes, predict 1H/13C NMR
+      and FT-IR/UV-Vis spectra, run ADMET/PAINS MedChem scorecards and HRMS isotope envelopes,
+      plan retrosynthesis disconnections, optimize 3D geometries with UFF-Lite, and export lossless
+      editable SVG/PNG/PDF, CDXML, CDX, Molfile V2000/V3000, SDF, SMILES, XYZ, CIF, and LaTeX chemfig.
+    </p>
+  </description>
+  <launchable type="desktop-id">chiralcraft.desktop</launchable>
+  <url type="homepage">https://github.com/nosidak/chiralcraft</url>
+  <url type="bugtracker">https://github.com/nosidak/chiralcraft/issues</url>
+  <url type="vcs-browser">https://github.com/nosidak/chiralcraft</url>
+  <provides>
+    <binary>chiralcraft</binary>
+    <mediatype>chemical/x-cdxml</mediatype>
+    <mediatype>chemical/x-cdx</mediatype>
+    <mediatype>chemical/x-mdl-molfile</mediatype>
+    <mediatype>chemical/x-mdl-sdfile</mediatype>
+    <mediatype>chemical/x-xyz</mediatype>
+    <mediatype>chemical/x-cif</mediatype>
+    <mediatype>chemical/x-pdb</mediatype>
+  </provides>
+  <categories>
+    <category>Science</category>
+    <category>Chemistry</category>
+    <category>Education</category>
+    <category>Graphics</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="1.0.0" date="2026-11-27">
+      <description>
+        <p>Initial public release of ChiralCraft 1.0.0 under GNU AGPL-3.0-or-later.</p>
+      </description>
+    </release>
+  </releases>
+</component>

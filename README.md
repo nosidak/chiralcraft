@@ -11,8 +11,9 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/nosidak/chiralcraft/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/nosidak/chiralcraft?style=flat-square&color=2ea043"></a>
   <img alt="100% Rust" src="https://img.shields.io/badge/100%25-Rust-b7410e?style=flat-square&logo=rust">
-  <img alt="Linux · macOS · Windows" src="https://img.shields.io/badge/Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-native-2f7bf5?style=flat-square">
+  <img alt="Linux · macOS · Windows · FreeBSD" src="https://img.shields.io/badge/Linux%20%C2%B7%20macOS%20%C2%B7%20Windows%20%C2%B7%20FreeBSD-native-2f7bf5?style=flat-square">
   <img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-3a3a3a?style=flat-square">
   <img alt="Formats: 22+" src="https://img.shields.io/badge/formats-22%2B-2ea043?style=flat-square">
   <img alt="MCP Tools: 17" src="https://img.shields.io/badge/MCP%20tools-17-6f42c1?style=flat-square">
@@ -304,6 +305,17 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full architectural details.
 
 ## Get Started
 
+### Download Prebuilt Packages
+
+Prebuilt native installers and portable archives for every platform are published on the [**GitHub Releases**](https://github.com/nosidak/chiralcraft/releases/latest) page with verified `SHA256SUMS.txt` checksums:
+
+| Platform | Architecture | Available Packages |
+|---|---|---|
+| **Linux** | `x86_64` &amp; `aarch64` | `.AppImage`, `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL/openSUSE), `.pkg.tar.zst` (Arch Linux), `.tar.gz` |
+| **macOS** | Universal (Apple Silicon + Intel) | `.dmg` (`ChiralCraft.app`), `.zip`, plus standalone `aarch64.tar.gz` &amp; `x86_64.tar.gz` |
+| **Windows** | `x64` &amp; `ARM64` | `.msi` (WiX installer), `-setup.exe` (Inno Setup), `-portable.zip` |
+| **FreeBSD** | `x86_64` | `.tar.gz` |
+
 ### Build & Run from Source
 
 Requires Rust `1.78+` (standard Cargo toolchain; no external C/Python/Java chemistry libraries needed):
@@ -322,7 +334,7 @@ chiralcraft
 cargo test --workspace
 ```
 
-The workspace ships with **75 unit, integration, format round-trip, MCP protocol, and headless full-frame `egui` GUI tests** covering all 53 tools, all 11 template libraries, all 29 floating windows/studios, and all 40 dialogs.
+The workspace ships with **76 unit, integration, format round-trip, MCP protocol, and headless full-frame `egui` GUI tests** covering all 53 tools, all 11 template libraries, all 29 floating windows/studios, and all 40 dialogs.
 
 <br>
 

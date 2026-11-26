@@ -1,0 +1,61 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="ChiralCraft"
+    Manufacturer="nosidak"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="94E7A5D1-7C3B-4A68-9E8F-3C1A4D2B7E55"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ChiralCraft is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="ChiralCraft" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="ChiralCraft" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="A7F3C2E9-4B18-4D92-B5C1-8E6F0A3D2C44">
+        <File Id="ChiralCraftExe" Source="$(var.BinPath)" KeyPath="yes" />
+        <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
+        <ProgId Id="ChiralCraft.Document" Description="ChiralCraft Chemical Structure Document">
+          <Extension Id="cdxml" ContentType="chemical/x-cdxml">
+            <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
+          </Extension>
+          <Extension Id="cdx" ContentType="chemical/x-cdx">
+            <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
+          </Extension>
+          <Extension Id="mol" ContentType="chemical/x-mdl-molfile">
+            <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
+          </Extension>
+          <Extension Id="sdf" ContentType="chemical/x-mdl-sdfile">
+            <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
+          </Extension>
+        </ProgId>
+      </Component>
+      <Component Id="DocsAndLicense" Guid="B8E4D3FA-5C29-4E03-C6D2-9F7A1B4E3D55">
+        <File Id="ReadmeMd" Source="$(var.RepoRoot)\README.md" KeyPath="yes" />
+        <File Id="LicenseTxt" Source="$(var.RepoRoot)\LICENSE" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="C9F5E40B-6D3A-4F14-D7E3-0A8B2C5F4E66">
+      <Shortcut
+        Id="ApplicationStartMenuShortcut"
+        Name="ChiralCraft"
+        Description="Chemical Structure &amp; Cheminformatics Studio"
+        Target="[#ChiralCraftExe]"
+        WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\nosidak\ChiralCraft" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="MainFeature" Title="ChiralCraft" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

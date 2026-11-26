@@ -1,0 +1,264 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.0.0; defaults to Cargo.toml version)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            V="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+            TAG="v${V}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${TAG} (version ${VERSION})"
+
+  linux:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI & packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libgtk-3-dev \
+            dpkg rpm zstd file curl
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: cargo test --workspace
+      - name: Build release binary
+        run: cargo build -p chiralcraft-app --release
+      - name: Smoke-test CLI & MCP server
+        run: |
+          ./target/release/chiralcraft --version
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | ./target/release/chiralcraft --mcp
+      - name: Download appimagetool
+        run: |
+          curl -fSL -o /tmp/appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage"
+          chmod +x /tmp/appimagetool
+      - name: Package Linux (.AppImage, .deb, .rpm, .pkg.tar.zst, .tar.gz)
+        env:
+          APPIMAGETOOL: /tmp/appimagetool
+        run: |
+          chmod +x packaging/linux/package.sh
+          ./packaging/linux/package.sh "${{ needs.meta.outputs.version }}" "${{ matrix.arch }}" target/release/chiralcraft dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*
+
+  macos:
+    needs: meta
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable (arm64 + x86_64)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build macOS Apple Silicon & Intel binaries
+        run: |
+          cargo build -p chiralcraft-app --release --target aarch64-apple-darwin
+          cargo build -p chiralcraft-app --release --target x86_64-apple-darwin
+      - name: Smoke-test native macOS binary
+        run: |
+          ./target/aarch64-apple-darwin/release/chiralcraft --version
+          ./target/aarch64-apple-darwin/release/chiralcraft --formula "CC(=O)Oc1ccccc1C(=O)O"
+      - name: Package macOS Universal (.dmg, .zip) & per-arch (.tar.gz)
+        run: |
+          chmod +x packaging/macos/package.sh
+          ./packaging/macos/package.sh \
+            "${{ needs.meta.outputs.version }}" \
+            target/aarch64-apple-darwin/release/chiralcraft \
+            target/x86_64-apple-darwin/release/chiralcraft \
+            dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-universal
+          path: dist/*
+
+  windows:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Install WiX Toolset v5
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build Windows release binary
+        shell: pwsh
+        run: cargo build -p chiralcraft-app --release --target ${{ matrix.target }}
+      - name: Smoke-test Windows CLI
+        shell: pwsh
+        run: |
+          .\target\${{ matrix.target }}\release\chiralcraft.exe --version
+          .\target\${{ matrix.target }}\release\chiralcraft.exe --formula "CC(=O)Oc1ccccc1C(=O)O"
+      - name: Package Windows (.msi, -setup.exe, -portable.zip)
+        shell: pwsh
+        run: |
+          .\packaging\windows\package.ps1 `
+            -Version "${{ needs.meta.outputs.version }}" `
+            -Arch "${{ matrix.arch }}" `
+            -BinPath "target\${{ matrix.target }}\release\chiralcraft.exe" `
+            -OutDir "dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: dist/*
+
+  freebsd:
+    needs: meta
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & package FreeBSD x86_64 tarball
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.2"
+          usesh: true
+          mem: 6144
+          prepare: |
+            pkg install -y rust pkgconf libxkbcommon libxcb mesa-libs
+          run: |
+            set -e
+            VERSION="${{ needs.meta.outputs.version }}"
+            cargo build -p chiralcraft-app --release
+            ./target/release/chiralcraft --version
+            NAME="chiralcraft-${VERSION}-freebsd-x86_64"
+            mkdir -p "dist/${NAME}"
+            cp target/release/chiralcraft README.md LICENSE CHANGELOG.md "dist/${NAME}/"
+            tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+            rm -rf "dist/${NAME}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-freebsd-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: ignore
+
+  publish:
+    needs: [meta, linux, macos, windows, freebsd]
+    if: always() && needs.meta.result == 'success' && needs.linux.result == 'success' && needs.macos.result == 'success' && needs.windows.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd dist
+          sha256sum chiralcraft-* | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Build release notes
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          cat > release-notes.md <<EOF
+          # ChiralCraft ${TAG}
+
+          Pure-Rust desktop chemical structure editor, spectroscopy studio, MedChem ADMET/PAINS workbench, 3D UFF-Lite viewer, CLI batch converter, and Model Context Protocol (MCP) server — licensed under **GNU AGPL-3.0-or-later**.
+
+          ## Downloads
+
+          | Platform | Architecture | Packages |
+          | :--- | :--- | :--- |
+          | **Linux** | x86_64 (amd64) | \`.AppImage\`, \`.deb\`, \`.rpm\`, \`.pkg.tar.zst\`, \`.tar.gz\` |
+          | **Linux** | aarch64 (arm64) | \`.AppImage\`, \`.deb\`, \`.rpm\`, \`.pkg.tar.zst\`, \`.tar.gz\` |
+          | **macOS** | Universal (Apple Silicon + Intel) | \`.dmg\`, \`.zip\` (\`ChiralCraft.app\`), \`aarch64.tar.gz\`, \`x86_64.tar.gz\` |
+          | **Windows** | x64 | \`.msi\`, \`-setup.exe\`, \`-portable.zip\` |
+          | **Windows** | ARM64 | \`.msi\`, \`-setup.exe\`, \`-portable.zip\` |
+          | **FreeBSD** | x86_64 | \`.tar.gz\` (when available) |
+
+          ### Verify Checksums
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+          \`\`\`
+
+          ## Highlights in ${TAG}
+
+          - **Publication-Grade 2D Chemical Drawing**: ACS Document 1996, RSC, Nature, Wiley, and Dark Slide stylesheets; automatic Kekulization; multi-source steric-clash-free 2D cleanup; crossing-bond bridge gaps; Haworth/Chair/3D template libraries; TLC & SDS-PAGE gel plates; dual-pathway Reaction Energy Profiles (\`ΔG‡\`).
+          - **Spectroscopy & Mass Spectrometry**: On-canvas \`¹H\`/\`¹³C\` NMR shift badges, FT-IR, UV-Vis, 2D COSY/HSQC/HMBC, JCAMP-DX (\`.jdx\`) viewer, and High-Res MS isotope envelope & ESI+/ESI- adduct simulator.
+          - **Medicinal Chemistry & Synthesis**: Lipinski/Veber/Ghose/CNS MPO/QED/Fsp³/SA scorecards, PAINS/Brenk alerts, physiological pH microspecies & pI curves, Markush R-group enumeration (CSV/SDF), and offline retrosynthesis disconnection advisor.
+          - **3D, Quantum & Organometallics**: Interactive 3D Ball-and-Stick/CPK viewer, UFF-Lite 3D force field optimizer, ORCA/Gaussian/xTB input deck generator, Green CBC 18-electron organometallic analyzer, and BigSMILES polymer calculator.
+          - **Lossless Interchange, CLI & MCP**: Native CDXML, CDX, Molfile V2000/V3000, SDF, SMILES, XYZ, CIF, PDB, HELM, FASTA, LaTeX \`\\chemfig\`, and lossless editable SVG/PNG/PDF round-trip, plus a built-in \`--mcp\` JSON-RPC server.
+          EOF
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: "ChiralCraft ${{ needs.meta.outputs.tag }}"
+          body_path: release-notes.md
+          files: dist/*
+          draft: false
+          prerelease: false
