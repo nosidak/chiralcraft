@@ -21,16 +21,22 @@
       <Component Id="MainExecutable" Guid="A7F3C2E9-4B18-4D92-B5C1-8E6F0A3D2C44">
         <File Id="ChiralCraftExe" Source="$(var.BinPath)" KeyPath="yes" />
         <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
-        <ProgId Id="ChiralCraft.Document" Description="ChiralCraft Chemical Structure Document">
+        <ProgId Id="ChiralCraft.CDXML" Description="CDXML Chemical Document">
           <Extension Id="cdxml" ContentType="chemical/x-cdxml">
             <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
           </Extension>
+        </ProgId>
+        <ProgId Id="ChiralCraft.CDX" Description="CDX Binary Chemical Document">
           <Extension Id="cdx" ContentType="chemical/x-cdx">
             <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
           </Extension>
+        </ProgId>
+        <ProgId Id="ChiralCraft.MOL" Description="MDL Molfile Chemical Structure">
           <Extension Id="mol" ContentType="chemical/x-mdl-molfile">
             <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
           </Extension>
+        </ProgId>
+        <ProgId Id="ChiralCraft.SDF" Description="MDL Structure-Data File">
           <Extension Id="sdf" ContentType="chemical/x-mdl-sdfile">
             <Verb Id="open" Command="Open with ChiralCraft" TargetFile="ChiralCraftExe" Argument='"%1"' />
           </Extension>
