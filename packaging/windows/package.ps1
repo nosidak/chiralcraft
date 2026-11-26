@@ -39,6 +39,7 @@ if ($WixCmd) {
     -d "RepoRoot=$RepoRoot" `
     -o $MsiOut
   if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
+  Remove-Item -Force -ErrorAction SilentlyContinue "$OutFull\*.wixpdb"
 }
 
 # 3. Inno Setup EXE Installer
