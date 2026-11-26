@@ -167,7 +167,7 @@ pub fn render_energy_profiles_svg(profiles: &[EnergyProfile], ink: &str) -> Stri
             rx + 2.0, plot_t - 3.0, ep.unit_str()
         ));
 
-        let draw_path = |svg: &mut String, states: &[EnergyState], color: &str, dashed: bool| {
+        let draw_path = |svg: &mut String, states: &[EnergyState], other: &[EnergyState], color: &str, dashed: bool, is_secondary: bool| {
             let n = states.len();
             if n == 0 {
                 return;
@@ -191,22 +191,32 @@ pub fn render_energy_profiles_svg(profiles: &[EnergyProfile], ink: &str) -> Stri
                     "<path d=\"M {sx:.2} {y_a:.2} C {mx:.2} {y_a:.2}, {mx:.2} {y_b:.2}, {ex:.2} {y_b:.2}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"0.9\"{dash_attr}/>\n"
                 ));
             }
-            for &(cx, cy, st) in &pts {
+            for (i, &(cx, cy, st)) in pts.iter().enumerate() {
                 svg.push_str(&format!(
                     "<line x1=\"{:.2}\" y1=\"{cy:.2}\" x2=\"{:.2}\" y2=\"{cy:.2}\" stroke=\"{color}\" stroke-width=\"2.1\"/>\n",
                     cx - bar_hw, cx + bar_hw
                 ));
+                let mut ly = cy - 4.0;
+                if let Some(ost) = other.get(i) {
+                    if (st.energy - ost.energy).abs() < 0.05 && st.label == ost.label {
+                        if is_secondary {
+                            continue;
+                        }
+                    } else if st.energy < ost.energy {
+                        ly = cy + 8.5;
+                    }
+                }
                 let esc_lbl = st.label.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
                 svg.push_str(&format!(
-                    "<text x=\"{cx:.2}\" y=\"{:.2}\" font-size=\"6.2\" text-anchor=\"middle\" fill=\"{color}\">{esc_lbl} ({:.1})</text>\n",
-                    cy - 4.0, st.energy
+                    "<text x=\"{cx:.2}\" y=\"{ly:.2}\" font-size=\"6.2\" text-anchor=\"middle\" fill=\"{color}\">{esc_lbl} ({:.1})</text>\n",
+                    st.energy
                 ));
             }
         };
 
-        draw_path(&mut svg, &ep.pathway_a, "#1657B8", false);
+        draw_path(&mut svg, &ep.pathway_a, &ep.pathway_b, "#1657B8", false, false);
         if !ep.pathway_b.is_empty() {
-            draw_path(&mut svg, &ep.pathway_b, "#C83232", true);
+            draw_path(&mut svg, &ep.pathway_b, &ep.pathway_a, "#C83232", true, true);
         }
     }
     svg

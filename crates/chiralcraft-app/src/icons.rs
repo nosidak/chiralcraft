@@ -84,33 +84,46 @@ pub enum ToolbarIcon {
 }
 
 /// Converts plain ASCII chemical formulas like `C9H8O4`, `CH3`, `NH4+`, `SO4-`
-/// into crisp Unicode subscript/superscript display strings (`C₉H₈O₄`, `CH₃`, `NH₄⁺`, `SO₄⁻`).
+/// into crisp Unicode subscript/superscript display strings (`C₉H₈O₄`, `CH₃`, `NH₄⁺`, `SO₄⁻`)
+/// while leaving ordinary numbers (`85 °C, 15 min, 92%`, `MW: 180.16`, `δ 7.32`) untouched.
 pub fn format_chemical_formula(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     let chars: Vec<char> = s.chars().collect();
+    let mut in_chem_sub = false;
     for (i, &ch) in chars.iter().enumerate() {
-        let prev_is_chem = i > 0 && (chars[i - 1].is_ascii_alphabetic() || chars[i - 1] == ')' || chars[i - 1] == ']' || chars[i - 1].is_ascii_digit());
-        if ch.is_ascii_digit() && prev_is_chem {
-            let sub = match ch {
-                '0' => '₀',
-                '1' => '₁',
-                '2' => '₂',
-                '3' => '₃',
-                '4' => '₄',
-                '5' => '₅',
-                '6' => '₆',
-                '7' => '₇',
-                '8' => '₈',
-                '9' => '₉',
-                _ => ch,
-            };
-            out.push(sub);
-        } else if ch == '+' && i > 0 && i == chars.len() - 1 {
-            out.push('⁺');
-        } else if ch == '-' && i > 0 && i == chars.len() - 1 {
-            out.push('⁻');
+        if ch.is_ascii_digit() {
+            let starts_sub = i > 0
+                && (chars[i - 1].is_ascii_alphabetic()
+                    || chars[i - 1] == ')'
+                    || chars[i - 1] == ']');
+            if starts_sub || in_chem_sub {
+                in_chem_sub = true;
+                let sub = match ch {
+                    '0' => '₀',
+                    '1' => '₁',
+                    '2' => '₂',
+                    '3' => '₃',
+                    '4' => '₄',
+                    '5' => '₅',
+                    '6' => '₆',
+                    '7' => '₇',
+                    '8' => '₈',
+                    '9' => '₉',
+                    _ => ch,
+                };
+                out.push(sub);
+            } else {
+                out.push(ch);
+            }
         } else {
-            out.push(ch);
+            in_chem_sub = false;
+            if ch == '+' && i > 0 && i == chars.len() - 1 {
+                out.push('⁺');
+            } else if ch == '-' && i > 0 && i == chars.len() - 1 {
+                out.push('⁻');
+            } else {
+                out.push(ch);
+            }
         }
     }
     out

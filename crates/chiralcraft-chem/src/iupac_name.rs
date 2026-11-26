@@ -905,6 +905,16 @@ fn classify_substituent(mol: &ChemMolecule, sub_root: usize, parent_atom: usize)
             let o_cnt = nbrs.iter().filter(|&&(nb, _)| mol.atoms[nb].z == 8).count();
             if o_cnt >= 2 {
                 "nitro".to_string()
+            } else if let Some(&(c_idx, _)) = nbrs.iter().find(|&&(nb, _)| {
+                mol.atoms[nb].z == 6
+                    && mol.neighbors(nb).iter().any(|&(k, bi)| mol.atoms[k].z == 8 && mol.bonds[bi].order == 2)
+            }) {
+                let c_sub = count_subtree_carbons(mol, c_idx, sub_root);
+                if c_sub == 2 {
+                    "acetamido".to_string()
+                } else {
+                    "amido".to_string()
+                }
             } else {
                 "amino".to_string()
             }
@@ -988,6 +998,7 @@ fn name_substituted_benzene(
         ("carboxy", "benzoic acid"),
         ("formyl", "benzaldehyde"),
         ("cyano", "benzonitrile"),
+        ("acetamido", "acetanilide"),
         ("hydroxy", "phenol"),
         ("amino", "aniline"),
         ("methyl", "toluene"),

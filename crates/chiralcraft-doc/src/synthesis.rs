@@ -323,7 +323,7 @@ fn split_molecule_at_bond(
         return None; // Ring bond; keep acyclic strategic disconnections crisp
     }
 
-    let build_half = |want_a: bool, attach_orig: usize, cap_z: Option<i32>| -> ChemMolecule {
+    let build_half = |want_a: bool, attach_orig: usize, other_orig: usize, cap_z: Option<i32>| -> ChemMolecule {
         let mut out = ChemMolecule::new();
         let mut map = vec![usize::MAX; n];
         for (i, a) in mol.atoms.iter().enumerate() {
@@ -347,8 +347,13 @@ fn split_molecule_at_bond(
             if att < out.atoms.len() {
                 let nid = out.atoms.iter().map(|a| a.id).max().unwrap_or(1) + 1;
                 let mut ca = ChemAtom::new(nid, cz);
-                ca.x = out.atoms[att].x + bond_len;
-                ca.y = out.atoms[att].y;
+                // Place cap atom along the severed bond vector (toward `other_orig`) so it never collides with existing substituents
+                let dx = mol.atoms[other_orig].x - mol.atoms[attach_orig].x;
+                let dy = mol.atoms[other_orig].y - mol.atoms[attach_orig].y;
+                let d = dx.hypot(dy);
+                let (ux, uy) = if d > 1e-6 { (dx / d, dy / d) } else { (1.0, 0.0) };
+                ca.x = out.atoms[att].x + bond_len * ux;
+                ca.y = out.atoms[att].y + bond_len * uy;
                 if cz == 5 {
                     ca.label = Some("B(OH)₂".to_string());
                 }
@@ -361,8 +366,8 @@ fn split_molecule_at_bond(
         out
     };
 
-    let ma = build_half(true, u0, cap_u_z);
-    let mb = build_half(false, v0, cap_v_z);
+    let ma = build_half(true, u0, v0, cap_u_z);
+    let mb = build_half(false, v0, u0, cap_v_z);
     if ma.atoms.is_empty() || mb.atoms.is_empty() {
         return None;
     }

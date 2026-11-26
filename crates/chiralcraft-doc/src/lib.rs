@@ -3844,24 +3844,43 @@ pub fn clean_up_structure_preserving_stereo(
         .collect();
 
     if !acyclic_selected.is_empty() {
-        // Traverse from pinned atoms first, then highest-degree anchors in acyclic selected components
-        let mut seeds: Vec<usize> = pinned_atoms.iter().copied().collect();
-        seeds.sort_unstable();
+        // Seed multi-source BFS with ALL pinned ring atoms simultaneously so every exocyclic ring
+        // substituent root (depth 1) is placed before deeper branches choose steric-avoiding angles!
+        let mut pinned_seeds: Vec<usize> = pinned_atoms.iter().copied().collect();
+        pinned_seeds.sort_unstable();
         let mut remaining_seeds: Vec<usize> = (0..n)
             .filter(|i| !pinned_atoms.contains(i) && adj[*i].iter().any(|(_, bi)| acyclic_selected.contains(bi)))
             .collect();
         remaining_seeds.sort_by_key(|&i| std::cmp::Reverse(adj[i].len()));
-        seeds.extend(remaining_seeds);
 
         let mut visited_atoms = vec![false; n];
+        let mut placed_atoms = vec![false; n];
+        for &ra in &pinned_atoms {
+            placed_atoms[ra] = true;
+        }
         let mut depth_atoms = vec![0usize; n];
         let mut q = VecDeque::new();
-        for seed in seeds {
-            if visited_atoms[seed] {
+        let mut seed_batches: Vec<Vec<usize>> = Vec::new();
+        if !pinned_seeds.is_empty() {
+            seed_batches.push(pinned_seeds);
+        }
+        for s in remaining_seeds {
+            seed_batches.push(vec![s]);
+        }
+        for batch in seed_batches {
+            let mut pushed_any = false;
+            for seed in batch {
+                if visited_atoms[seed] {
+                    continue;
+                }
+                visited_atoms[seed] = true;
+                placed_atoms[seed] = true;
+                q.push_back(seed);
+                pushed_any = true;
+            }
+            if !pushed_any {
                 continue;
             }
-            visited_atoms[seed] = true;
-            q.push_back(seed);
             while let Some(u) = q.pop_front() {
                 // Collect unvisited neighbors of `u` so collapsed SMILES branches fan out cleanly without overlap!
                 let children: Vec<(usize, usize)> = adj[u]
@@ -3878,6 +3897,7 @@ pub fn clean_up_structure_preserving_stereo(
                         let oy = orig_pos[v].1 - orig_pos[u].1;
                         let olen = (ox * ox + oy * oy).sqrt();
                         if olen > 1e-9 {
+                            placed_atoms[v] = true;
                             let target_x = mol.atoms[u].x + target_bond_length_pt * (ox / olen);
                             let target_y = mol.atoms[u].y + target_bond_length_pt * (oy / olen);
                             let dx = target_x - mol.atoms[v].x;
@@ -3903,13 +3923,15 @@ pub fn clean_up_structure_preserving_stereo(
                         } else {
                             collapsed_children.push((v, bi));
                         }
+                    } else {
+                        placed_atoms[v] = true;
                     }
                     q.push_back(v);
                 }
 
                 // Synthesize clean IUPAC 2D geometry for any collapsed (SMILES/InChI) children of `u`
                 if !collapsed_children.is_empty() {
-                    let placed_nbrs: Vec<(f64, i32)> = adj[u]
+                    let placed_nbrs: Vec<(usize, f64, i32)> = adj[u]
                         .iter()
                         .filter_map(|&(nb, bi)| {
                             if collapsed_children.iter().any(|&(cv, _)| cv == nb) {
@@ -3918,12 +3940,46 @@ pub fn clean_up_structure_preserving_stereo(
                             let dx = mol.atoms[nb].x - mol.atoms[u].x;
                             let dy = mol.atoms[nb].y - mol.atoms[u].y;
                             if dx.hypot(dy) > 1e-6 {
-                                Some((dy.atan2(dx), mol.bonds[bi].order))
+                                Some((nb, dy.atan2(dx), mol.bonds[bi].order))
                             } else {
                                 None
                             }
                         })
                         .collect();
+                    // Steric clearance helper: minimum squared distance from a candidate child position
+                    // to all already-positioned non-u atoms (maximizing clearance automatically yields
+                    // trans zig-zag chains AND bends ortho ring substituents away from each other!).
+                    let clearance_d2 = |ang: f64, skip_atom: Option<usize>| -> f64 {
+                        let cx = mol.atoms[u].x + target_bond_length_pt * ang.cos();
+                        let cy = mol.atoms[u].y + target_bond_length_pt * ang.sin();
+                        let mut best = f64::INFINITY;
+                        for w in 0..n {
+                            if !placed_atoms[w] || w == u || skip_atom == Some(w) {
+                                continue;
+                            }
+                            let dx = mol.atoms[w].x - cx;
+                            let dy = mol.atoms[w].y - cy;
+                            best = best.min(dx * dx + dy * dy);
+                        }
+                        best
+                    };
+                    let subtree_weight = |root: usize| -> usize {
+                        let mut vis = vec![false; n];
+                        vis[u] = true;
+                        vis[root] = true;
+                        let mut st = vec![root];
+                        let mut cnt = 0usize;
+                        while let Some(cur) = st.pop() {
+                            cnt += 1;
+                            for &(nb, _) in &adj[cur] {
+                                if !vis[nb] {
+                                    vis[nb] = true;
+                                    st.push(nb);
+                                }
+                            }
+                        }
+                        cnt
+                    };
                     let k = collapsed_children.len();
                     let angles: Vec<f64> = if placed_nbrs.is_empty() {
                         let base = -std::f64::consts::FRAC_PI_6;
@@ -3935,19 +3991,43 @@ pub fn clean_up_structure_preserving_stereo(
                         };
                         (0..k).map(|i| base + (i as f64) * step).collect()
                     } else if placed_nbrs.len() == 1 {
-                        let (back_ang, back_ord) = placed_nbrs[0];
+                        let (parent_nb, back_ang, back_ord) = placed_nbrs[0];
                         let has_triple = back_ord == 3
                             || collapsed_children.iter().any(|&(_, bi)| mol.bonds[bi].order == 3);
                         match k {
                             1 if has_triple => vec![back_ang + std::f64::consts::PI],
                             1 => {
-                                let sign = if depth_atoms[u] % 2 == 0 { 1.0 } else { -1.0 };
-                                vec![back_ang + sign * (2.0 * std::f64::consts::PI / 3.0)]
+                                let a_pos = back_ang + 2.0 * std::f64::consts::PI / 3.0;
+                                let a_neg = back_ang - 2.0 * std::f64::consts::PI / 3.0;
+                                let d_pos = clearance_d2(a_pos, Some(parent_nb));
+                                let d_neg = clearance_d2(a_neg, Some(parent_nb));
+                                let eps = 1e-2 * target_bond_length_pt * target_bond_length_pt;
+                                let chosen = if d_pos.is_finite() && d_neg.is_finite() && (d_pos - d_neg).abs() > eps {
+                                    if d_pos > d_neg { a_pos } else { a_neg }
+                                } else {
+                                    let sign = if depth_atoms[u] % 2 == 0 { 1.0 } else { -1.0 };
+                                    back_ang + sign * (2.0 * std::f64::consts::PI / 3.0)
+                                };
+                                vec![chosen]
                             }
-                            2 => vec![
-                                back_ang + 2.0 * std::f64::consts::PI / 3.0,
-                                back_ang - 2.0 * std::f64::consts::PI / 3.0,
-                            ],
+                            2 => {
+                                let a_pos = back_ang + 2.0 * std::f64::consts::PI / 3.0;
+                                let a_neg = back_ang - 2.0 * std::f64::consts::PI / 3.0;
+                                let w0 = subtree_weight(collapsed_children[0].0);
+                                let w1 = subtree_weight(collapsed_children[1].0);
+                                if w0 != w1 {
+                                    let d_pos = clearance_d2(a_pos, Some(parent_nb));
+                                    let d_neg = clearance_d2(a_neg, Some(parent_nb));
+                                    let (open_ang, tight_ang) = if d_pos >= d_neg { (a_pos, a_neg) } else { (a_neg, a_pos) };
+                                    if w0 > w1 {
+                                        vec![open_ang, tight_ang]
+                                    } else {
+                                        vec![tight_ang, open_ang]
+                                    }
+                                } else {
+                                    vec![a_pos, a_neg]
+                                }
+                            }
                             3 => vec![
                                 back_ang + std::f64::consts::FRAC_PI_2,
                                 back_ang + std::f64::consts::PI,
@@ -3960,8 +4040,8 @@ pub fn clean_up_structure_preserving_stereo(
                         }
                     } else {
                         // Outward bisector away from existing placed neighbors (e.g. exocyclic ring substituents)
-                        let sx: f64 = placed_nbrs.iter().map(|(a, _)| a.cos()).sum();
-                        let sy: f64 = placed_nbrs.iter().map(|(a, _)| a.sin()).sum();
+                        let sx: f64 = placed_nbrs.iter().map(|(_, a, _)| a.cos()).sum();
+                        let sy: f64 = placed_nbrs.iter().map(|(_, a, _)| a.sin()).sum();
                         let out_ang = (-sy).atan2(-sx);
                         if k == 1 {
                             vec![out_ang]
@@ -3975,6 +4055,7 @@ pub fn clean_up_structure_preserving_stereo(
                     for ((v, _), ang) in collapsed_children.into_iter().zip(angles.into_iter()) {
                         mol.atoms[v].x = mol.atoms[u].x + target_bond_length_pt * ang.cos();
                         mol.atoms[v].y = mol.atoms[u].y + target_bond_length_pt * ang.sin();
+                        placed_atoms[v] = true;
                     }
                 }
             }

@@ -6910,9 +6910,29 @@ impl ChiralCraftApp {
                                     pp.line_segment([p1, p2], Stroke::new(lw, col));
                                     pp.line_segment([p1 + u * inset + n * bond_sep, p2 - u * inset + n * bond_sep], Stroke::new(lw, col));
                                     pp.line_segment([p1 + u * inset - n * bond_sep, p2 - u * inset - n * bond_sep], Stroke::new(lw, col));
-                                } else if b.order >= 4 {
+                                } else if b.order == 4 {
                                     for off in [-1.5 * bond_sep, -0.5 * bond_sep, 0.5 * bond_sep, 1.5 * bond_sep] {
                                         pp.line_segment([p1 + n * off, p2 + n * off], Stroke::new(lw, col));
+                                    }
+                                } else if b.order == 6 {
+                                    // Delocalized aromatic (1.5) bond: solid outer bond + inset dashed inner bond
+                                    let inset = len * 0.16;
+                                    let in_n = if let Some(&(rnx, rny)) = ring_normals.get(&bi) {
+                                        Vec2::new(rnx as f32, rny as f32)
+                                    } else {
+                                        n
+                                    };
+                                    pp.line_segment([p1, p2], Stroke::new(lw, col));
+                                    let q1 = p1 + u * inset + in_n * bond_sep;
+                                    let q2 = p2 - u * inset + in_n * bond_sep;
+                                    let dashes = 4usize;
+                                    for di in 0..dashes {
+                                        let t0 = (di as f32) / (dashes as f32);
+                                        let t1 = ((di as f32) + 0.58) / (dashes as f32);
+                                        pp.line_segment(
+                                            [q1 + (q2 - q1) * t0, q1 + (q2 - q1) * t1.min(1.0)],
+                                            Stroke::new(lw, col),
+                                        );
                                     }
                                 } else {
                                     for ((sx, sy), (ex, ey)) in &seg_pairs {
@@ -7494,7 +7514,7 @@ impl ChiralCraftApp {
                         FontId::proportional((6.5 * self.zoom).clamp(7.0, 14.0)),
                         default_ink,
                     );
-                    let draw_ep = |states: &[chiralcraft_doc::EnergyState], col: Color32, dashed: bool| {
+                    let draw_ep = |states: &[chiralcraft_doc::EnergyState], other: &[chiralcraft_doc::EnergyState], col: Color32, dashed: bool, is_secondary: bool| {
                         let n = states.len();
                         if n == 0 { return; }
                         let step = (pr - pl) / (n as f32);
@@ -7526,13 +7546,26 @@ impl ChiralCraftApp {
                             }
                         }
                         let fs = (6.2 * self.zoom).clamp(6.5, 13.0);
-                        for (c, st) in pts {
+                        for (i, (c, st)) in pts.into_iter().enumerate() {
                             pp.line_segment([Pos2::new(c.x - hw, c.y), Pos2::new(c.x + hw, c.y)], Stroke::new((lw * 2.4).max(2.2), col));
+                            if let Some(ost) = other.get(i) {
+                                if (st.energy - ost.energy).abs() < 0.05 && st.label == ost.label {
+                                    if is_secondary {
+                                        continue;
+                                    }
+                                    pp.text(Pos2::new(c.x, c.y - 3.0 * self.zoom), egui::Align2::CENTER_BOTTOM, format!("{} ({:.1})", st.label, st.energy), FontId::proportional(fs), col);
+                                    continue;
+                                }
+                                if st.energy < ost.energy {
+                                    pp.text(Pos2::new(c.x, c.y + 3.5 * self.zoom), egui::Align2::CENTER_TOP, format!("{} ({:.1})", st.label, st.energy), FontId::proportional(fs), col);
+                                    continue;
+                                }
+                            }
                             pp.text(Pos2::new(c.x, c.y - 3.0 * self.zoom), egui::Align2::CENTER_BOTTOM, format!("{} ({:.1})", st.label, st.energy), FontId::proportional(fs), col);
                         }
                     };
-                    draw_ep(&ep.pathway_a, Color32::from_rgb(22, 87, 184), false);
-                    draw_ep(&ep.pathway_b, Color32::from_rgb(200, 50, 50), true);
+                    draw_ep(&ep.pathway_a, &ep.pathway_b, Color32::from_rgb(22, 87, 184), false, false);
+                    draw_ep(&ep.pathway_b, &ep.pathway_a, Color32::from_rgb(200, 50, 50), true, true);
                 }
                 for arr in &self.doc().scene.arrows {
                     let p1 = self.doc_to_screen(page_origin, arr.tail.0, arr.tail.1);
@@ -10288,5 +10321,65 @@ mod tests {
         assert!(app.tab().gel_plates.is_empty(), "Clear must remove gel plates");
         assert!(app.doc_mut().undo(), "Clear must undo cleanly");
         assert!(!app.doc().scene.molecules.is_empty());
+    }
+
+    #[test]
+    fn test_chemistry_accuracy_kekule_layout_formula_and_retrosynthesis() {
+        // 1. SMILES aromatic rings must Kekulize to alternating 1/2 bonds (never order 6)
+        //    and lay out with zero steric clashes / structure warnings (including ortho-substituted Aspirin!)
+        for &(smi, label) in &[
+            ("Oc1ccccc1C(=O)O", "Salicylic Acid"),
+            ("CC(=O)Oc1ccccc1C(=O)O", "Aspirin"),
+            ("CC(C)Cc1ccc(C(C)C(=O)O)cc1", "Ibuprofen"),
+            ("CC(=O)Nc1ccccc1", "Acetanilide"),
+            ("Brc1ccc(NC(=O)C)cc1", "4-Bromoacetanilide"),
+        ] {
+            let mut m = smiles_to_molecule(smi).expect(label);
+            assert!(
+                m.bonds.iter().all(|b| b.order == 1 || b.order == 2),
+                "{label} must have Kekulized 1/2 bonds, found orders: {:?}",
+                m.bonds.iter().map(|b| b.order).collect::<Vec<_>>()
+            );
+            assert!(
+                m.bonds.iter().filter(|b| b.order == 2).count() >= 3,
+                "{label} benzene ring must have 3 Kekulé double bonds"
+            );
+            clean_up_structure_preserving_stereo(&mut m, &[], 14.40);
+            let warns = chiralcraft_doc::check_structure(&m, &[]);
+            assert!(
+                warns.is_empty(),
+                "{label} should have 0 structure/overlap warnings after cleanup, got: {warns:?}"
+            );
+        }
+
+        // 2. Formula formatter must subscript chemical counts only, never ordinary numbers/decimals/temperatures
+        assert_eq!(format_chemical_formula("Ac2O, H3PO4 (cat.)"), "Ac₂O, H₃PO₄ (cat.)");
+        assert_eq!(format_chemical_formula("85 °C, 15 min, 92%"), "85 °C, 15 min, 92%");
+        assert_eq!(
+            format_chemical_formula("2-acetoxybenzoic acid (aspirin) | C9H8O4 | MW: 180.16"),
+            "2-acetoxybenzoic acid (aspirin) | C₉H₈O₄ | MW: 180.16"
+        );
+        assert_eq!(format_chemical_formula("δ 7.32 (dd)"), "δ 7.32 (dd)");
+        assert_eq!(format_chemical_formula("C10H16"), "C₁₀H₁₆");
+        assert_eq!(format_chemical_formula("Ca(OH)2"), "Ca(OH)₂");
+
+        // 3. IUPAC naming distinguishes acetanilide derivatives from bare anilines
+        let dict = NameDictionary::with_builtins();
+        let acet = smiles_to_molecule("CC(=O)Nc1ccccc1").unwrap();
+        assert_eq!(molecule_to_name(&acet, &molecule_to_smiles(&acet), &dict), "acetanilide");
+        let br_acet = smiles_to_molecule("Brc1ccc(NC(=O)C)cc1").unwrap();
+        assert_eq!(molecule_to_name(&br_acet, &molecule_to_smiles(&br_acet), &dict), "4-bromoacetanilide");
+
+        // 4. Retrosynthetic Amide disconnection of Acetanilide yields non-overlapping Acetic Acid (CH3COOH) + Aniline
+        let mut acet_2d = acet.clone();
+        clean_up_structure_preserving_stereo(&mut acet_2d, &[], 14.40);
+        let hits = suggest_disconnections(&acet_2d, 14.40);
+        assert!(!hits.is_empty());
+        let h0 = &hits[0];
+        assert!(h0.reaction_name.contains("Amide"));
+        let w_a = chiralcraft_doc::check_structure(&h0.synthon_a, &[]);
+        let w_b = chiralcraft_doc::check_structure(&h0.synthon_b, &[]);
+        assert!(w_a.is_empty(), "Synthon A must have zero overlap warnings: {w_a:?}");
+        assert!(w_b.is_empty(), "Synthon B must have zero overlap warnings: {w_b:?}");
     }
 }

@@ -3111,6 +3111,9 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
     if !ring_opens.is_empty() {
         return Err("Unclosed ring closure digit in SMILES".to_string());
     }
+    // Kekulize lowercase SMILES aromatic bonds (order 6) into standard alternating single/double (1/2)
+    // bonds so structures render and export with textbook Kekulé rings rather than delocalized order-6 edges.
+    let _ = chiralcraft_chem::kekulize_aromatic_bonds(&mut mol);
     Ok(mol)
 }
 
