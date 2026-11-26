@@ -36,7 +36,7 @@ pub fn transition_metal_group(z: i32) -> Option<i32> {
 }
 
 /// Analyzes every transition metal center in `mol` using Green's Covalent Bond Classification (L/X)
-/// to report formal oxidation state, d^n count, 18e⁻ / 16e⁻ electron count, and coordination geometry.
+/// to report formal oxidation state, d^n count, 18e- / 16e- electron count, and coordination geometry.
 pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexReport> {
     let n = mol.atoms.len();
     let mut adj: Vec<Vec<(usize, i32, BondDisplay)>> = vec![Vec::new(); n];
@@ -72,30 +72,30 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
                 // η5-Cp is L2X (6e- donor, +1 oxidation state)
                 l_cnt += 2;
                 x_cnt += 1;
-                details.push(format!("{lsym} (η⁵, L₂X, 6e⁻)"));
+                details.push(format!("{lsym} (η5, L2X, 6e-)"));
                 continue;
             }
             if lbl_low == "cod" || lbl_low == "nbd" || lbl_low == "bpy" || lbl_low == "dppe" || lbl_low == "dppf" {
                 l_cnt += 2;
-                details.push(format!("{lsym} (κ²/η⁴ bidentate, L₂, 4e⁻)"));
+                details.push(format!("{lsym} (κ2/η4 bidentate, L2, 4e-)"));
                 continue;
             }
 
             if disp == BondDisplay::Dative || order == 5 {
                 l_cnt += 1;
-                details.push(format!("{lsym} (dative L-type, 2e⁻)"));
+                details.push(format!("{lsym} (dative L-type, 2e-)"));
             } else if order == 2 {
                 // Fischer/Schrock carbene or oxo/imido: treat M=O / M=N as X2 (4e-), M=C as L (2e- Schrock X2)
                 if matches!(la.z, 8 | 7 | 16) && l_deg == 1 {
                     x_cnt += 2;
-                    details.push(format!("={lsym} (X₂ oxo/imido, 4e⁻)"));
+                    details.push(format!("={lsym} (X2 oxo/imido, 4e-)"));
                 } else {
                     l_cnt += 1;
-                    details.push(format!("={lsym} (carbene L-type, 2e⁻)"));
+                    details.push(format!("={lsym} (carbene L-type, 2e-)"));
                 }
             } else if order >= 3 {
                 x_cnt += 3;
-                details.push(format!("≡{lsym} (X₃ carbyne/nitrido, 6e⁻)"));
+                details.push(format!("≡{lsym} (X3 carbyne/nitrido, 6e-)"));
             } else {
                 // Single bond classification:
                 // Halogens (F, Cl, Br, I), H, C (alkyl/aryl unless CO!), alkoxide O (deg<=2), amide N (deg==2 single) -> X-type
@@ -120,14 +120,14 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
                     || lbl_low == "mecn";
                 if is_l {
                     l_cnt += 1;
-                    details.push(format!("{lsym} (L-type neutral, 2e⁻)"));
+                    details.push(format!("{lsym} (L-type neutral, 2e-)"));
                 } else if transition_metal_group(la.z).is_some() {
                     // Metal-metal single bond contributes 1e- to each metal
                     extra_e += 1;
-                    details.push(format!("M–{lsym} (metal-metal bond, 1e⁻)"));
+                    details.push(format!("M–{lsym} (metal-metal bond, 1e-)"));
                 } else {
                     x_cnt += 1;
-                    details.push(format!("{lsym} (X-type anionic, 2e⁻)"));
+                    details.push(format!("{lsym} (X-type anionic, 2e-)"));
                 }
             }
         }
@@ -143,11 +143,11 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
         let geometry = match cn {
             0 => "Unbound Metal Atom",
             1 => "Monocoordinate",
-            2 => "Linear (d¹⁰ / 14e⁻ typical)",
+            2 => "Linear (d¹⁰ / 14e- typical)",
             3 => "Trigonal Planar",
             4 => {
                 if d_elec == 8 && matches!(atom.z, 45 | 46 | 77 | 78 | 79 | 28) {
-                    "Square Planar (d⁸ 16e⁻ classic)"
+                    "Square Planar (d⁸ 16e- classic)"
                 } else {
                     "Tetrahedral"
                 }
@@ -158,13 +158,13 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
         };
 
         let status = if total_e == 18 {
-            "18e⁻ Closed-Shell (Saturated)"
+            "18e- Closed-Shell (Saturated)"
         } else if total_e == 16 && d_elec == 8 {
-            "16e⁻ Square-Planar Stable (d⁸)"
+            "16e- Square-Planar Stable (d⁸)"
         } else if total_e < 18 {
-            "Coordinatively Unsaturated (<18e⁻)"
+            "Coordinatively Unsaturated (<18e-)"
         } else {
-            "Hypervalent / >18e⁻ Complex"
+            "Hypervalent / >18e- Complex"
         };
 
         reports.push(MetalComplexReport {

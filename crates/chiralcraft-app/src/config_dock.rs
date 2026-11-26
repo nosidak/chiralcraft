@@ -306,7 +306,7 @@ pub fn render_quantum_panel_contents(
                 ui.small(format!("Dipole: {d:.3} Debye"));
             }
             if !rep.ir_frequencies_cm1.is_empty() {
-                ui.small(format!("DFT IR Modes: {} (max {:.0} cm⁻¹)", rep.ir_frequencies_cm1.len(), rep.ir_frequencies_cm1.iter().copied().fold(0.0_f64, f64::max)));
+                ui.small(format!("DFT IR Modes: {} (max {:.0} cm^-1)", rep.ir_frequencies_cm1.len(), rep.ir_frequencies_cm1.iter().copied().fold(0.0_f64, f64::max)));
             }
             if let Some(opt) = &rep.optimized_molecule {
                 if ui.small_button("Stamp DFT 3D Geometry on Canvas").clicked() {
@@ -421,9 +421,9 @@ pub fn show_right_studio_dock(
                     let metals = analyze_organometallic_complexes(mol);
                     if !metals.is_empty() {
                         ui.separator();
-                        ui.strong("Organometallic 18e⁻");
+                        ui.strong("Organometallic 18e-");
                         for r in metals {
-                            ui.small(format!("{}: {}e⁻ (ox {:+}, d^{}) — {}", r.metal_symbol, r.total_valence_electrons, r.oxidation_state, r.d_electrons, r.predicted_geometry));
+                            ui.small(format!("{}: {}e- (ox {:+}, d^{}) — {}", r.metal_symbol, r.total_valence_electrons, r.oxidation_state, r.d_electrons, r.predicted_geometry));
                         }
                     }
                     ui.separator();
@@ -465,23 +465,23 @@ pub fn show_right_studio_dock(
                 }
                 DockTab::Spectra => {
                     let Some(mol) = active_mol.filter(|m| !m.atoms.is_empty()) else {
-                        ui.weak("Draw a structure for live FT-IR, UV–Vis, HRMS, and NMR previews.");
+                        ui.weak("Draw a structure for live FT-IR, UV-Vis, HRMS, and NMR previews.");
                         return;
                     };
                     let ir = predict_ir_spectrum(mol);
                     let uv = predict_uv_vis(mol);
                     let hrms = simulate_hrms(mol, "[M+H]+");
-                    ui.strong("HRMS [M+H]⁺");
+                    ui.strong("HRMS [M+H]+");
                     if let Some(pk) = hrms.peaks.first() {
                         ui.label(format!("Base peak: {:.4} ({})", pk.mz, hrms.formula));
                     }
                     ui.separator();
-                    ui.strong("UV–Vis");
+                    ui.strong("UV-Vis");
                     ui.label(format!("λmax ≈ {:.0} nm — {}", uv.lambda_max_nm, uv.perceived_color_name));
                     ui.separator();
                     ui.strong("Diagnostic FT-IR");
                     for b in ir.bands.iter().take(5) {
-                        ui.small(format!("{:.0} cm⁻¹ ({}) {}", b.wavenumber_cm1, b.strength, b.assignment));
+                        ui.small(format!("{:.0} cm^-1 ({}) {}", b.wavenumber_cm1, b.strength, b.assignment));
                     }
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {

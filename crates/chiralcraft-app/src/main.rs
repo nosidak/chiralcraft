@@ -438,6 +438,9 @@ struct ChiralCraftApp {
     dock_tab: DockTab,
     /// Computational Chemistry Bridge (ORCA / Gaussian / xTB) state.
     quantum: QuantumStudioState,
+    /// Optional deterministic GPU screenshot capture path (`chiralcraft --screenshot <preset> <out.png>`).
+    screenshot_out_path: Option<String>,
+    screenshot_frames: u8,
 }
 
 impl ChiralCraftApp {
@@ -596,7 +599,185 @@ impl ChiralCraftApp {
             show_right_dock: initial_dock,
             dock_tab: DockTab::Analysis,
             quantum: QuantumStudioState::default(),
+            screenshot_out_path: None,
+            screenshot_frames: 0,
         }
+    }
+
+    /// Launch ChiralCraft pre-loaded with a deterministic showcase scene and save a native GPU screenshot.
+    fn new_showcase_preset(preset: &str, out_path: &str) -> Self {
+        let mut app = Self::new();
+        app.screenshot_out_path = Some(out_path.to_string());
+        app.screenshot_frames = 0;
+        app.ui_theme = UiTheme::ClassicLight;
+        app.show_right_dock = true;
+        app.zoom = 1.45;
+        app.tab_mut().maximized = true;
+        app.show_stereo = true;
+        let blen = app.doc().settings.bond_length_pt;
+
+        let place_smi = |smi: &str, cx: f64, cy: f64, blen: f64| -> ChemMolecule {
+            let mut m = smiles_to_molecule(smi).unwrap_or_default();
+            clean_up_structure_preserving_stereo(&mut m, &[], blen);
+            let (x1, y1, x2, y2) = mol_bbox(&m);
+            let dx = cx - 0.5 * (x1 + x2);
+            let dy = cy - 0.5 * (y1 + y2);
+            for a in &mut m.atoms {
+                a.x += dx;
+                a.y += dy;
+            }
+            m
+        };
+
+        match preset {
+            "medchem" => {
+                app.doc_mut().name = "Lead_Optimization_SAR.cdxml".to_string();
+                app.show_warnings = false;
+                let m = place_smi("CC(C)Cc1ccc(C(C)C(=O)O)cc1", 130.0, 125.0, blen);
+                let m2 = place_smi("Brc1ccc(NC(=O)C)cc1", 130.0, 235.0, blen);
+                app.doc_mut().stamp_molecule_tx(m, "Ibuprofen");
+                app.doc_mut().stamp_molecule_tx(m2, "4-Bromoacetanilide");
+                app.tab_mut().selected_mols = vec![1];
+                app.dock_tab = DockTab::MedChem;
+                app.pro_suite.show_hrms = true;
+                app.status_msg = "MedChem ADMET Scorecard + HRMS Isotope Envelope (79Br/81Br doublet)".to_string();
+            }
+            "spectroscopy" => {
+                app.doc_mut().name = "Aspirin_Spectroscopy.cdxml".to_string();
+                app.show_warnings = false;
+                let m = place_smi("CC(=O)Oc1ccccc1C(=O)O", 110.0, 175.0, blen);
+                app.doc_mut().stamp_molecule_tx(m, "Aspirin");
+                app.tab_mut().selected_mols = vec![0];
+                app.stamp_nmr_shift_labels(false);
+                app.dock_tab = DockTab::Spectra;
+                app.omni_suite.show_spectroscopy = true;
+                app.omni_suite.spec_tab = SpecTab::FtIr;
+                app.status_msg = "1H-NMR On-Canvas Shift Badges + FT-IR / UV-Vis / 2D NMR Studio".to_string();
+            }
+            "3d-quantum" => {
+                app.doc_mut().name = "Adamantane_DFT_3D.cdxml".to_string();
+                app.show_warnings = false;
+                let mut adam = build_adamantane_2d(blen);
+                let (x1, y1, x2, y2) = mol_bbox(&adam);
+                for a in &mut adam.atoms {
+                    a.x += 130.0 - 0.5 * (x1 + x2);
+                    a.y += 155.0 - 0.5 * (y1 + y2);
+                }
+                let lifted = lift_molecule_2d_to_3d(&adam);
+                let (opt, rep) = optimize_geometry_3d(&lifted, 120);
+                app.doc_mut().stamp_molecule_tx(opt, "Adamantane 3D");
+                app.tab_mut().selected_mols = vec![0];
+                app.viewer_3d.open = true;
+                app.viewer_3d.last_opt_summary = format!(
+                    "UFF 3D Opt ({} iters): E {:.1} -> {:.2} kcal/mol",
+                    rep.iterations, rep.initial_energy_kcal, rep.final_energy_kcal
+                );
+                app.dock_tab = DockTab::Quantum;
+                app.status_msg = "Interactive 3D Viewer + UFF-Lite Optimizer + ORCA/Gaussian/xTB Deck".to_string();
+            }
+            "synthesis" => {
+                app.doc_mut().name = "Retrosynthesis_EnergyProfile.cdxml".to_string();
+                app.show_warnings = false;
+                let target = place_smi("CC(=O)Nc1ccccc1", 115.0, 88.0, blen);
+                let hits = suggest_disconnections(&target, blen);
+                app.doc_mut().stamp_molecule_tx(target.clone(), "Acetanilide");
+                app.tab_mut().selected_mols = vec![0];
+                if let Some(h0) = hits.first().cloned() {
+                    app.pro_suite.retro_hits = hits;
+                    app.pro_suite.highlighted_retro_bond = Some(h0.bond_idx);
+                    app.doc_mut().apply_scene_tx("Retrosynthesis", |s, nid| {
+                        stamp_retrosynthesis_scheme(s, nid, &target, &h0, 65.0, 175.0);
+                        s.energy_profiles.push(chiralcraft_doc::EnergyProfile::starter(901, 45.0, 240.0));
+                    });
+                }
+                app.pro_suite.show_retro = true;
+                app.dock_tab = DockTab::Analysis;
+                app.status_msg = "Retrosynthesis Disconnection Advisor + Reaction Energy Profile (ΔG‡)".to_string();
+            }
+            "organometallic" => {
+                app.doc_mut().name = "Organometallic_Catalysis.cdxml".to_string();
+                app.show_warnings = false;
+                let cat_lib = app.ctp_libraries.iter().find(|l| l.name == "Organometallic Catalysts").cloned();
+                if let Some(lib) = cat_lib {
+                    if let Some(pd) = lib.stamp(0, 130.0, 120.0) {
+                        app.doc_mut().stamp_molecule_tx(pd, "Pd(PPh3)4");
+                    }
+                    if let Some(pt) = lib.stamp(1, 130.0, 235.0) {
+                        app.doc_mut().stamp_molecule_tx(pt, "Cisplatin");
+                    }
+                }
+                app.tab_mut().selected_mols = vec![0];
+                app.omni_suite.show_ino_poly = true;
+                app.dock_tab = DockTab::Analysis;
+                app.status_msg = "Organometallic 18-Electron Green CBC Analyzer & Catalyst Library".to_string();
+            }
+            "dark-slide" => {
+                app.ui_theme = UiTheme::DarkSlide;
+                app.show_warnings = false;
+                app.doc_mut().name = "Keynote_Slide_Dark.svg".to_string();
+                let mut haw = build_haworth_pyranose(blen);
+                let (hx1, hy1, hx2, hy2) = mol_bbox(&haw);
+                for a in &mut haw.atoms {
+                    a.x += 105.0 - 0.5 * (hx1 + hx2);
+                    a.y += 120.0 - 0.5 * (hy1 + hy2);
+                }
+                let mut adam = build_adamantane_2d(blen);
+                let (ax1, ay1, ax2, ay2) = mol_bbox(&adam);
+                for a in &mut adam.atoms {
+                    a.x += 235.0 - 0.5 * (ax1 + ax2);
+                    a.y += 120.0 - 0.5 * (ay1 + ay2);
+                }
+                app.doc_mut().stamp_molecule_tx(haw, "Haworth Pyranose");
+                app.doc_mut().stamp_molecule_tx(adam, "Adamantane");
+                app.doc_mut().apply_scene_tx("Dark Slide Cycle", |s, nid| {
+                    insert_starter_catalytic_cycle(s, nid, 175.0, 265.0);
+                });
+                app.cmd_palette.open_fresh();
+                app.dock_tab = DockTab::Inspector;
+                app.status_msg = "Dark Slide Mode + Crossing-Bond Bridge Gaps + Command Palette (: / F4)".to_string();
+            }
+            _ => {
+                // "hero": Clean publication reaction scheme + Aspirin + Ibuprofen + TLC plate + Energy Profile + Right Studio Dock
+                app.doc_mut().name = "Synthesis_Scheme_ACS1996.cdxml".to_string();
+                app.show_warnings = false;
+                let r1 = place_smi("Oc1ccccc1C(=O)O", 92.0, 105.0, blen);
+                let p1 = place_smi("CC(=O)Oc1ccccc1C(=O)O", 275.0, 105.0, blen);
+                let ibu = place_smi("CC(C)Cc1ccc(C(C)C(=O)O)cc1", 110.0, 235.0, blen);
+                app.doc_mut().stamp_molecule_tx(r1, "Salicylic Acid");
+                app.doc_mut().stamp_molecule_tx(p1, "Aspirin");
+                app.doc_mut().stamp_molecule_tx(ibu, "Ibuprofen");
+                app.tab_mut().selected_mols = vec![1];
+                app.doc_mut().apply_scene_tx("Hero Scheme Elements", |s, nid| {
+                    let aid = *nid; *nid += 1;
+                    s.arrows.push(SceneArrow {
+                        id: aid,
+                        tail: (145.0, 105.0),
+                        head: (218.0, 105.0),
+                        arrowhead_head: "Full".to_string(),
+                        arrowhead_tail: None,
+                        no_go: None,
+                        dipole: false,
+                    });
+                    stamp_arrow_conditions(s, nid, 0, "Ac2O, H3PO4 (cat.)", "85 °C, 15 min, 92%");
+                    let tid = *nid; *nid += 1;
+                    s.tlc_plates.push(SceneTlcPlate {
+                        id: tid,
+                        bbox: (415.0, 62.0, 468.0, 148.0),
+                        origin_fraction: 0.16,
+                        spot_rfs: vec![0.28, 0.54, 0.76],
+                        spot_labels: vec!["SM".into(), "Co".into(), "Prod".into()],
+                        spot_colors: vec![(20, 20, 20), (25, 95, 205), (205, 45, 45)],
+                        solvent_label: "EtOAc/Hex 1:3".into(),
+                    });
+                    s.energy_profiles.push(chiralcraft_doc::EnergyProfile::starter(905, 215.0, 185.0));
+                });
+                app.attach_linked_caption(LinkedCaptionKind::FullSummary);
+                app.dock_tab = DockTab::Analysis;
+                app.status_msg = "ChiralCraft 1.0 — ACS 1996 • Live Linked Captions • TLC • Energy Profile".to_string();
+            }
+        }
+        app.doc_mut().save();
+        app
     }
 
     /// Launch ChiralCraft pre-loaded with a file (or in `--edit-svg` round-trip mode for WordCraft/DeckCraft).
@@ -4048,6 +4229,37 @@ impl ChiralCraftApp {
         if !self.style_initialized {
             Self::apply_theme(ctx, self.ui_theme);
             self.style_initialized = true;
+        }
+        if let Some(out_path) = self.screenshot_out_path.clone() {
+            let captured = ctx.input(|i| {
+                i.events.iter().find_map(|ev| {
+                    if let egui::Event::Screenshot { image, .. } = ev {
+                        Some(image.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(img) = captured {
+                if let Some(parent) = std::path::Path::new(&out_path).parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Ok(png_bytes) = chiralcraft_formats::encode_rgba_png(
+                    img.as_raw(),
+                    img.width() as u32,
+                    img.height() as u32,
+                ) {
+                    let _ = fs::write(&out_path, png_bytes);
+                }
+                self.screenshot_out_path = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.screenshot_frames = self.screenshot_frames.saturating_add(1);
+                if self.screenshot_frames == 6 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                }
+                ctx.request_repaint();
+            }
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.roundtrip_svg_path.is_some() {
             let _ = self.save_roundtrip_svg();
@@ -9020,6 +9232,25 @@ fn main() -> eframe::Result<()> {
         Some("--mcp") => {
             mcp::run_mcp_stdio_server();
             Ok(())
+        }
+        Some("--screenshot") if args.len() >= 4 => {
+            let preset = args[2].clone();
+            let out_path = args[3].clone();
+            let mut vp = egui::ViewportBuilder::default()
+                .with_inner_size([1360.0, 840.0])
+                .with_title("ChiralCraft");
+            if let Some(icon) = load_app_icon_data() {
+                vp = vp.with_icon(std::sync::Arc::new(icon));
+            }
+            let opts = eframe::NativeOptions {
+                viewport: vp,
+                ..Default::default()
+            };
+            eframe::run_native(
+                "ChiralCraft",
+                opts,
+                Box::new(move |_cc| Ok(Box::new(ChiralCraftApp::new_showcase_preset(&preset, &out_path)))),
+            )
         }
         Some("--edit-svg") if args.len() >= 3 => {
             let target_path = args[2].clone();

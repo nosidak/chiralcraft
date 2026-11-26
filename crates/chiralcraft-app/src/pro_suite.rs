@@ -359,9 +359,9 @@ pub fn show_isomers_window(
                     ui.horizontal(|ui| {
                         ui.label("From Atom #:");
                         ui.add(egui::DragValue::new(&mut state.push_from_atom).range(1..=max_a));
-                        ui.label("→ To Atom #:");
+                        ui.label("-> To Atom #:");
                         ui.add(egui::DragValue::new(&mut state.push_to_atom).range(1..=max_a));
-                        if ui.button("Push Electrons → Stamp Product").clicked() {
+                        if ui.button("Push Electrons -> Stamp Product").clicked() {
                             match apply_electron_push_arrow(mol, state.push_from_atom - 1, state.push_to_atom - 1) {
                                 Ok((next_mol, msg)) => {
                                     state.push_feedback = msg;
@@ -620,7 +620,7 @@ pub fn show_retrosynthesis_window(
                                     state.highlighted_retro_bond = Some(hit.bond_idx);
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("Stamp Retrosynthesis (⇒)").clicked() {
+                                    if ui.small_button("Stamp Retrosynthesis (=>)").clicked() {
                                         act = ProSuiteAction::StampRetrosynthesis(hit.clone());
                                     }
                                     ui.label(RichText::new(format!("Score {}", hit.score)).small().weak());

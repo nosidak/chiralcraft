@@ -2,7 +2,7 @@
 //!
 //! - Drag-to-orbit 3D rotation (`yaw`, `pitch`), zoom, and `a`/`b`/`c` axis snap
 //! - Render modes: **Ball & Stick**, **Stick**, **Space-Filling (CPK)**, **Wireframe**
-//! - VESTA-inspired element colors with radial specular shading & depth-sorted Painter's algorithm
+//! - CPK crystallographic element colors with radial specular shading & depth-sorted Painter's algorithm
 //! - Optional crystallographic **Unit Cell wireframe** for `.cif` and VASP `POSCAR`/`CONTCAR`
 //! - **"Snapshot to 2D Canvas"** stamps the exact rotated 3D projection onto the 2D drawing sheet
 //!   preserving `z_coord` for Rear Opacity depth cueing and crossing-bond bridge gaps!
@@ -62,7 +62,7 @@ pub enum Viewer3dAction {
     ApplyOptimized3d(ChemMolecule, String),
 }
 
-/// VESTA-inspired element RGB color for 3D spheres & sticks.
+/// CPK crystallographic element RGB color for 3D spheres & sticks.
 pub fn vesta_element_color(z: i32) -> Color32 {
     match z {
         1 => Color32::from_rgb(238, 238, 238),  // H
@@ -441,7 +441,7 @@ pub fn show_3d_viewer_window(
                         let lifted = lift_molecule_2d_to_3d(m);
                         let (opt, rep) = optimize_geometry_3d(&lifted, 180);
                         let summary = format!(
-                            "UFF 3D Opt ({} iters): E {:.1} → {:.2} kcal/mol",
+                            "UFF 3D Opt ({} iters): E {:.1} -> {:.2} kcal/mol",
                             rep.iterations, rep.initial_energy_kcal, rep.final_energy_kcal
                         );
                         state.last_opt_summary = summary.clone();
@@ -453,7 +453,7 @@ pub fn show_3d_viewer_window(
                         action = Viewer3dAction::SnapshotTo2d(snapshot_rotated_molecule(m, state.yaw, state.pitch));
                     }
                 }
-                if ui.add_enabled(has_mol, egui::Button::new("2D → 3D Lift")).clicked() {
+                if ui.add_enabled(has_mol, egui::Button::new("2D -> 3D Lift")).clicked() {
                     action = Viewer3dAction::LiftActiveTo3d;
                 }
                 if !state.measure_atoms.is_empty() && ui.small_button("Clear Measure").clicked() {

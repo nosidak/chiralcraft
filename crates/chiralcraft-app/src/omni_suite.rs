@@ -1,5 +1,5 @@
 //! All-Discipline Omni-Suite Studio Windows:
-//! 1. Multi-Spectroscopy Studio (FT-IR %T, UV–Vis λmax & Color Swatch, Interactive 2D NMR: COSY / HSQC / HMBC)
+//! 1. Multi-Spectroscopy Studio (FT-IR %T, UV-Vis λmax & Color Swatch, Interactive 2D NMR: COSY / HSQC / HMBC)
 //! 2. Organometallic 18-Electron (Green CBC) & Polymer / BigSMILES Studio
 //! 3. Reaction Energy Profile (ΔG‡) & Eyring / Boltzmann Kinetics Builder
 //! 4. ELN Procedure Generator & Lab Solvent/Reagent Safety (GHS + Liquid Volume mL) Handbook
@@ -160,7 +160,7 @@ pub fn show_spectroscopy_window(
     let mut act = OmniSuiteAction::None;
     let mut open = state.show_spectroscopy;
 
-    egui::Window::new("Multi-Spectroscopy Studio (FT-IR / UV–Vis / 2D NMR)")
+    egui::Window::new("Multi-Spectroscopy Studio (FT-IR / UV-Vis / 2D NMR)")
         .open(&mut open)
         .default_pos([260.0, 80.0])
         .default_width(560.0)
@@ -168,8 +168,8 @@ pub fn show_spectroscopy_window(
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for (lbl, t) in [
-                    ("FT-IR (4000–400 cm⁻¹)", SpecTab::FtIr),
-                    ("UV–Vis & Color", SpecTab::UvVis),
+                    ("FT-IR (4000-400 cm^-1)", SpecTab::FtIr),
+                    ("UV-Vis & Color", SpecTab::UvVis),
                     ("2D NMR (COSY / HSQC / HMBC)", SpecTab::Nmr2d),
                 ] {
                     if ui.selectable_label(state.spec_tab == t, lbl).clicked() {
@@ -182,7 +182,7 @@ pub fn show_spectroscopy_window(
 
             let Some(mol) = active_mol.filter(|m| !m.atoms.is_empty()) else {
                 state.highlighted_spec_atoms.clear();
-                ui.weak("Draw or select a molecule to simulate IR, UV–Vis, and 2D NMR spectra.");
+                ui.weak("Draw or select a molecule to simulate IR, UV-Vis, and 2D NMR spectra.");
                 return;
             };
 
@@ -211,7 +211,7 @@ pub fn show_spectroscopy_window(
                     egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
                         for b in &ir.bands {
                             let is_sel = !b.atom_indices.is_empty() && state.highlighted_spec_atoms == b.atom_indices;
-                            if ui.selectable_label(is_sel, format!("{:.0} cm⁻¹ ({}) — {}", b.wavenumber_cm1, b.strength, b.assignment)).clicked() {
+                            if ui.selectable_label(is_sel, format!("{:.0} cm^-1 ({}) — {}", b.wavenumber_cm1, b.strength, b.assignment)).clicked() {
                                 state.highlighted_spec_atoms = if is_sel { Vec::new() } else { b.atom_indices.clone() };
                             }
                         }
@@ -227,7 +227,7 @@ pub fn show_spectroscopy_window(
                         ui.painter().rect_filled(sw, 6.0, Color32::from_rgb(uv.perceived_rgb.0, uv.perceived_rgb.1, uv.perceived_rgb.2));
                         ui.painter().rect_stroke(sw, 6.0, Stroke::new(1.0_f32, Color32::GRAY), egui::StrokeKind::Inside);
                         ui.vertical(|ui| {
-                            ui.strong(format!("λmax ≈ {:.0} nm   (ε ≈ {:.0} M⁻¹cm⁻¹)", uv.lambda_max_nm, uv.epsilon_est));
+                            ui.strong(format!("λmax ≈ {:.0} nm   (ε ≈ {:.0} M⁻¹cm^-1)", uv.lambda_max_nm, uv.epsilon_est));
                             ui.label(format!("Transition: {}  |  Chromophore: {}", uv.transition, uv.chromophore));
                             ui.label(format!("Perceived Solution Color: {}", uv.perceived_color_name));
                         });
@@ -335,15 +335,15 @@ pub fn show_ino_poly_window(
     let mut act = OmniSuiteAction::None;
     let mut open = state.show_ino_poly;
 
-    egui::Window::new("Organometallic 18e⁻ & Polymer / BigSMILES Studio")
+    egui::Window::new("Organometallic 18e- & Polymer / BigSMILES Studio")
         .open(&mut open)
         .default_pos([300.0, 110.0])
         .default_width(480.0)
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut state.ino_poly_tab, InoPolyTab::Organometallic, "Organometallic 18e⁻ / Green CBC");
-                ui.selectable_value(&mut state.ino_poly_tab, InoPolyTab::Polymer, "Polymer Mn/Mw/Đ & BigSMILES");
+                ui.selectable_value(&mut state.ino_poly_tab, InoPolyTab::Organometallic, "Organometallic 18e- / Green CBC");
+                ui.selectable_value(&mut state.ino_poly_tab, InoPolyTab::Polymer, "Polymer Mn/Mw/D & BigSMILES");
             });
             ui.separator();
 
@@ -360,7 +360,7 @@ pub fn show_ino_poly_window(
                     });
                     ui.separator();
                     let Some(mol) = active_mol.filter(|m| !m.atoms.is_empty()) else {
-                        ui.weak("Draw or stamp a transition-metal complex to analyze 18e⁻ count & oxidation state.");
+                        ui.weak("Draw or stamp a transition-metal complex to analyze 18e- count & oxidation state.");
                         return;
                     };
                     let reports = analyze_organometallic_complexes(mol);
@@ -375,7 +375,7 @@ pub fn show_ino_poly_window(
                                     Color32::from_rgb(205, 120, 15)
                                 };
                                 ui.label(RichText::new(format!(
-                                    "{} (Group {}) — {}e⁻  |  Oxidation State: {:+}  |  d^{}",
+                                    "{} (Group {}) — {}e-  |  Oxidation State: {:+}  |  d^{}",
                                     r.metal_symbol, r.group_number, r.total_valence_electrons, r.oxidation_state, r.d_electrons
                                 )).strong().color(col));
                                 ui.label(format!("Status: {}  |  Geometry: {}", r.rule_status, r.predicted_geometry));
@@ -405,7 +405,7 @@ pub fn show_ino_poly_window(
                     });
                     egui::Grid::new("poly_inputs").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
                         ui.label("DP (n):"); ui.add(egui::DragValue::new(&mut state.poly_dp).range(1.0..=100_000.0));
-                        ui.label("Dispersity (Đ):"); ui.add(egui::DragValue::new(&mut state.poly_pdi).speed(0.02).range(1.0..=10.0));
+                        ui.label("Dispersity (D):"); ui.add(egui::DragValue::new(&mut state.poly_pdi).speed(0.02).range(1.0..=10.0));
                         ui.end_row();
                         ui.label("End-Group MW:"); ui.add(egui::DragValue::new(&mut state.poly_end_mw).range(0.0..=5000.0));
                         ui.label("Comonomer MW:"); ui.add(egui::DragValue::new(&mut state.poly_comon_mw).range(12.0..=2000.0));
@@ -430,7 +430,7 @@ pub fn show_ino_poly_window(
                         "Repeat Unit MW: {:.2} Da  |  Mn: {:.1} Da ({:.2} kDa)  |  Mw: {:.1} Da ({:.2} kDa)",
                         rep.repeat_mw, rep.mn, rep.mn / 1000.0, rep.mw, rep.mw / 1000.0
                     ));
-                    ui.label(format!("Weight Fraction A: {:.1}%  |  Đ = {:.2}", rep.weight_frac_a * 100.0, rep.pdi));
+                    ui.label(format!("Weight Fraction A: {:.1}%  |  D = {:.2}", rep.weight_frac_a * 100.0, rep.pdi));
                     ui.horizontal(|ui| {
                         ui.label("BigSMILES:");
                         ui.label(RichText::new(&rep.big_smiles).monospace());
@@ -473,7 +473,7 @@ pub fn show_energy_profile_window(
             let dg = state.draft_profile.max_barrier_kcal();
             let (k_rate, t_half) = eyring_rate_and_halflife(dg, state.draft_profile.temp_k);
             ui.label(RichText::new(format!(
-                "Eyring Kinetics (ΔG‡ = {dg:.2} kcal/mol @ {:.1} K):  k = {k_rate:.2e} s⁻¹  |  t½ = {}",
+                "Eyring Kinetics (ΔG‡ = {dg:.2} kcal/mol @ {:.1} K):  k = {k_rate:.2e} s^-1  |  t1/2 = {}",
                 state.draft_profile.temp_k,
                 format_halflife(t_half)
             )).strong().color(Color32::from_rgb(20, 95, 185)));
