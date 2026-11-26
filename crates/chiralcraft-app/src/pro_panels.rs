@@ -291,6 +291,7 @@ pub fn show_biographics_toolbar(ctx: &egui::Context, open: &mut bool) -> ProPane
                     ("BioGraphics & Lab", "BioGraphics & Lab Shapes"),
                     ("Lab Glassware", "Lab Glassware & Apparatus"),
                     ("Haworth & Macro", "Haworth & Macrocycles"),
+                    ("Catalysts", "Organometallic Catalysts"),
                     ("Amino Acids", "Amino Acids"),
                     ("Carbohydrates", "Carbohydrates"),
                     ("Nucleobases", "Nucleobases"),

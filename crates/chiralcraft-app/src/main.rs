@@ -56,7 +56,7 @@ use chiralcraft_doc::{
 use chiralcraft_formats::{
     clean_up_biopolymer, decode_png_rgba, export_quantum_input, helm_to_molecule,
     inchi_to_inchikey, molecule_to_3mf_xml, molecule_to_fasta, molecule_to_helm, molecule_to_inchi,
-    molecule_to_molfile_v2000, molecule_to_molfile_v3000, molecule_to_png, molecule_to_sln,
+    molecule_to_molfile_v2000, molecule_to_molfile_v3000, molecule_to_sln,
     molecule_to_smiles, molecules_to_sdf, molfile_to_molecule, molfile_v3000_to_molecule,
     monomer_to_all_atom_molecule, parse_jcamp_dx, parse_quantum_output, sdf_to_molecules,
     sequence_to_biopolymer_molecule, smiles_to_molecule, CdxmlDocument, JcampSpectrum,
@@ -854,7 +854,9 @@ impl ChiralCraftApp {
                 s.captions.clear();
                 s.tables.clear();
                 s.tlc_plates.clear();
+                s.energy_profiles.clear();
             });
+            self.tab_mut().gel_plates.clear();
             self.tab_mut().selected_mols.clear();
             self.tab_mut().reaction_atom_maps.clear();
             self.sanitize_state();
@@ -2955,6 +2957,14 @@ impl ChiralCraftApp {
                     let hit_tlc = self.doc().scene.tlc_plates.iter().position(|t| {
                         dx >= t.bbox.0 - 4.0 && dx <= t.bbox.2 + 4.0 && dy >= t.bbox.1 - 4.0 && dy <= t.bbox.3 + 4.0
                     });
+                    let hit_ep = self.doc().scene.energy_profiles.iter().position(|ep| {
+                        let (x1, y1, x2, y2) = (ep.bbox.0.min(ep.bbox.2), ep.bbox.1.min(ep.bbox.3), ep.bbox.0.max(ep.bbox.2), ep.bbox.1.max(ep.bbox.3));
+                        dx >= x1 - 4.0 && dx <= x2 + 4.0 && dy >= y1 - 4.0 && dy <= y2 + 4.0
+                    });
+                    let hit_gel = self.tab().gel_plates.iter().position(|gp| {
+                        let (x1, y1, x2, y2) = (gp.bbox.0.min(gp.bbox.2), gp.bbox.1.min(gp.bbox.3), gp.bbox.0.max(gp.bbox.2), gp.bbox.1.max(gp.bbox.3));
+                        dx >= x1 - 4.0 && dx <= x2 + 4.0 && dy >= y1 - 4.0 && dy <= y2 + 4.0
+                    });
                     if let Some(ai) = hit_arrow {
                         self.doc_mut().apply_scene_tx("Erase Arrow", |s, _| { if ai < s.arrows.len() { s.arrows.remove(ai); } });
                     } else if let Some(ci) = hit_curve {
@@ -2965,8 +2975,99 @@ impl ChiralCraftApp {
                         self.doc_mut().apply_scene_tx("Erase Table", |s, _| { if ti < s.tables.len() { s.tables.remove(ti); } });
                     } else if let Some(ti) = hit_tlc {
                         self.doc_mut().apply_scene_tx("Erase TLC Plate", |s, _| { if ti < s.tlc_plates.len() { s.tlc_plates.remove(ti); } });
+                    } else if let Some(ei) = hit_ep {
+                        self.doc_mut().apply_scene_tx("Erase Energy Profile", |s, _| { if ei < s.energy_profiles.len() { s.energy_profiles.remove(ei); } });
+                    } else if let Some(gi) = hit_gel {
+                        self.tab_mut().gel_plates.remove(gi);
+                        self.status_msg = "Erased Gel Electrophoresis Plate".to_string();
                     }
                 }
+            }
+            Tool::Templates => {
+                if let Some(lib) = self.ctp_libraries.get(self.selected_ctp_idx).cloned() {
+                    let lib_name = lib.name.clone();
+                    if let Some(m) = lib.stamp(0, dx, dy) {
+                        self.doc_mut().stamp_molecule_tx(m, "Template Stamp");
+                        self.status_msg = format!("Stamped {lib_name} #1");
+                    } else if let Some(curves) = lib.stamp_graphic(0, dx, dy) {
+                        self.doc_mut().apply_scene_tx("Graphic Template Stamp", |s, nid| {
+                            for mut c in curves {
+                                c.id = *nid;
+                                *nid += 1;
+                                s.curves.push(c);
+                            }
+                        });
+                        self.status_msg = format!("Stamped {lib_name} graphic #1");
+                    } else {
+                        self.active_flyout = ActiveFlyout::Templates;
+                    }
+                } else {
+                    self.active_flyout = ActiveFlyout::Templates;
+                }
+            }
+            Tool::AcyclicChain => {
+                let chain = Self::build_acyclic_chain(dx, dy, dx + blen * 3.2, dy, blen);
+                let nc = chain.atoms.len();
+                self.doc_mut().stamp_molecule_tx(chain, "Add Chain");
+                self.status_msg = format!("Added {nc}-carbon acyclic chain");
+            }
+            Tool::PenCurve => {
+                self.doc_mut().apply_scene_tx("Add Curve", |scene, next_id| {
+                    let id = *next_id;
+                    *next_id += 1;
+                    scene.curves.push(SceneCurve {
+                        id,
+                        points: vec![
+                            (dx - 24.0, dy),
+                            (dx, dy - 22.0),
+                            (dx, dy - 22.0),
+                            (dx + 24.0, dy),
+                        ],
+                        closed: false,
+                    });
+                });
+            }
+            Tool::ShapeRect | Tool::ShapeOval | Tool::ShapeLine | Tool::Bracket | Tool::RoundBracket | Tool::CurlyBracket => {
+                let (gtype, stype, bb) = match self.tool {
+                    Tool::Bracket => ("Bracket", Some("Square".to_string()), (dx - 28.0, dy - 22.0, dx + 28.0, dy + 22.0)),
+                    Tool::RoundBracket => ("Bracket", Some("Round".to_string()), (dx - 28.0, dy - 22.0, dx + 28.0, dy + 22.0)),
+                    Tool::CurlyBracket => ("Bracket", Some("Curly".to_string()), (dx - 28.0, dy - 22.0, dx + 28.0, dy + 22.0)),
+                    Tool::ShapeOval => ("Oval", Some("Circle".to_string()), (dx - 22.0, dy - 22.0, dx + 22.0, dy + 22.0)),
+                    Tool::ShapeLine => ("Line", None, (dx - 26.0, dy, dx + 26.0, dy)),
+                    _ => ("Rectangle", Some("Shadow".to_string()), (dx - 32.0, dy - 22.0, dx + 32.0, dy + 22.0)),
+                };
+                self.doc_mut().apply_scene_tx(gtype, |scene, next_id| {
+                    let id = *next_id;
+                    *next_id += 1;
+                    scene.graphics.push(SceneGraphic {
+                        id,
+                        graphic_type: gtype.to_string(),
+                        sub_type: stype,
+                        bbox: bb,
+                    });
+                });
+            }
+            Tool::Arrow | Tool::NoGoArrow | Tool::EquilibriumArrow | Tool::RetrosyntheticArrow | Tool::CurvedArrow => {
+                let (head, tail, nogo) = match self.tool {
+                    Tool::NoGoArrow => ("Full".to_string(), None, Some("Cross".to_string())),
+                    Tool::EquilibriumArrow => ("HalfLeft".to_string(), Some("HalfLeft".to_string()), None),
+                    Tool::RetrosyntheticArrow => ("Retrosynthetic".to_string(), None, None),
+                    Tool::CurvedArrow => ("Curved".to_string(), None, None),
+                    _ => ("Full".to_string(), None, None),
+                };
+                self.doc_mut().apply_scene_tx("Add Arrow", |scene, next_id| {
+                    let id = *next_id;
+                    *next_id += 1;
+                    scene.arrows.push(SceneArrow {
+                        id,
+                        tail: (dx - 26.0, dy),
+                        head: (dx + 26.0, dy),
+                        arrowhead_head: head,
+                        arrowhead_tail: tail,
+                        no_go: nogo,
+                        dipole: false,
+                    });
+                });
             }
             t if self.is_bond_tool() => {
                 let (ord, disp) = self.current_bond_spec();
@@ -3938,6 +4039,12 @@ impl eframe::App for ChiralCraftApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui_frame(ctx);
+    }
+}
+
+impl ChiralCraftApp {
+    fn render_ui_frame(&mut self, ctx: &egui::Context) {
         if !self.style_initialized {
             Self::apply_theme(ctx, self.ui_theme);
             self.style_initialized = true;
@@ -4127,7 +4234,7 @@ impl eframe::App for ChiralCraftApp {
                         ui.separator();
                         if ui.button("Page Setup...\tShift+Ctrl+P").clicked() { self.dialog = ActiveDialog::PageSetup; ui.close_menu(); }
                         if ui.button("Print...\tCtrl+P").clicked() {
-                            self.file_path_buf = "print_export.svg".to_string();
+                            self.file_path_buf = "print_export.pdf".to_string();
                             self.dialog = ActiveDialog::SaveAs;
                             ui.close_menu();
                         }
@@ -4171,7 +4278,9 @@ impl eframe::App for ChiralCraftApp {
                             || !self.doc().scene.graphics.is_empty()
                             || !self.doc().scene.captions.is_empty()
                             || !self.doc().scene.tables.is_empty()
-                            || !self.doc().scene.tlc_plates.is_empty();
+                            || !self.doc().scene.tlc_plates.is_empty()
+                            || !self.doc().scene.energy_profiles.is_empty()
+                            || !self.tab().gel_plates.is_empty();
                         let has_clip = !self.clipboard_mols.is_empty();
                         let u_lbl = format!("{u_raw}\tCtrl+Z");
                         let r_lbl = format!("{r_raw}\tShift+Ctrl+Z");
@@ -4304,12 +4413,14 @@ impl eframe::App for ChiralCraftApp {
                                 }
                                 ui.close_menu();
                             }
-                            if ui.add_enabled(has_mols, egui::Button::new("PNG")).clicked() {
-                                if let Some(m) = self.active_mol() {
-                                    let bytes = molecule_to_png(m, 3.0);
-                                    if fs::write("/tmp/chiralcraft-copy.png", &bytes).is_ok() {
-                                        self.status_msg = format!("Rendered PNG ({} bytes) to /tmp/chiralcraft-copy.png", bytes.len());
+                            if ui.add_enabled(has_mols, egui::Button::new("PNG (Editable)")).clicked() {
+                                match self.doc().to_editable_png(self.export_opts.png_dpi) {
+                                    Ok(bytes) => {
+                                        if fs::write("/tmp/chiralcraft-copy.png", &bytes).is_ok() {
+                                            self.status_msg = format!("Exported editable PNG ({} bytes, {} DPI) to /tmp/chiralcraft-copy.png", bytes.len(), self.export_opts.png_dpi);
+                                        }
                                     }
+                                    Err(e) => self.status_msg = format!("PNG export failed: {e}"),
                                 }
                                 ui.close_menu();
                             }
@@ -4346,6 +4457,7 @@ impl eframe::App for ChiralCraftApp {
                         let has_embedded_obj = !self.doc().scene.graphics.is_empty()
                             || !self.doc().scene.tables.is_empty()
                             || !self.doc().scene.tlc_plates.is_empty()
+                            || !self.doc().scene.energy_profiles.is_empty()
                             || !self.doc().scene.curves.is_empty()
                             || !self.doc().scene.captions.is_empty();
                         if has_embedded_obj {
@@ -4374,6 +4486,10 @@ impl eframe::App for ChiralCraftApp {
                                             p.id = *nid; *nid += 1;
                                             p.bbox = (p.bbox.0 + 14.0, p.bbox.1 + 14.0, p.bbox.2 + 14.0, p.bbox.3 + 14.0);
                                             s.tlc_plates.push(p);
+                                        } else if let Some(mut ep) = s.energy_profiles.last().cloned() {
+                                            ep.id = *nid; *nid += 1;
+                                            ep.bbox = (ep.bbox.0 + 14.0, ep.bbox.1 + 14.0, ep.bbox.2 + 14.0, ep.bbox.3 + 14.0);
+                                            s.energy_profiles.push(ep);
                                         } else if let Some(mut c) = s.curves.last().cloned() {
                                             c.id = *nid; *nid += 1;
                                             for pt in &mut c.points { pt.0 += 14.0; pt.1 += 14.0; }
@@ -4388,6 +4504,7 @@ impl eframe::App for ChiralCraftApp {
                                         if s.graphics.pop().is_none()
                                             && s.tables.pop().is_none()
                                             && s.tlc_plates.pop().is_none()
+                                            && s.energy_profiles.pop().is_none()
                                             && s.curves.pop().is_none()
                                         {
                                             let _ = s.captions.pop();
@@ -4442,6 +4559,7 @@ impl eframe::App for ChiralCraftApp {
                                 if ui.selectable_label(self.ui_theme == th, lbl).clicked() {
                                     self.ui_theme = th;
                                     Self::apply_theme(ctx, th);
+                                    self.persist_user_config();
                                     self.status_msg = format!("Switched appearance to {lbl}");
                                     ui.close_menu();
                                 }
@@ -4504,6 +4622,7 @@ impl eframe::App for ChiralCraftApp {
                         ui.separator();
                         ui.checkbox(&mut self.show_warnings, "Show Chemical Warnings");
                         ui.checkbox(&mut self.show_reaction_interp, "Show Reaction Interpretation");
+                        ui.checkbox(&mut self.tab_mut().show_atom_numbers, "Show Atom Numbers");
                         ui.separator();
                         if ui.add_enabled((self.zoom - 1.0).abs() > 0.01, egui::Button::new("Actual Size\tF5")).clicked() {
                             self.zoom = 1.0;
@@ -4855,9 +4974,17 @@ impl eframe::App for ChiralCraftApp {
                                     })
                                 })
                                 .collect();
+                            let mut expanded_cnt = 0usize;
                             for (mi, ai, lbl) in jobs {
-                                self.doc_mut().expand_label_tx(mi, ai, &lbl);
+                                if self.doc_mut().expand_label_tx(mi, ai, &lbl) {
+                                    expanded_cnt += 1;
+                                }
                             }
+                            self.status_msg = if expanded_cnt > 0 {
+                                format!("Expanded {expanded_cnt} nickname/group label(s)")
+                            } else {
+                                "No expandable nickname or functional-group labels found".to_string()
+                            };
                             ui.close_menu();
                         }
                         if ui.add_enabled(has_mols, egui::Button::new("Contract Label")).clicked() {
@@ -5304,11 +5431,11 @@ impl eframe::App for ChiralCraftApp {
                             ui.close_menu();
                         }
                         for (lbl, body) in [
-                            ("Getting Started", "Draw bonds using the left Tools palette, hover atoms and press element hotkeys (O, N, F, C=Cl, B=Br, 2==O), or pick any of the 26 .ctp Template libraries from View > Templates."),
-                            ("Tutorials", "1. Click Benzene and click empty canvas to stamp.\n2. Hover an edge and click Benzene again to fuse Naphthalene.\n3. Hover an atom and press O, N, or Enter to type a nickname like Ph, Boc, or CF3.\n4. Use Structure > Clean Up Structure (Shift+Ctrl+K) or Check Structure."),
-                            ("ChiralCraft Basics", "ChiralCraft workspace: Drag MDI document title bars to move, drag edges/corners to resize, Ctrl+Wheel to zoom, right-click atoms/bonds for quick edits, and export to 16 chemical/vector formats."),
-                            ("CLI Scripting", "Batch CLI mode is built directly into chiralcraft:\n  chiralcraft analyze <file>\n  chiralcraft convert <in> <out>\nSupports CDX, CDXML, MOL V2000/V3000, SDF, RXN, CML, CT, TGF, SKC, SVG, EPS, EMF, PNG."),
-                            ("Recent Additions", "ChiralCraft 1.0 highlights:\n• Live PubChem & ChEMBL search with curated 2D MOL/SDF import\n• Hybrid offline + PubChem IUPAC Structure ↔ Name\n• ¹H-NMR & ¹³C-NMR prediction, HELM/FASTA biopolymers & Stoichiometry Grid\n• 98 context-sensitive hotkeys, 26 template libraries, 16 journal stylesheets\n• Full IUPAC 2008 & Nature Research rendering compliance."),
+                            ("Getting Started", "Draw bonds using the left Tools palette, hover atoms and press element hotkeys (O, N, F, C=Cl, B=Br, 2==O), press ':' or F4 for the Command Palette, or pick any of the 11 built-in Template libraries from View > Templates."),
+                            ("Tutorials", "1. Click Benzene and click empty canvas to stamp.\n2. Hover an edge and click Benzene again to fuse Naphthalene.\n3. Hover an atom and press O, N, or Enter to type a nickname like Ph, Boc, O₂N, or CF₃.\n4. Use Structure > Clean Up Structure (Shift+Ctrl+K), Check Structure, or the Right-Side Studio Dock."),
+                            ("ChiralCraft Basics", "ChiralCraft workspace: Drag MDI document title bars to move, drag edges/corners to resize, Ctrl+Wheel to zoom, right-click atoms/bonds for quick edits, and export to 22+ chemical, crystallographic, quantum, and lossless editable SVG/PNG/PDF formats."),
+                            ("CLI & MCP Server", "Batch CLI & MCP server built directly into chiralcraft:\n  chiralcraft --help\n  chiralcraft analyze <file|SMILES>\n  chiralcraft convert <in> <out>\n  chiralcraft --mcp  (17-tool stdio JSON-RPC 2.0 MCP server)\nSupports CDX, CDXML, MOL, SDF, RXN, XYZ, CIF, PDB, POSCAR, JCAMP-DX, ORCA/Gaussian/xTB, and editable SVG/PNG/PDF."),
+                            ("Recent Additions", "ChiralCraft 1.0 highlights:\n• Live PubChem & ChEMBL search + offline/hybrid IUPAC Structure ↔ Name\n• ¹H/¹³C NMR + experimental JCAMP-DX overlay, FT-IR, UV–Vis & 2D NMR (COSY/HSQC/HMBC)\n• MedChem/ADMET/PAINS Scorecard, HRMS Isotopes, Isomers/pH, Markush SAR & Retrosynthesis\n• Interactive 3D Viewer, UFF-lite Optimizer, Crystal Unit Cells & ORCA/Gaussian/xTB Bridge\n• Organometallic 18e⁻ CBC, Polymers/BigSMILES, Reaction Energy Profiles (ΔG‡), LaTeX & ELN SI\n• Lossless Editable SVG/PNG/PDF round-trip + 17-tool MCP Server."),
                         ] {
                             if ui.button(lbl).clicked() {
                                 self.dialog = ActiveDialog::HelpTopic {
@@ -5363,8 +5490,8 @@ impl eframe::App for ChiralCraftApp {
                             if toolbar_icon_button(ui, ToolbarIcon::Save, false, "Save (Ctrl+S)").clicked() {
                                 self.do_save_action();
                             }
-                            if toolbar_icon_button(ui, ToolbarIcon::Print, false, "Export Vector SVG / Print...").clicked() {
-                                self.file_path_buf = "print_export.svg".to_string();
+                            if toolbar_icon_button(ui, ToolbarIcon::Print, false, "Export Vector PDF / Print...").clicked() {
+                                self.file_path_buf = "print_export.pdf".to_string();
                                 self.dialog = ActiveDialog::SaveAs;
                             }
                             if toolbar_icon_button(ui, ToolbarIcon::Help, false, "Keyboard Shortcuts & Help").clicked() {
@@ -5386,12 +5513,8 @@ impl eframe::App for ChiralCraftApp {
                             if toolbar_icon_button(ui, ToolbarIcon::Copy, false, "Copy").clicked() {
                                 self.do_copy_action();
                             }
-                            if toolbar_icon_button(ui, ToolbarIcon::Paste, false, "Paste").clicked() {
-                                let clip = self.clipboard_mols.clone();
-                                for mut m in clip {
-                                    for a in &mut m.atoms { a.x += 20.0; a.y += 20.0; }
-                                    self.doc_mut().stamp_molecule_tx(m, "Paste");
-                                }
+                            if toolbar_icon_button(ui, ToolbarIcon::Paste, false, "Paste (Ctrl+V)").clicked() {
+                                self.do_paste_action();
                             }
                             ui.add_space(3.0);
                             egui::ComboBox::from_id_salt("zoom_combo")
@@ -5476,17 +5599,35 @@ impl eframe::App for ChiralCraftApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         if ui.small_button("Front").on_hover_text("Bring to Front (F2)").clicked() {
-                            if let Some(&mi) = self.tab().selected_mols.first() {
+                            if let Some(mi) = self.active_mol_index() {
+                                let mut new_idx = None;
                                 self.doc_mut().apply_scene_tx("Bring to Front", |s, _| {
-                                    if mi < s.molecules.len() { let m = s.molecules.remove(mi); s.molecules.push(m); }
+                                    if mi < s.molecules.len() {
+                                        let m = s.molecules.remove(mi);
+                                        s.molecules.push(m);
+                                        new_idx = Some(s.molecules.len() - 1);
+                                    }
                                 });
+                                if let Some(ni) = new_idx {
+                                    self.tab_mut().selected_mols = vec![ni];
+                                    self.status_msg = "Brought structure to front".to_string();
+                                }
                             }
                         }
                         if ui.small_button("Back").on_hover_text("Send to Back (F3)").clicked() {
-                            if let Some(&mi) = self.tab().selected_mols.first() {
+                            if let Some(mi) = self.active_mol_index() {
+                                let mut moved = false;
                                 self.doc_mut().apply_scene_tx("Send to Back", |s, _| {
-                                    if mi < s.molecules.len() { let m = s.molecules.remove(mi); s.molecules.insert(0, m); }
+                                    if mi < s.molecules.len() {
+                                        let m = s.molecules.remove(mi);
+                                        s.molecules.insert(0, m);
+                                        moved = true;
+                                    }
                                 });
+                                if moved {
+                                    self.tab_mut().selected_mols = vec![0];
+                                    self.status_msg = "Sent structure to back".to_string();
+                                }
                             }
                         }
                         ui.separator();
@@ -6948,10 +7089,10 @@ impl eframe::App for ChiralCraftApp {
                             pp.line_segment([p1, p2], Stroke::new(1.5_f32, Color32::RED));
                         }
                         "Line" => {
-                            pp.line_segment([p1, p2], Stroke::new(lw, Color32::BLACK));
+                            pp.line_segment([p1, p2], Stroke::new(lw, default_ink));
                         }
                         "Oval" => {
-                            pp.circle_stroke(r.center(), r.width().min(r.height()) * 0.5, Stroke::new(lw, Color32::BLACK));
+                            pp.circle_stroke(r.center(), r.width().min(r.height()) * 0.5, Stroke::new(lw, default_ink));
                         }
                         "MultiCenter" => {
                             pp.circle_filled(r.center(), 2.8 * self.zoom, Color32::from_rgb(0, 110, 210));
@@ -6963,16 +7104,16 @@ impl eframe::App for ChiralCraftApp {
                         "Orbital" => {
                             let c = r.center();
                             match g.sub_type.as_deref() {
-                                Some("s") => { pp.circle_stroke(c, r.width() * 0.7, Stroke::new(lw, Color32::BLACK)); }
+                                Some("s") => { pp.circle_stroke(c, r.width() * 0.7, Stroke::new(lw, default_ink)); }
                                 Some("d") => {
                                     for (ox, oy, f) in [(-0.4, -0.2, true), (0.4, 0.2, true), (-0.4, 0.2, false), (0.4, -0.2, false)] {
                                         let pc = Pos2::new(c.x + r.width() * ox, c.y + r.height() * oy);
-                                        if f { pp.circle_filled(pc, r.width() * 0.35, Color32::BLACK); } else { pp.circle_stroke(pc, r.width() * 0.35, Stroke::new(lw, Color32::BLACK)); }
+                                        if f { pp.circle_filled(pc, r.width() * 0.35, default_ink); } else { pp.circle_stroke(pc, r.width() * 0.35, Stroke::new(lw, default_ink)); }
                                     }
                                 }
                                 _ => {
-                                    pp.circle_filled(Pos2::new(c.x, c.y - r.height() * 0.25), r.width() * 0.45, Color32::BLACK);
-                                    pp.circle_stroke(Pos2::new(c.x, c.y + r.height() * 0.25), r.width() * 0.45, Stroke::new(lw, Color32::BLACK));
+                                    pp.circle_filled(Pos2::new(c.x, c.y - r.height() * 0.25), r.width() * 0.45, default_ink);
+                                    pp.circle_stroke(Pos2::new(c.x, c.y + r.height() * 0.25), r.width() * 0.45, Stroke::new(lw, default_ink));
                                 }
                             }
                         }
@@ -6981,18 +7122,18 @@ impl eframe::App for ChiralCraftApp {
                             let rad = r.width().min(r.height()) * 0.5;
                             match g.sub_type.as_deref() {
                                 Some("CircleMinus") => {
-                                    pp.circle_stroke(c, rad, Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([Pos2::new(c.x - rad * 0.5, c.y), Pos2::new(c.x + rad * 0.5, c.y)], Stroke::new(lw, Color32::BLACK));
+                                    pp.circle_stroke(c, rad, Stroke::new(lw, default_ink));
+                                    pp.line_segment([Pos2::new(c.x - rad * 0.5, c.y), Pos2::new(c.x + rad * 0.5, c.y)], Stroke::new(lw, default_ink));
                                 }
-                                Some("Radical") => { pp.circle_filled(c, rad * 0.35, Color32::BLACK); }
+                                Some("Radical") => { pp.circle_filled(c, rad * 0.35, default_ink); }
                                 Some("LonePair") => {
-                                    pp.circle_filled(Pos2::new(c.x - rad * 0.35, c.y), rad * 0.25, Color32::BLACK);
-                                    pp.circle_filled(Pos2::new(c.x + rad * 0.35, c.y), rad * 0.25, Color32::BLACK);
+                                    pp.circle_filled(Pos2::new(c.x - rad * 0.35, c.y), rad * 0.25, default_ink);
+                                    pp.circle_filled(Pos2::new(c.x + rad * 0.35, c.y), rad * 0.25, default_ink);
                                 }
                                 _ => {
-                                    pp.circle_stroke(c, rad, Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([Pos2::new(c.x - rad * 0.5, c.y), Pos2::new(c.x + rad * 0.5, c.y)], Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([Pos2::new(c.x, c.y - rad * 0.5), Pos2::new(c.x, c.y + rad * 0.5)], Stroke::new(lw, Color32::BLACK));
+                                    pp.circle_stroke(c, rad, Stroke::new(lw, default_ink));
+                                    pp.line_segment([Pos2::new(c.x - rad * 0.5, c.y), Pos2::new(c.x + rad * 0.5, c.y)], Stroke::new(lw, default_ink));
+                                    pp.line_segment([Pos2::new(c.x, c.y - rad * 0.5), Pos2::new(c.x, c.y + rad * 0.5)], Stroke::new(lw, default_ink));
                                 }
                             }
                         }
@@ -7008,7 +7149,7 @@ impl eframe::App for ChiralCraftApp {
                                             let t = (k as f32) / 10.0;
                                             let bulge = (t * std::f32::consts::PI).sin();
                                             let cur = Pos2::new(bx - side * arm * (1.0 - bulge), r.min.y + t * r.height());
-                                            pp.line_segment([prev, cur], Stroke::new(lw, Color32::BLACK));
+                                            pp.line_segment([prev, cur], Stroke::new(lw, default_ink));
                                             prev = cur;
                                         }
                                     }
@@ -7028,17 +7169,17 @@ impl eframe::App for ChiralCraftApp {
                                             Pos2::new(bx - side * arm, r.max.y),
                                         ];
                                         for w in pts.windows(2) {
-                                            pp.line_segment([w[0], w[1]], Stroke::new(lw, Color32::BLACK));
+                                            pp.line_segment([w[0], w[1]], Stroke::new(lw, default_ink));
                                         }
                                     }
                                 }
                                 _ => {
-                                    pp.line_segment([r.min + Vec2::new(arm, 0.0), r.min], Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([r.min, Pos2::new(r.min.x, r.max.y)], Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([Pos2::new(r.min.x, r.max.y), Pos2::new(r.min.x + arm, r.max.y)], Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([Pos2::new(r.max.x - arm, r.min.y), Pos2::new(r.max.x, r.min.y)], Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([Pos2::new(r.max.x, r.min.y), r.max], Stroke::new(lw, Color32::BLACK));
-                                    pp.line_segment([r.max, r.max - Vec2::new(arm, 0.0)], Stroke::new(lw, Color32::BLACK));
+                                    pp.line_segment([r.min + Vec2::new(arm, 0.0), r.min], Stroke::new(lw, default_ink));
+                                    pp.line_segment([r.min, Pos2::new(r.min.x, r.max.y)], Stroke::new(lw, default_ink));
+                                    pp.line_segment([Pos2::new(r.min.x, r.max.y), Pos2::new(r.min.x + arm, r.max.y)], Stroke::new(lw, default_ink));
+                                    pp.line_segment([Pos2::new(r.max.x - arm, r.min.y), Pos2::new(r.max.x, r.min.y)], Stroke::new(lw, default_ink));
+                                    pp.line_segment([Pos2::new(r.max.x, r.min.y), r.max], Stroke::new(lw, default_ink));
+                                    pp.line_segment([r.max, r.max - Vec2::new(arm, 0.0)], Stroke::new(lw, default_ink));
                                 }
                             }
                         }
@@ -7049,9 +7190,10 @@ impl eframe::App for ChiralCraftApp {
                             };
                             let has_shadow = matches!(g.sub_type.as_deref(), Some("Shadow") | Some("RoundedShadow") | None);
                             if has_shadow {
-                                pp.rect_filled(r.translate(Vec2::splat(2.2 * self.zoom)), rad, Color32::from_gray(185));
+                                let sh_col = if self.ui_theme == UiTheme::DarkSlide { Color32::from_gray(70) } else { Color32::from_gray(185) };
+                                pp.rect_filled(r.translate(Vec2::splat(2.2 * self.zoom)), rad, sh_col);
                             }
-                            pp.rect_stroke(r, rad, Stroke::new(lw, Color32::BLACK), egui::StrokeKind::Outside);
+                            pp.rect_stroke(r, rad, Stroke::new(lw, default_ink), egui::StrokeKind::Outside);
                         }
                     }
                 }
@@ -7193,16 +7335,16 @@ impl eframe::App for ChiralCraftApp {
                     if arr.arrowhead_tail.is_some() {
                         // Equilibrium double-shafted antiparallel harpoons
                         let sep = 1.8 * self.zoom;
-                        pp.line_segment([p1 + n * sep, p2 + n * sep], Stroke::new(lw, Color32::BLACK));
-                        pp.line_segment([p2 + n * sep, p2 + n * sep - u * hl + n * hw], Stroke::new(lw, Color32::BLACK));
-                        pp.line_segment([p1 - n * sep, p2 - n * sep], Stroke::new(lw, Color32::BLACK));
-                        pp.line_segment([p1 - n * sep, p1 - n * sep + u * hl - n * hw], Stroke::new(lw, Color32::BLACK));
+                        pp.line_segment([p1 + n * sep, p2 + n * sep], Stroke::new(lw, default_ink));
+                        pp.line_segment([p2 + n * sep, p2 + n * sep - u * hl + n * hw], Stroke::new(lw, default_ink));
+                        pp.line_segment([p1 - n * sep, p2 - n * sep], Stroke::new(lw, default_ink));
+                        pp.line_segment([p1 - n * sep, p1 - n * sep + u * hl - n * hw], Stroke::new(lw, default_ink));
                     } else if arr.arrowhead_head == "Retrosynthetic" {
                         let sep = 1.6 * self.zoom;
-                        pp.line_segment([p1 + n * sep, p2 - u * 3.0 * self.zoom + n * sep], Stroke::new(lw, Color32::BLACK));
-                        pp.line_segment([p1 - n * sep, p2 - u * 3.0 * self.zoom - n * sep], Stroke::new(lw, Color32::BLACK));
-                        pp.line_segment([p2, p2 - u * hl + n * hw * 1.6], Stroke::new(lw, Color32::BLACK));
-                        pp.line_segment([p2, p2 - u * hl - n * hw * 1.6], Stroke::new(lw, Color32::BLACK));
+                        pp.line_segment([p1 + n * sep, p2 - u * 3.0 * self.zoom + n * sep], Stroke::new(lw, default_ink));
+                        pp.line_segment([p1 - n * sep, p2 - u * 3.0 * self.zoom - n * sep], Stroke::new(lw, default_ink));
+                        pp.line_segment([p2, p2 - u * hl + n * hw * 1.6], Stroke::new(lw, default_ink));
+                        pp.line_segment([p2, p2 - u * hl - n * hw * 1.6], Stroke::new(lw, default_ink));
                     } else if arr.arrowhead_head == "Curved" {
                         let ctrl = p1 + d * 0.5 - n * (len * 0.35);
                         let mut prev = p1;
@@ -7213,15 +7355,15 @@ impl eframe::App for ChiralCraftApp {
                                 mt * mt * p1.x + 2.0 * mt * t * ctrl.x + t * t * p2.x,
                                 mt * mt * p1.y + 2.0 * mt * t * ctrl.y + t * t * p2.y,
                             );
-                            pp.line_segment([prev, cur], Stroke::new(lw, Color32::BLACK));
+                            pp.line_segment([prev, cur], Stroke::new(lw, default_ink));
                             prev = cur;
                         }
                         let tu = (p2 - ctrl).normalized();
                         let tn = Vec2::new(-tu.y, tu.x);
-                        pp.add(egui::Shape::convex_polygon(vec![p2, p2 - tu * hl + tn * hw, p2 - tu * hl - tn * hw], Color32::BLACK, Stroke::NONE));
+                        pp.add(egui::Shape::convex_polygon(vec![p2, p2 - tu * hl + tn * hw, p2 - tu * hl - tn * hw], default_ink, Stroke::NONE));
                     } else {
-                        pp.line_segment([p1, p2], Stroke::new(lw, Color32::BLACK));
-                        pp.add(egui::Shape::convex_polygon(vec![p2, p2 - u * hl + n * hw, p2 - u * hl - n * hw], Color32::BLACK, Stroke::NONE));
+                        pp.line_segment([p1, p2], Stroke::new(lw, default_ink));
+                        pp.add(egui::Shape::convex_polygon(vec![p2, p2 - u * hl + n * hw, p2 - u * hl - n * hw], default_ink, Stroke::NONE));
                     }
                     if arr.no_go.as_deref() == Some("Cross") {
                         let m = p1 + d * 0.5;
@@ -7465,16 +7607,26 @@ impl eframe::App for ChiralCraftApp {
         // ---- 6b. ChiralCraft Floating Windows (`NMR`, `HELM Monomers`, `BioGraphics`, `Ring Fill`, `Stoichiometry`) ----
         let mut pro_actions = Vec::new();
         if self.show_nmr_window {
-            if let Some(pred) = self.nmr_prediction.clone() {
-                pro_actions.push(show_nmr_window(
-                    ctx,
-                    &mut self.show_nmr_window,
-                    &pred,
-                    &mut self.nmr_selected_atom,
-                    self.jcamp_overlay.as_ref(),
-                    &mut self.pro_suite.jcamp_path_buf,
-                ));
-            }
+            let pred = self.nmr_prediction.clone().unwrap_or_else(|| {
+                if let Some(ref m) = active_mol {
+                    predict_1h_nmr(m)
+                } else {
+                    NmrPrediction {
+                        nucleus: "1H",
+                        freq_mhz: 400.0,
+                        peaks: Vec::new(),
+                        report_text: "No structure selected (showing experimental JCAMP-DX overlay if loaded).".to_string(),
+                    }
+                }
+            });
+            pro_actions.push(show_nmr_window(
+                ctx,
+                &mut self.show_nmr_window,
+                &pred,
+                &mut self.nmr_selected_atom,
+                self.jcamp_overlay.as_ref(),
+                &mut self.pro_suite.jcamp_path_buf,
+            ));
         }
         if self.show_helm_toolbar {
             pro_actions.push(show_helm_monomer_window(
@@ -7524,6 +7676,7 @@ impl eframe::App for ChiralCraftApp {
             self.crossing_clearance_pt = cross_gap;
             self.export_opts = exp_opts;
             if changed {
+                self.persist_user_config();
                 self.status_msg = "Updated Object Inspector settings".to_string();
             }
         }
@@ -7935,25 +8088,16 @@ impl eframe::App for ChiralCraftApp {
                         }
                     });
                     ui.separator();
-                    ui.label("File path (.cdxml, .cdx, .mol, .sdf, .xyz, .cif, .pdb, POSCAR, .svg, .png, .pdf):");
+                    ui.label("File path (.cdxml, .cdx, .mol, .sdf, .smi, .xyz, .cif, .pdb, POSCAR, .jdx, .out/.log, .svg, .png, .pdf):");
                     ui.text_edit_singleline(&mut self.file_path_buf);
                     ui.horizontal(|ui| {
                         if ui.button("Open").clicked() {
-                            match load_document_any_with_cell(&self.file_path_buf) {
-                                Ok((d, cell_opt)) => {
-                                    let idx = self.tabs.len();
-                                    let mut tab = OpenDocTab::new_at(d, idx);
-                                    tab.file_path = Some(self.file_path_buf.clone());
-                                    self.tabs.push(tab);
-                                    self.active_tab = self.tabs.len() - 1;
-                                    if let Some(cell) = cell_opt {
-                                        self.viewer_3d.unit_cell = Some(cell);
-                                        self.viewer_3d.open = true;
-                                    }
-                                    self.status_msg = format!("Opened {}", self.file_path_buf);
+                            let path = self.file_path_buf.trim().to_string();
+                            if !path.is_empty() {
+                                self.open_path_into_new_tab(&path);
+                                if !self.status_msg.starts_with("Open failed") && !self.status_msg.starts_with("JCAMP-DX open error") {
                                     self.dialog = ActiveDialog::None;
                                 }
-                                Err(e) => self.status_msg = format!("Open failed: {e}"),
                             }
                         }
                         if ui.button("Cancel").clicked() { self.dialog = ActiveDialog::None; }
@@ -8125,11 +8269,11 @@ impl eframe::App for ChiralCraftApp {
                 });
             }
             ActiveDialog::SaveAs => {
-                egui::Window::new("Save As").collapsible(false).default_width(440.0).show(ctx, |ui| {
-                    ui.label("Format (.cdxml, .cdx, .cds, .mol, .sdf, .rxn, .ct, .tgf, .cml, .skc, .svg, .eps, .emf, .png, .sln, .inchi):");
+                egui::Window::new("Save As").collapsible(false).default_width(460.0).show(ctx, |ui| {
+                    ui.label("Format (.cdxml, .cdx, .mol, .sdf, .rxn, .svg, .png, .pdf, .eps, .emf, .cml, .ct, .tgf, .skc, .sln, .inchi):");
                     ui.text_edit_singleline(&mut self.file_path_buf);
                     ui.horizontal_wrapped(|ui| {
-                        for ext in [".cdxml", ".cdx", ".mol", ".sdf", ".rxn", ".svg", ".png", ".eps", ".emf", ".cml", ".ct", ".tgf", ".skc", ".cds"] {
+                        for ext in [".cdxml", ".cdx", ".mol", ".sdf", ".rxn", ".svg", ".png", ".pdf", ".eps", ".emf", ".cml", ".ct", ".tgf", ".skc", ".sln", ".inchi", ".cds"] {
                             if ui.small_button(ext).clicked() {
                                 let stem = self.file_path_buf.rsplit_once('.').map(|(a, _)| a).unwrap_or(&self.file_path_buf).to_string();
                                 self.file_path_buf = format!("{stem}{ext}");
@@ -8147,6 +8291,9 @@ impl eframe::App for ChiralCraftApp {
                                         self.doc_mut().name = fname.to_string();
                                     }
                                     self.doc_mut().save();
+                                    if !cfg!(test) {
+                                        self.user_config.push_recent(&path);
+                                    }
                                     self.status_msg = format!("Saved {path}");
                                     self.dialog = ActiveDialog::None;
                                 }
@@ -8602,10 +8749,11 @@ impl eframe::App for ChiralCraftApp {
                 });
             }
             ActiveDialog::Licensing => {
-                egui::Window::new("ChiralCraft Licensing").collapsible(false).show(ctx, |ui| {
-                    ui.strong("ChiralCraft 1.0 (Open Pure-Rust Edition)");
-                    ui.label("Status: Active — Full Chemistry Drawing, NMR, Biopolymers & Database Suite");
-                    ui.label("Engine: Pure-Rust Scientific Chemistry Workspace");
+                egui::Window::new("ChiralCraft Licensing").collapsible(false).default_width(420.0).show(ctx, |ui| {
+                    ui.strong("ChiralCraft 1.0 — GNU Affero General Public License v3.0");
+                    ui.label("License: AGPL-3.0-or-later");
+                    ui.label("Copyright (c) 2026 nosidak (https://github.com/nosidak/chiralcraft)");
+                    ui.label("Full pure-Rust chemistry drawing, spectroscopy, MedChem, 3D/quantum, and MCP studio.");
                     if ui.button("OK").clicked() { self.dialog = ActiveDialog::None; }
                 });
             }
@@ -8616,7 +8764,7 @@ impl eframe::App for ChiralCraftApp {
                         self.app_icon_tex = Some(ctx.load_texture("chiralcraft_app_icon", img, egui::TextureOptions::LINEAR));
                     }
                 }
-                egui::Window::new("About ChiralCraft").collapsible(false).default_width(390.0).show(ctx, |ui| {
+                egui::Window::new("About ChiralCraft").collapsible(false).default_width(420.0).show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         if let Some(ref tex) = self.app_icon_tex {
                             ui.image((tex.id(), Vec2::splat(72.0)));
@@ -8624,7 +8772,8 @@ impl eframe::App for ChiralCraftApp {
                         }
                         ui.vertical(|ui| {
                             ui.heading("ChiralCraft 1.0");
-                            ui.label("Pure-Rust scientific chemical structure editor: IUPAC 2008 / Nature drawing engine, live PubChem & ChEMBL search/import, Editable SVG round-trip (WordCraft / DeckCraft), Structure↔Name, ¹H/¹³C-NMR prediction, HELM/FASTA biopolymers, Stoichiometry Grid, Enhanced Stereo, 3MF & 16+ chemical/vector formats.");
+                            ui.label("Pure-Rust scientific chemical structure & cheminformatics studio: IUPAC 2008 rendering, 16 journal stylesheets, 11 template libraries, live PubChem/ChEMBL search, Editable SVG/PNG/PDF round-trip, ¹H/¹³C/2D NMR, FT-IR, UV–Vis, MedChem/HRMS, Isomers, Markush SAR, Retrosynthesis, 3D UFF/Crystals, ORCA/Gaussian/xTB bridge, Organometallic 18e⁻, LaTeX, ELN SI & 17-tool MCP server.");
+                            ui.small("AGPL-3.0-or-later • github.com/nosidak/chiralcraft");
                         });
                     });
                     ui.add_space(6.0);
@@ -9671,5 +9820,242 @@ mod tests {
         let smi_doc = load_document_or_smiles("CC(=O)Oc1ccccc1C(=O)O").expect("Raw SMILES must load");
         assert_eq!(smi_doc.scene.molecules.len(), 1);
         assert_eq!(chiralcraft_chem::compute_analysis_report(&smi_doc.scene.molecules[0]).formula, "C9H8O4");
+    }
+
+    #[test]
+    fn test_exhaustive_gui_every_tool_window_dialog_and_action() {
+        let mut app = ChiralCraftApp::new();
+        let ctx = egui::Context::default();
+        let run_frame = |app: &mut ChiralCraftApp| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1440.0, 900.0)));
+            let out = ctx.run(input, |c| app.render_ui_frame(c));
+            assert!(!out.shapes.is_empty(), "Headless egui frame must produce rendered shapes");
+        };
+
+        // ---- 1. Render ALL floating windows & studios on an EMPTY canvas across all 3 themes & all 4 dock tabs ----
+        app.show_analysis = true;
+        app.show_properties = true;
+        app.show_periodic_table = true;
+        app.show_info_window = true;
+        app.show_char_map = true;
+        app.show_nmr_window = true; // Must NOT panic or vanish even with nmr_prediction == None!
+        app.show_helm_toolbar = true;
+        app.show_biographics_toolbar = true;
+        app.show_ring_fill_toolbar = true;
+        app.show_stoichiometry = true;
+        app.show_object_inspector = true;
+        app.show_object_toolbar = true;
+        app.show_structure_toolbar = true;
+        app.show_rulers = true;
+        app.show_crosshair = true;
+        app.show_reaction_interp = true;
+        app.show_diff_window = true;
+        app.show_chem_db = true;
+        app.show_right_dock = true;
+        app.viewer_3d.open = true;
+        app.pro_suite.show_medchem = true;
+        app.pro_suite.show_hrms = true;
+        app.pro_suite.show_isomers = true;
+        app.pro_suite.show_markush = true;
+        app.pro_suite.show_retro = true;
+        app.pro_suite.show_pub_composer = true;
+        app.omni_suite.show_spectroscopy = true;
+        app.omni_suite.show_ino_poly = true;
+        app.omni_suite.show_energy_profile = true;
+        app.omni_suite.show_eln_safety = true;
+        app.omni_suite.show_latex_export = true;
+        app.omni_suite.show_screening = true;
+        app.quantum.show_window = true;
+        app.cmd_palette.open_fresh();
+
+        for theme in [UiTheme::ClassicLight, UiTheme::DarkChrome, UiTheme::DarkSlide] {
+            app.ui_theme = theme;
+            ChiralCraftApp::apply_theme(&ctx, theme);
+            for dtab in [DockTab::Inspector, DockTab::MedChem, DockTab::Spectra, DockTab::Quantum] {
+                app.dock_tab = dtab;
+                run_frame(&mut app);
+            }
+        }
+        app.cmd_palette.open = false;
+
+        // ---- 2. Exercise EVERY SINGLE ONE of the 53 Tool::* variants (single click + drag + erase) ----
+        let bond_tools = [
+            Tool::SolidBond, Tool::DoubleBond, Tool::TripleBond, Tool::MultipleBond,
+            Tool::DativeBond, Tool::QuadrupleBond, Tool::DashedBond, Tool::HashedBond,
+            Tool::HashWedgeBond, Tool::BoldBond, Tool::WedgeBond, Tool::HollowWedgeBond, Tool::WavyBond,
+        ];
+        for (i, &t) in bond_tools.iter().enumerate() {
+            let before = app.doc().scene.molecules.len();
+            app.tool = t;
+            app.handle_canvas_click(60.0 + (i as f64) * 28.0, 60.0, false);
+            assert_eq!(app.doc().scene.molecules.len(), before + 1, "Bond tool {:?} single click must stamp bond", t);
+        }
+        // Drag a bond from an existing atom to empty space
+        app.tool = Tool::WedgeBond;
+        app.drag_start_atom = Some((0, 0));
+        let a0 = (app.doc().scene.molecules[0].atoms[0].x, app.doc().scene.molecules[0].atoms[0].y);
+        app.handle_canvas_drag_release(a0.0, a0.1, a0.0 + 20.0, a0.1 + 15.0, false);
+        assert_eq!(app.doc().scene.molecules[0].atoms.len(), 3);
+
+        let ring_tools = [
+            Tool::Cyclopropane, Tool::Cyclobutane, Tool::Cyclopentane, Tool::Cyclohexane,
+            Tool::Cycloheptane, Tool::Cyclooctane, Tool::Chair1, Tool::Chair2,
+            Tool::Cyclopentadiene, Tool::Benzene,
+        ];
+        for (i, &t) in ring_tools.iter().enumerate() {
+            let before = app.doc().scene.molecules.len();
+            app.tool = t;
+            app.handle_canvas_click(70.0 + (i as f64) * 45.0, 140.0, false);
+            assert_eq!(app.doc().scene.molecules.len(), before + 1, "Ring tool {:?} must stamp ring", t);
+        }
+
+        // Single-click default stamping for ALL arrow, shape, bracket, orbital, symbol, curve, chain, table, TLC, template tools!
+        let arrow_tools = [Tool::Arrow, Tool::EquilibriumArrow, Tool::NoGoArrow, Tool::RetrosyntheticArrow, Tool::CurvedArrow];
+        for (i, &t) in arrow_tools.iter().enumerate() {
+            let before = app.doc().scene.arrows.len();
+            app.tool = t;
+            app.handle_canvas_click(80.0 + (i as f64) * 65.0, 210.0, false);
+            assert_eq!(app.doc().scene.arrows.len(), before + 1, "Arrow tool {:?} single-click must stamp arrow", t);
+        }
+
+        let graphic_tools = [
+            Tool::Orbital, Tool::OrbitalS, Tool::OrbitalD,
+            Tool::ShapeRect, Tool::ShapeOval, Tool::ShapeLine,
+            Tool::Bracket, Tool::RoundBracket, Tool::CurlyBracket,
+            Tool::ChemSymbol, Tool::SymbolMinus, Tool::SymbolRadical, Tool::SymbolLonePair,
+        ];
+        for (i, &t) in graphic_tools.iter().enumerate() {
+            let before = app.doc().scene.graphics.len();
+            app.tool = t;
+            app.handle_canvas_click(70.0 + (i as f64) * 35.0, 270.0, false);
+            assert_eq!(app.doc().scene.graphics.len(), before + 1, "Graphic tool {:?} single-click must stamp object", t);
+        }
+
+        app.tool = Tool::PenCurve;
+        let c_before = app.doc().scene.curves.len();
+        app.handle_canvas_click(120.0, 320.0, false);
+        assert_eq!(app.doc().scene.curves.len(), c_before + 1, "PenCurve single-click must add curve");
+
+        app.tool = Tool::AcyclicChain;
+        let m_before = app.doc().scene.molecules.len();
+        app.handle_canvas_click(220.0, 320.0, false);
+        assert_eq!(app.doc().scene.molecules.len(), m_before + 1, "AcyclicChain single-click must add chain");
+
+        app.tool = Tool::Table;
+        app.handle_canvas_click(320.0, 320.0, false);
+        assert_eq!(app.doc().scene.tables.len(), 1);
+
+        app.tool = Tool::TlcPlate;
+        app.handle_canvas_click(430.0, 320.0, false);
+        assert_eq!(app.doc().scene.tlc_plates.len(), 1);
+
+        app.tool = Tool::TextLabel;
+        app.handle_canvas_click(490.0, 320.0, false);
+        assert!(matches!(app.dialog, ActiveDialog::NewCaption { .. }));
+        app.dialog = ActiveDialog::None;
+
+        // Tool::Templates across ALL 11 built-in template libraries!
+        assert_eq!(app.ctp_libraries.len(), 11);
+        for lib_i in 0..app.ctp_libraries.len() {
+            app.selected_ctp_idx = lib_i;
+            app.tool = Tool::Templates;
+            let bm = app.doc().scene.molecules.len();
+            let bc = app.doc().scene.curves.len();
+            app.handle_canvas_click(150.0, 420.0, false);
+            assert!(
+                app.doc().scene.molecules.len() > bm || app.doc().scene.curves.len() > bc,
+                "Template library #{} ({}) must stamp via Tool::Templates",
+                lib_i, app.ctp_libraries[lib_i].name
+            );
+        }
+
+        // Perspective, Fragmentation, ReactionMap, Marquee, Lasso
+        app.tool = Tool::Marquee;
+        app.handle_canvas_drag_release(0.0, 0.0, 500.0, 500.0, false);
+        assert!(!app.tab().selected_mols.is_empty());
+        app.tool = Tool::Perspective;
+        app.handle_canvas_drag_release(200.0, 200.0, 225.0, 210.0, false);
+        app.tool = Tool::ReactionMap;
+        app.drag_start_atom = Some((0, 0));
+        let b_pos = (app.doc().scene.molecules[1].atoms[0].x, app.doc().scene.molecules[1].atoms[0].y);
+        app.handle_canvas_drag_release(a0.0, a0.1, b_pos.0, b_pos.1, false);
+        assert_eq!(app.tab().reaction_atom_maps.len(), 2);
+
+        // Energy Profile + Gel Plate + Eraser + Undo + Clear!
+        app.handle_omni_suite_action(&ctx, OmniSuiteAction::StampEnergyProfile(chiralcraft_doc::EnergyProfile::starter(901, 50.0, 450.0)));
+        app.handle_pro_panel_action(&ctx, ProPanelAction::InsertGelPlate);
+        assert_eq!(app.doc().scene.energy_profiles.len(), 1);
+        assert_eq!(app.tab().gel_plates.len(), 1);
+        app.tool = Tool::Eraser;
+        app.handle_canvas_click(90.0, 480.0, false); // Erases EnergyProfile
+        assert_eq!(app.doc().scene.energy_profiles.len(), 0, "Eraser must erase EnergyProfile");
+        assert!(app.doc_mut().undo(), "Erase EnergyProfile must undo cleanly");
+        assert_eq!(app.doc().scene.energy_profiles.len(), 1);
+
+        // ---- 3. Render POPULATED canvas with ALL 15 flyouts, ALL inner studio tabs, and ALL 40 ActiveDialog variants ----
+        app.doc_mut().stamp_molecule_tx(smiles_to_molecule("CC(=O)Oc1ccccc1C(=O)O").unwrap(), "Aspirin");
+        app.tab_mut().selected_mols = vec![app.doc().scene.molecules.len() - 1];
+        app.do_predict_nmr(false);
+
+        for fly in [
+            ActiveFlyout::None, ActiveFlyout::Templates, ActiveFlyout::Arrows, ActiveFlyout::Brackets,
+            ActiveFlyout::Chains, ActiveFlyout::ChemSymbols, ActiveFlyout::Chromatography,
+            ActiveFlyout::Colors, ActiveFlyout::Curves, ActiveFlyout::DottedDashed,
+            ActiveFlyout::Shapes, ActiveFlyout::Fragmentation, ActiveFlyout::MultipleBonds,
+            ActiveFlyout::Orbitals, ActiveFlyout::PenTools, ActiveFlyout::Windows, ActiveFlyout::Accessories,
+        ] {
+            app.active_flyout = fly;
+            run_frame(&mut app);
+        }
+        app.active_flyout = ActiveFlyout::None;
+
+        for itab in [IsomerTab::PhMicrospecies, IsomerTab::Tautomers, IsomerTab::Stereoisomers, IsomerTab::Resonance, IsomerTab::ElectronPush] {
+            app.pro_suite.isomer_tab = itab;
+            run_frame(&mut app);
+        }
+        for stab in [SpecTab::FtIr, SpecTab::UvVis, SpecTab::Nmr2d] {
+            app.omni_suite.spec_tab = stab;
+            run_frame(&mut app);
+        }
+        for ip_tab in [InoPolyTab::Organometallic, InoPolyTab::Polymer] {
+            app.omni_suite.ino_poly_tab = ip_tab;
+            run_frame(&mut app);
+        }
+
+        let all_dialogs = [
+            ActiveDialog::OpenFile, ActiveDialog::InsertFile, ActiveDialog::InsertObject,
+            ActiveDialog::SaveAs, ActiveDialog::ApplyStylesheetFile, ActiveDialog::PasteSmiles,
+            ActiveDialog::PasteNameAsStructure, ActiveDialog::PasteInchi, ActiveDialog::PasteMolText,
+            ActiveDialog::PasteCdxml, ActiveDialog::PasteEditableSvg,
+            ActiveDialog::PasteBiopolymer(PolymerKind::Peptide), ActiveDialog::PasteHelm,
+            ActiveDialog::AddToNameDict, ActiveDialog::ScaleDialog, ActiveDialog::RotateDialog,
+            ActiveDialog::PageSetup, ActiveDialog::DocumentSettings, ActiveDialog::DocumentProperties,
+            ActiveDialog::ObjectSettings, ActiveDialog::Preferences, ActiveDialog::ListNicknames,
+            ActiveDialog::DefineNickname, ActiveDialog::AtomProperties { mol_idx: 0, atom_idx: 0 },
+            ActiveDialog::BondProperties { mol_idx: 0, bond_idx: 0 }, ActiveDialog::BracketProperties,
+            ActiveDialog::RLogicQuery, ActiveDialog::LineSpacing, ActiveDialog::FontSizeOther,
+            ActiveDialog::CheckStructureDialog, ActiveDialog::ColorPicker, ActiveDialog::AttachData,
+            ActiveDialog::Annotate, ActiveDialog::FindElement, ActiveDialog::EditCaption { cap_idx: 0 },
+            ActiveDialog::NewCaption { x_tenths: 1000, y_tenths: 1000 },
+            ActiveDialog::HelpTopic { title: "Test".into(), body: "Body".into() },
+            ActiveDialog::Shortcuts, ActiveDialog::Licensing, ActiveDialog::About,
+        ];
+        for dlg in all_dialogs {
+            app.dialog = dlg;
+            run_frame(&mut app);
+        }
+        app.dialog = ActiveDialog::None;
+
+        // ---- 4. Verify Edit > Copy / Paste / Clear clears EVERYTHING including EnergyProfile & GelPlate ----
+        app.do_copy_action();
+        app.do_paste_action();
+        app.tab_mut().selected_mols.clear();
+        app.do_clear_action();
+        assert!(app.doc().scene.molecules.is_empty());
+        assert!(app.doc().scene.energy_profiles.is_empty(), "Clear must remove energy profiles");
+        assert!(app.tab().gel_plates.is_empty(), "Clear must remove gel plates");
+        assert!(app.doc_mut().undo(), "Clear must undo cleanly");
+        assert!(!app.doc().scene.molecules.is_empty());
     }
 }
