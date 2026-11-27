@@ -8,5 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 description = "Core chemistry engine for ChiralCraft (valence, implicit H, aromaticity, CIP stereo, NMR prediction, IUPAC naming)"
 
+[features]
+default = []
+ml-ir = []
+
 [dependencies]
 chiralcraft-tables = { path = "../chiralcraft-tables" }

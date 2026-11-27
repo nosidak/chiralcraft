@@ -14,7 +14,8 @@ pub mod nmr;
 pub mod properties;
 pub mod spectroscopy;
 pub use forcefield::{
-    measure_angle_deg, measure_dihedral_deg, measure_distance_angstrom, optimize_geometry_3d,
+    add_explicit_hydrogens_3d, measure_angle_deg, measure_dihedral_deg, measure_distance_angstrom,
+    optimize_geometry_3d, prepare_molecule_for_quantum, total_formal_charge, ExplicitHResult,
     ForceFieldReport,
 };
 pub use inorganic_polymer::{
@@ -34,9 +35,13 @@ pub use medchem::{
 pub use nmr::{predict_13c_nmr, predict_1h_nmr, NmrPeak, NmrPrediction};
 pub use properties::{compute_analysis_report, estimate_chemical_properties, AnalysisReport, ChemicalProperties};
 pub use spectroscopy::{
-    predict_2d_nmr, predict_ir_spectrum, predict_uv_vis, IrBand, IrPrediction, Nmr2dCrossPeak,
-    Nmr2dKind, Nmr2dPrediction, UvVisPrediction,
+    absorbance_to_transmittance_pct, compare_ir_spectra, pick_ir_peaks, predict_2d_nmr,
+    predict_ir_spectrum, predict_uv_vis, transmittance_pct_to_absorbance, IrBackend, IrBand,
+    IrComparisonMetrics, IrLineShape, IrPeak, IrPrediction, IrRenderParams, IrSpectrumSource,
+    IrYAxis, Nmr2dCrossPeak, Nmr2dKind, Nmr2dPrediction, RuleBasedIrBackend, UvVisPrediction,
 };
+#[cfg(feature = "ml-ir")]
+pub use spectroscopy::MlIrModelHook;
 
 pub use chiralcraft_tables::{
     cs_real_num_kundef, electron_mass_factor, ElementRecord, IsotopeRecord, PseudoAtomRecord,

@@ -1,13 +1,22 @@
-//! Computational Chemistry Bridge: ORCA (`.inp`/`.out`), Gaussian (`.gjf`/`.log`), and xTB.
+//! Computational Chemistry Bridge: ORCA (`.inp`/`.out`), Gaussian (`.gjf`/`.log`),
+//! xTB (`GFN2-xTB` / `GFN-FF` `vibspectrum` & `g98.out`), and Molden (`.molden`).
 //!
 //! - Exports ready-to-run DFT / semi-empirical input decks directly from any 2D/3D `ChemMolecule`
-//! - Parses completed ORCA `.out` and Gaussian `.log` files to extract optimized 3D coordinates,
-//!   final SCF energy (Hartree), HOMO/LUMO orbital energies & gap (eV), dipole moment (Debye),
-//!   and calculated harmonic IR vibrational frequencies (cm⁻¹).
+//!   with automatic explicit-H 3D placement and UFF pre-optimization.
+//! - Parses completed ORCA `.out`, Gaussian `.log`, xTB `g98.out` / `vibspectrum`, and Molden `.molden`
+//!   files to extract optimized 3D coordinates, SCF energy (Hartree), HOMO/LUMO gap (eV), dipole moment (Debye),
+//!   and full harmonic IR spectra (wavenumbers `cm⁻¹`, intensities `km/mol`, imaginary mode count,
+//!   symmetry labels, and 3D Cartesian normal-mode displacement vectors).
 
-use chiralcraft_chem::{get_element, get_element_by_symbol, BondDisplay, ChemAtom, ChemMolecule};
+use std::path::Path;
+
+use chiralcraft_chem::{
+    get_element, get_element_by_symbol, prepare_molecule_for_quantum, total_formal_charge,
+    BondDisplay, ChemAtom, ChemMolecule, IrBand, IrPrediction, IrSpectrumSource,
+};
 
 const PT_PER_ANG: f64 = 14.40 / 1.50;
+const BOHR_TO_ANG: f64 = 0.529_177_210_9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantumProgram {
@@ -34,6 +43,12 @@ pub struct QuantumJobSpec {
     pub multiplicity: u32,
     pub solvent: String, // "None", "THF", "DCM", "Water", "DMSO", "MeCN", "Toluene"
     pub nprocs: u32,
+    /// Automatically materialize implicit hydrogens in 3D before writing Cartesian coordinates.
+    pub add_explicit_hydrogens: bool,
+    /// Run a quick pure-Rust UFF-lite 3D relaxation before writing Cartesian coordinates.
+    pub pre_optimize_uff: bool,
+    /// xTB Hamiltonian level: `2` = GFN2-xTB (default), `1` = GFN1-xTB, `0` = GFN-FF.
+    pub xtb_gfn_level: u8,
 }
 
 impl Default for QuantumJobSpec {
@@ -47,19 +62,28 @@ impl Default for QuantumJobSpec {
             multiplicity: 1,
             solvent: "None".to_string(),
             nprocs: 4,
+            add_explicit_hydrogens: true,
+            pre_optimize_uff: true,
+            xtb_gfn_level: 2,
         }
     }
 }
 
-fn molecule_angstrom_coords(mol: &ChemMolecule) -> Vec<(String, f64, f64, f64)> {
+fn molecule_angstrom_coords_prepared(
+    mol: &ChemMolecule,
+    spec: &QuantumJobSpec,
+) -> (Vec<(String, f64, f64, f64)>, i32) {
     if mol.atoms.is_empty() {
-        return Vec::new();
+        return (Vec::new(), spec.charge);
     }
-    let nf = mol.atoms.len() as f64;
-    let cx = mol.atoms.iter().map(|a| a.x).sum::<f64>() / nf;
-    let cy = mol.atoms.iter().map(|a| a.y).sum::<f64>() / nf;
-    let cz = mol.atoms.iter().map(|a| a.z_coord).sum::<f64>() / nf;
-    mol.atoms
+    let prep = prepare_molecule_for_quantum(mol, spec.add_explicit_hydrogens, spec.pre_optimize_uff);
+    let m = &prep.molecule;
+    let nf = m.atoms.len() as f64;
+    let cx = m.atoms.iter().map(|a| a.x).sum::<f64>() / nf;
+    let cy = m.atoms.iter().map(|a| a.y).sum::<f64>() / nf;
+    let cz = m.atoms.iter().map(|a| a.z_coord).sum::<f64>() / nf;
+    let coords = m
+        .atoms
         .iter()
         .map(|a| {
             let sym = get_element(a.z).map(|e| e.symbol).unwrap_or("C").to_string();
@@ -70,11 +94,18 @@ fn molecule_angstrom_coords(mol: &ChemMolecule) -> Vec<(String, f64, f64, f64)> 
                 (a.z_coord - cz) / PT_PER_ANG,
             )
         })
-        .collect()
+        .collect();
+    let charge = if spec.charge == 0 {
+        total_formal_charge(m)
+    } else {
+        spec.charge
+    };
+    (coords, charge)
 }
 
 /// Generates a ready-to-run **ORCA** `.inp` input deck.
 pub fn export_orca_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String {
+    let (coords, charge) = molecule_angstrom_coords_prepared(mol, spec);
     let job_kw = match spec.job_type {
         QuantumJobType::OptFreq => "Opt Freq",
         QuantumJobType::SinglePoint => "SP",
@@ -93,8 +124,8 @@ pub fn export_orca_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String {
     if spec.job_type == QuantumJobType::TdDft {
         out.push_str("%tddft\n  nroots 15\n  tda false\nend\n");
     }
-    out.push_str(&format!("\n* xyz {} {}\n", spec.charge, spec.multiplicity.max(1)));
-    for (sym, x, y, z) in molecule_angstrom_coords(mol) {
+    out.push_str(&format!("\n* xyz {} {}\n", charge, spec.multiplicity.max(1)));
+    for (sym, x, y, z) in coords {
         out.push_str(&format!("  {:<3} {:12.6} {:12.6} {:12.6}\n", sym, x, y, z));
     }
     out.push_str("*\n");
@@ -103,6 +134,7 @@ pub fn export_orca_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String {
 
 /// Generates a ready-to-run **Gaussian 16** `.gjf` input deck.
 pub fn export_gaussian_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String {
+    let (coords, charge) = molecule_angstrom_coords_prepared(mol, spec);
     let job_kw = match spec.job_type {
         QuantumJobType::OptFreq => "Opt Freq",
         QuantumJobType::SinglePoint => "SP",
@@ -121,24 +153,28 @@ pub fn export_gaussian_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> Strin
         spec.basis,
         job_kw,
         solv,
-        spec.charge,
+        charge,
         spec.multiplicity.max(1)
     );
-    for (sym, x, y, z) in molecule_angstrom_coords(mol) {
+    for (sym, x, y, z) in coords {
         out.push_str(&format!("  {:<3} {:12.6} {:12.6} {:12.6}\n", sym, x, y, z));
     }
     out.push('\n');
     out
 }
 
-/// Generates a ready-to-run **xTB (GFN2-xTB)** `.xyz` coordinate block + recommended CLI command header.
+/// Generates a ready-to-run **xTB (GFN2-xTB / GFN-FF)** `.xyz` coordinate block + CLI command header.
 pub fn export_xtb_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String {
-    let coords = molecule_angstrom_coords(mol);
+    let (coords, charge) = molecule_angstrom_coords_prepared(mol, spec);
     let task = match spec.job_type {
         QuantumJobType::OptFreq => "--ohess",
         QuantumJobType::SinglePoint => "--scc",
-        QuantumJobType::TdDft => "--opt",
-        QuantumJobType::Nmr => "--opt",
+        QuantumJobType::TdDft | QuantumJobType::Nmr => "--opt",
+    };
+    let method_flag = match spec.xtb_gfn_level {
+        0 => "--gfnff",
+        1 => "--gfn 1",
+        _ => "--gfn 2",
     };
     let solv = if spec.solvent.eq_ignore_ascii_case("none") || spec.solvent.trim().is_empty() {
         String::new()
@@ -147,9 +183,10 @@ pub fn export_xtb_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String {
     };
     let uhf = spec.multiplicity.saturating_sub(1);
     let mut out = format!(
-        "{}\n# Run: xtb structure.xyz --gfn 2 --chrg {} --uhf {} {}{}\n",
+        "{}\n# Run: xtb structure.xyz {} --chrg {} --uhf {} {}{}\n",
         coords.len(),
-        spec.charge,
+        method_flag,
+        charge,
         uhf,
         task,
         solv
@@ -169,6 +206,18 @@ pub fn export_quantum_input(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct QuantumIrMode {
+    pub mode_index: usize,
+    pub wavenumber_cm1: f64,
+    /// Physical IR intensity in `km/mol` (0.0 if inactive or unavailable).
+    pub intensity_km_mol: f64,
+    pub symmetry: Option<String>,
+    pub is_imaginary: bool,
+    /// Cartesian normal-mode displacements `[dx, dy, dz]` per atom (aligned with `optimized_molecule.atoms`).
+    pub displacements: Vec<[f64; 3]>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct QuantumOutputReport {
     pub program: String,
     pub converged: bool,
@@ -178,7 +227,259 @@ pub struct QuantumOutputReport {
     pub homo_lumo_gap_ev: Option<f64>,
     pub dipole_debye: Option<f64>,
     pub ir_frequencies_cm1: Vec<f64>,
+    pub ir_modes: Vec<QuantumIrMode>,
+    pub imaginary_mode_count: usize,
     pub optimized_molecule: Option<ChemMolecule>,
+}
+
+fn atom_mass(z: i32) -> f64 {
+    get_element(z).map(|e| e.atomic_weight()).unwrap_or(12.011)
+}
+
+fn describe_normal_mode(
+    mode: &QuantumIrMode,
+    opt_mol: Option<&ChemMolecule>,
+    parent_heavy_map: Option<&[Option<usize>]>,
+) -> (String, Vec<usize>, Vec<(usize, f64)>) {
+    let mut atom_weights: Vec<(usize, f64)> = Vec::new();
+    let mut canvas_indices: Vec<usize> = Vec::new();
+    let mut detail = String::new();
+
+    if let Some(mol) = opt_mol {
+        if mode.displacements.len() == mol.atoms.len() && !mol.atoms.is_empty() {
+            let mut raw_ke = Vec::with_capacity(mol.atoms.len());
+            let mut total_ke = 0.0_f64;
+            for (i, d) in mode.displacements.iter().enumerate() {
+                let m = atom_mass(mol.atoms[i].z);
+                let ke = m * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                raw_ke.push((i, ke));
+                total_ke += ke;
+            }
+            if total_ke > 1e-12 {
+                for (i, ke) in &mut raw_ke {
+                    *ke /= total_ke;
+                    let _ = i;
+                }
+                raw_ke.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                atom_weights = raw_ke.iter().take(6).copied().collect();
+
+                // Map top contributing atoms back to 2D canvas heavy atoms when available
+                let mut seen = std::collections::BTreeSet::new();
+                for &(ai, w) in &raw_ke {
+                    if w < 0.08 && !canvas_indices.is_empty() {
+                        break;
+                    }
+                    let mapped = parent_heavy_map
+                        .and_then(|pm| pm.get(ai).copied().flatten())
+                        .unwrap_or_else(|| {
+                            // If atom is H, map to its bonded heavy neighbor
+                            if mol.atoms[ai].z == 1 {
+                                mol.bonds
+                                    .iter()
+                                    .find_map(|b| {
+                                        if b.begin_atom == ai {
+                                            Some(b.end_atom)
+                                        } else if b.end_atom == ai {
+                                            Some(b.begin_atom)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(ai)
+                            } else {
+                                ai
+                            }
+                        });
+                    if seen.insert(mapped) {
+                        canvas_indices.push(mapped);
+                    }
+                    if canvas_indices.len() >= 4 {
+                        break;
+                    }
+                }
+
+                // Human-readable dominant group summary from top 2 atoms
+                let sym_of = |idx: usize| -> &'static str {
+                    get_element(mol.atoms[idx].z).map(|e| e.symbol).unwrap_or("X")
+                };
+                if raw_ke.len() >= 2 {
+                    let (a0, w0) = raw_ke[0];
+                    let (a1, w1) = raw_ke[1];
+                    let bonded = mol
+                        .bonds
+                        .iter()
+                        .any(|b| (b.begin_atom == a0 && b.end_atom == a1) || (b.begin_atom == a1 && b.end_atom == a0));
+                    let pct = ((w0 + w1) * 100.0).round() as i32;
+                    if bonded {
+                        let kind = if mode.wavenumber_cm1 >= 1500.0 {
+                            "stretch"
+                        } else if mode.wavenumber_cm1 >= 1000.0 {
+                            "stretch/bend"
+                        } else {
+                            "bend/wag"
+                        };
+                        detail = format!(
+                            "{}{}–{}{} {} ({}%)",
+                            sym_of(a0),
+                            a0 + 1,
+                            sym_of(a1),
+                            a1 + 1,
+                            kind,
+                            pct
+                        );
+                    } else {
+                        detail = format!(
+                            "{}{} ({:.0}%), {}{} ({:.0}%)",
+                            sym_of(a0),
+                            a0 + 1,
+                            w0 * 100.0,
+                            sym_of(a1),
+                            a1 + 1,
+                            w1 * 100.0
+                        );
+                    }
+                } else if let Some(&(a0, w0)) = raw_ke.first() {
+                    detail = format!("{}{} ({:.0}%)", sym_of(a0), a0 + 1, w0 * 100.0);
+                }
+            }
+        }
+    }
+
+    let label = if mode.is_imaginary {
+        if detail.is_empty() {
+            format!("Imaginary Mode #{} (TS / saddle)", mode.mode_index)
+        } else {
+            format!("Imaginary Mode #{} · {detail}", mode.mode_index)
+        }
+    } else if detail.is_empty() {
+        match &mode.symmetry {
+            Some(sym) => format!("Harmonic Mode #{} ({sym})", mode.mode_index),
+            None => format!("Harmonic Mode #{}", mode.mode_index),
+        }
+    } else {
+        format!("Mode #{} · {detail}", mode.mode_index)
+    };
+
+    (label, canvas_indices, atom_weights)
+}
+
+impl QuantumOutputReport {
+    /// Converts parsed quantum vibrational modes into a full `IrPrediction` ready for FT-IR Studio
+    /// plotting, HQI comparison, 2D canvas highlighting, and 3D normal-mode animation.
+    pub fn to_ir_prediction(
+        &self,
+        parent_heavy_map: Option<&[Option<usize>]>,
+    ) -> Option<IrPrediction> {
+        if self.ir_modes.is_empty() && self.ir_frequencies_cm1.is_empty() {
+            return None;
+        }
+        let source = match self.program.as_str() {
+            "ORCA" => IrSpectrumSource::OrcaDft,
+            "Gaussian" => IrSpectrumSource::GaussianDft,
+            "xTB (GFN-FF)" => IrSpectrumSource::XtbGfnFf,
+            "xTB" | "GFN2-xTB" => IrSpectrumSource::XtbGfn2,
+            "Molden" => IrSpectrumSource::Molden,
+            _ => IrSpectrumSource::OrcaDft,
+        };
+        let default_scale = source.recommended_scale_factor();
+
+        let modes: Vec<QuantumIrMode> = if !self.ir_modes.is_empty() {
+            self.ir_modes.clone()
+        } else {
+            self.ir_frequencies_cm1
+                .iter()
+                .enumerate()
+                .map(|(k, &f)| QuantumIrMode {
+                    mode_index: k + 1,
+                    wavenumber_cm1: f,
+                    intensity_km_mol: 25.0,
+                    symmetry: None,
+                    is_imaginary: f < 0.0,
+                    displacements: Vec::new(),
+                })
+                .collect()
+        };
+
+        let max_int = modes
+            .iter()
+            .filter(|m| !m.is_imaginary && m.wavenumber_cm1 >= 200.0)
+            .map(|m| m.intensity_km_mol)
+            .fold(0.0_f64, f64::max);
+        let has_real_int = max_int > 1e-6;
+
+        let mut bands = Vec::with_capacity(modes.len());
+        let mut imag_cnt = 0usize;
+        for m in &modes {
+            if m.is_imaginary {
+                imag_cnt += 1;
+            }
+            let norm_int = if m.is_imaginary {
+                0.0
+            } else if has_real_int {
+                (m.intensity_km_mol / max_int).clamp(0.0, 1.0)
+            } else {
+                0.55
+            };
+            let strength = if m.is_imaginary {
+                "imag"
+            } else if norm_int >= 0.70 {
+                "vs"
+            } else if norm_int >= 0.40 {
+                "s"
+            } else if norm_int >= 0.15 {
+                "m"
+            } else {
+                "w"
+            };
+            let (assignment, atom_indices, atom_weights) =
+                describe_normal_mode(m, self.optimized_molecule.as_ref(), parent_heavy_map);
+            bands.push(IrBand {
+                wavenumber_cm1: m.wavenumber_cm1,
+                intensity: norm_int,
+                intensity_km_mol: if has_real_int {
+                    Some(m.intensity_km_mol)
+                } else {
+                    None
+                },
+                width_cm1: 9.0,
+                strength: strength.to_string(),
+                assignment,
+                symmetry: m.symmetry.clone(),
+                is_imaginary: m.is_imaginary,
+                mode_index: Some(m.mode_index),
+                atom_indices,
+                atom_weights,
+                normal_mode_vectors: if m.displacements.is_empty() {
+                    None
+                } else {
+                    Some(m.displacements.clone())
+                },
+            });
+        }
+
+        // Sort real bands high -> low cm^-1, placing imaginary modes first for immediate visibility
+        bands.sort_by(|a, b| {
+            match (a.is_imaginary, b.is_imaginary) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b
+                    .wavenumber_cm1
+                    .partial_cmp(&a.wavenumber_cm1)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
+
+        let mut pred = IrPrediction {
+            source,
+            bands,
+            imaginary_count: imag_cnt.max(self.imaginary_mode_count),
+            default_scale_factor: default_scale,
+            report_text: String::new(),
+            mode_geometry_3d: self.optimized_molecule.clone(),
+        };
+        pred.report_text = pred.format_report(default_scale);
+        Some(pred)
+    }
 }
 
 fn coords_to_3d_mol(raw: &[(i32, f64, f64, f64)]) -> Option<ChemMolecule> {
@@ -193,18 +494,277 @@ fn coords_to_3d_mol(raw: &[(i32, f64, f64, f64)]) -> Option<ChemMolecule> {
     crate::xyz_to_molecule(&xyz).ok()
 }
 
-/// Parses an ORCA `.out`, Gaussian `.log`, or ORCA/Gaussian `.inp`/`.gjf` file into a `QuantumOutputReport`.
+/// Parses a TURBOMOLE / xTB `vibspectrum` file.
+pub fn parse_xtb_vibspectrum(text: &str) -> Result<Vec<QuantumIrMode>, String> {
+    let mut modes = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("$vibrational spectrum") {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if t.starts_with("$end") {
+            break;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let toks: Vec<&str> = t.split_whitespace().collect();
+        // Format: "  7   a     1635.42    72.45   YES    YES" OR without symmetry "  7  1635.42  72.45  YES  YES"
+        if toks.len() >= 3 {
+            let Ok(idx) = toks[0].parse::<usize>() else {
+                continue;
+            };
+            let (sym, wn, inten) = if let Ok(f) = toks[1].parse::<f64>() {
+                let int_v = toks.get(2).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                (None, f, int_v)
+            } else if toks.len() >= 4 {
+                let Ok(f) = toks[2].parse::<f64>() else {
+                    continue;
+                };
+                let int_v = toks[3].parse::<f64>().unwrap_or(0.0);
+                (Some(toks[1].to_string()), f, int_v)
+            } else {
+                continue;
+            };
+            if wn.abs() < 1e-2 {
+                continue; // skip 6 translational/rotational zero modes
+            }
+            modes.push(QuantumIrMode {
+                mode_index: idx,
+                wavenumber_cm1: wn,
+                intensity_km_mol: inten.max(0.0),
+                symmetry: sym,
+                is_imaginary: wn < 0.0,
+                displacements: Vec::new(),
+            });
+        }
+    }
+    if modes.is_empty() {
+        Err("No vibrational modes found in vibspectrum".to_string())
+    } else {
+        Ok(modes)
+    }
+}
+
+/// Parses a Molden vibrational file (`molden.input` / `.molden`) with `[FREQ]`, `[INT]`, `[FR-COORD]`, `[FR-NORM-COORD]`.
+pub fn parse_molden_vibrations(text: &str) -> Result<QuantumOutputReport, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut freqs: Vec<f64> = Vec::new();
+    let mut ints: Vec<f64> = Vec::new();
+    let mut coords: Vec<(i32, f64, f64, f64)> = Vec::new();
+    let mut mode_vecs: Vec<Vec<[f64; 3]>> = Vec::new();
+
+    #[derive(PartialEq)]
+    enum Sec {
+        None,
+        Freq,
+        Int,
+        FrCoord,
+        AtomsAngs,
+        AtomsAu,
+        FrNormCoord,
+    }
+    let mut sec = Sec::None;
+    let mut cur_vec: Vec<[f64; 3]> = Vec::new();
+    let mut in_vib = false;
+
+    for raw in &lines {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with('[') {
+            if in_vib && !cur_vec.is_empty() {
+                mode_vecs.push(std::mem::take(&mut cur_vec));
+                in_vib = false;
+            }
+            let up = t.to_ascii_uppercase();
+            sec = if up.starts_with("[FREQ]") {
+                Sec::Freq
+            } else if up.starts_with("[INT]") {
+                Sec::Int
+            } else if up.starts_with("[FR-COORD]") {
+                Sec::FrCoord
+            } else if up.starts_with("[ATOMS]") {
+                if up.contains("ANGS") {
+                    Sec::AtomsAngs
+                } else {
+                    Sec::AtomsAu
+                }
+            } else if up.starts_with("[FR-NORM-COORD]") {
+                Sec::FrNormCoord
+            } else {
+                Sec::None
+            };
+            continue;
+        }
+        match sec {
+            Sec::Freq => {
+                if let Ok(v) = t.split_whitespace().next().unwrap_or("").parse::<f64>() {
+                    freqs.push(v);
+                }
+            }
+            Sec::Int => {
+                if let Ok(v) = t.split_whitespace().next().unwrap_or("").parse::<f64>() {
+                    ints.push(v);
+                }
+            }
+            Sec::FrCoord => {
+                let toks: Vec<&str> = t.split_whitespace().collect();
+                if toks.len() >= 4 {
+                    if let (Some(el), Ok(x), Ok(y), Ok(z)) = (
+                        get_element_by_symbol(toks[0]),
+                        toks[1].parse::<f64>(),
+                        toks[2].parse::<f64>(),
+                        toks[3].parse::<f64>(),
+                    ) {
+                        // Molden [FR-COORD] is in Bohr (a.u.)
+                        coords.push((el.z, x * BOHR_TO_ANG, y * BOHR_TO_ANG, z * BOHR_TO_ANG));
+                    }
+                }
+            }
+            Sec::AtomsAngs | Sec::AtomsAu => {
+                if coords.is_empty() {
+                    let toks: Vec<&str> = t.split_whitespace().collect();
+                    if toks.len() >= 6 {
+                        if let (Ok(z), Ok(x), Ok(y), Ok(zc)) = (
+                            toks[2].parse::<i32>(),
+                            toks[3].parse::<f64>(),
+                            toks[4].parse::<f64>(),
+                            toks[5].parse::<f64>(),
+                        ) {
+                            let s = if sec == Sec::AtomsAu { BOHR_TO_ANG } else { 1.0 };
+                            coords.push((z, x * s, y * s, zc * s));
+                        }
+                    }
+                }
+            }
+            Sec::FrNormCoord => {
+                if t.to_ascii_lowercase().starts_with("vibration") {
+                    if in_vib && !cur_vec.is_empty() {
+                        mode_vecs.push(std::mem::take(&mut cur_vec));
+                    }
+                    in_vib = true;
+                    continue;
+                }
+                let toks: Vec<&str> = t.split_whitespace().collect();
+                if toks.len() >= 3 {
+                    if let (Ok(dx), Ok(dy), Ok(dz)) = (
+                        toks[0].parse::<f64>(),
+                        toks[1].parse::<f64>(),
+                        toks[2].parse::<f64>(),
+                    ) {
+                        cur_vec.push([dx, dy, dz]);
+                    }
+                }
+            }
+            Sec::None => {}
+        }
+    }
+    if in_vib && !cur_vec.is_empty() {
+        mode_vecs.push(cur_vec);
+    }
+    if freqs.is_empty() {
+        return Err("No [FREQ] vibrational modes found in Molden file".to_string());
+    }
+
+    let mut ir_modes = Vec::new();
+    let mut ir_freqs = Vec::new();
+    let mut imag_cnt = 0usize;
+    for (k, &f) in freqs.iter().enumerate() {
+        if f.abs() < 1e-2 {
+            continue;
+        }
+        let is_imag = f < 0.0;
+        if is_imag {
+            imag_cnt += 1;
+        } else {
+            ir_freqs.push(f);
+        }
+        ir_modes.push(QuantumIrMode {
+            mode_index: k + 1,
+            wavenumber_cm1: f,
+            intensity_km_mol: ints.get(k).copied().unwrap_or(0.0).max(0.0),
+            symmetry: None,
+            is_imaginary: is_imag,
+            displacements: mode_vecs.get(k).cloned().unwrap_or_default(),
+        });
+    }
+
+    Ok(QuantumOutputReport {
+        program: "Molden".to_string(),
+        converged: true,
+        energy_hartree: None,
+        homo_ev: None,
+        lumo_ev: None,
+        homo_lumo_gap_ev: None,
+        dipole_debye: None,
+        ir_frequencies_cm1: ir_freqs,
+        ir_modes,
+        imaginary_mode_count: imag_cnt,
+        optimized_molecule: coords_to_3d_mol(&coords),
+    })
+}
+
+/// Parses an ORCA `.out`, Gaussian `.log`, xTB `g98.out`/`vibspectrum`/stdout, Molden `.molden`,
+/// or ORCA/Gaussian `.inp`/`.gjf` file into a `QuantumOutputReport`.
 pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
+    if text.contains("[Molden Format]") || (text.contains("[FREQ]") && text.contains("[FR-NORM-COORD]")) {
+        return parse_molden_vibrations(text);
+    }
+    if text.contains("$vibrational spectrum") {
+        let modes = parse_xtb_vibspectrum(text)?;
+        let imag_cnt = modes.iter().filter(|m| m.is_imaginary).count();
+        let freqs = modes
+            .iter()
+            .filter(|m| !m.is_imaginary)
+            .map(|m| m.wavenumber_cm1)
+            .collect();
+        return Ok(QuantumOutputReport {
+            program: "xTB".to_string(),
+            converged: true,
+            energy_hartree: None,
+            homo_ev: None,
+            lumo_ev: None,
+            homo_lumo_gap_ev: None,
+            dipole_debye: None,
+            ir_frequencies_cm1: freqs,
+            ir_modes: modes,
+            imaginary_mode_count: imag_cnt,
+            optimized_molecule: None,
+        });
+    }
+
+    let is_xtb = text.contains("x T B")
+        || text.contains("xtb version")
+        || text.contains("xtb output")
+        || text.contains("xtb:")
+        || text.contains("GFN2-xTB")
+        || text.contains("GFN-FF")
+        || text.contains("xtb --");
     let is_orca = text.contains("* O   R   C   A *")
         || text.contains("FINAL SINGLE POINT ENERGY")
         || text.contains("CARTESIAN COORDINATES (ANGSTROEM)")
         || text.contains("* xyz");
     let is_gauss = text.contains("Gaussian, Inc.")
+        || text.contains("Gaussian 98")
         || text.contains("SCF Done:")
         || text.contains("Standard orientation:")
+        || text.contains("Frequencies --")
         || text.contains("#p ");
 
-    let program = if is_orca {
+    let program = if is_xtb {
+        if text.contains("GFN-FF") || text.contains("--gfnff") {
+            "xTB (GFN-FF)".to_string()
+        } else {
+            "xTB".to_string()
+        }
+    } else if is_orca {
         "ORCA".to_string()
     } else if is_gauss {
         "Gaussian".to_string()
@@ -214,20 +774,29 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
 
     let mut converged = text.contains("ORCA TERMINATED NORMALLY")
         || text.contains("Normal termination of Gaussian")
+        || text.contains("normal termination of xtb")
         || text.contains("HURRAY");
     let mut energy_hartree: Option<f64> = None;
     let mut homo_ev: Option<f64> = None;
     let mut lumo_ev: Option<f64> = None;
+    let mut homo_lumo_gap_override: Option<f64> = None;
     let mut dipole_debye: Option<f64> = None;
     let mut ir_freqs: Vec<f64> = Vec::new();
     let mut last_coords: Vec<(i32, f64, f64, f64)> = Vec::new();
+
+    // ORCA structured vibrational data
+    let mut orca_vib_freqs: std::collections::BTreeMap<usize, (f64, bool)> = std::collections::BTreeMap::new();
+    let mut orca_ir_ints: std::collections::BTreeMap<usize, (f64, f64)> = std::collections::BTreeMap::new();
+    let mut orca_norm_cols: std::collections::BTreeMap<usize, Vec<f64>> = std::collections::BTreeMap::new();
+    // Gaussian / xTB g98.out structured vibrational modes
+    let mut gauss_modes: Vec<QuantumIrMode> = Vec::new();
 
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i].trim();
 
-        // 1. Final SCF Energy
+        // 1. Final SCF Energy (ORCA, Gaussian, xTB)
         if let Some(rest) = line.strip_prefix("FINAL SINGLE POINT ENERGY") {
             if let Some(v) = rest.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()) {
                 energy_hartree = Some(v);
@@ -236,6 +805,24 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
             if let Some(after_eq) = line.split('=').nth(1) {
                 if let Some(v) = after_eq.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()) {
                     energy_hartree = Some(v);
+                }
+            }
+        } else if line.contains("TOTAL ENERGY") && line.contains("Eh") {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            for w in toks.windows(2) {
+                if w[1] == "Eh" {
+                    if let Ok(v) = w[0].parse::<f64>() {
+                        energy_hartree = Some(v);
+                    }
+                }
+            }
+        } else if line.contains("HOMO-LUMO GAP") && line.contains("eV") {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            for w in toks.windows(2) {
+                if w[1] == "eV" {
+                    if let Ok(v) = w[0].parse::<f64>() {
+                        homo_lumo_gap_override = Some(v);
+                    }
                 }
             }
         }
@@ -251,9 +838,14 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
                     dipole_debye = Some(v);
                 }
             }
+        } else if line.starts_with("full:") && line.split_whitespace().count() >= 5 {
+            // xTB dipole line: "full:  0.000  0.000  1.854  1.854"
+            if let Some(last) = line.split_whitespace().last().and_then(|s| s.parse::<f64>().ok()) {
+                dipole_debye = Some(last);
+            }
         }
 
-        // 3. ORCA Orbital Energies block (NO, OCC, E(Eh), E(eV))
+        // 3. ORCA Orbital Energies block
         if line == "ORBITAL ENERGIES" {
             let mut j = i + 1;
             let mut prev_occ_ev = None;
@@ -280,31 +872,263 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
 
         // 4. Gaussian Alpha occ./virt. eigenvalues (Hartree -> eV * 27.211386)
         if line.starts_with("Alpha  occ. eigenvalues --") {
-            if let Some(last) = line.split("--").nth(1).and_then(|s| s.split_whitespace().last()).and_then(|v| v.parse::<f64>().ok()) {
+            if let Some(last) = line
+                .split("--")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().last())
+                .and_then(|v| v.parse::<f64>().ok())
+            {
                 homo_ev = Some(last * 27.211_386);
             }
         } else if line.starts_with("Alpha virt. eigenvalues --") && lumo_ev.is_none() {
-            if let Some(first) = line.split("--").nth(1).and_then(|s| s.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()) {
+            if let Some(first) = line
+                .split("--")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|v| v.parse::<f64>().ok())
+            {
                 lumo_ev = Some(first * 27.211_386);
             }
         }
 
-        // 5. Vibrational Frequencies (ORCA & Gaussian)
-        if line.starts_with("Frequencies --") {
-            if let Some(rest) = line.split("--").nth(1) {
-                for tok in rest.split_whitespace() {
-                    if let Ok(f) = tok.parse::<f64>() {
-                        if f > 20.0 {
-                            ir_freqs.push(f);
+        // 5a. ORCA VIBRATIONAL FREQUENCIES block
+        if line == "VIBRATIONAL FREQUENCIES" {
+            let mut j = i + 1;
+            let mut seen_any = false;
+            while j < lines.len() {
+                let l = lines[j].trim();
+                if l.is_empty() && seen_any {
+                    break;
+                }
+                if l.contains("cm**-1") && l.contains(':') {
+                    if let Some((left, right)) = l.split_once(':') {
+                        if let (Ok(idx), Some(f)) = (
+                            left.trim().parse::<usize>(),
+                            right.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()),
+                        ) {
+                            seen_any = true;
+                            if f.abs() > 1e-2 {
+                                let imag = f < 0.0 || l.contains("imaginary");
+                                orca_vib_freqs.insert(idx, (f, imag));
+                            }
                         }
                     }
                 }
+                j += 1;
             }
-        } else if line.contains("cm**-1") && line.contains(':') {
-            if let Some(after) = line.split(':').nth(1) {
-                if let Some(f) = after.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()) {
-                    if f > 20.0 {
-                        ir_freqs.push(f);
+        }
+
+        // 5b. ORCA IR SPECTRUM block (supports ORCA 4/5/6 column layouts)
+        if line == "IR SPECTRUM" {
+            let mut j = i + 1;
+            let mut int_col_after_colon: Option<usize> = None;
+            let mut seen_rows = false;
+            while j < lines.len() {
+                let l = lines[j].trim();
+                if l.is_empty() && seen_rows {
+                    break;
+                }
+                if l.starts_with("Mode") && (l.contains("freq") || l.contains("Int")) {
+                    // Strip parenthesized unit tokens like "(cm**-1)" or "(km/mol)" before computing column index
+                    let hdr_toks: Vec<&str> = l
+                        .split_whitespace()
+                        .filter(|t| !(t.starts_with('(') && t.ends_with(')')))
+                        .collect();
+                    if let Some(pos) = hdr_toks.iter().position(|&t| t == "Int" || t.starts_with("Int(")) {
+                        int_col_after_colon = Some(pos.saturating_sub(1));
+                    } else if l.contains("eps") && l.contains("T**2") {
+                        int_col_after_colon = Some(2);
+                    } else {
+                        int_col_after_colon = Some(1);
+                    }
+                    j += 1;
+                    continue;
+                }
+                if let Some((left, right)) = l.split_once(':') {
+                    if let Ok(mode_idx) = left.trim().parse::<usize>() {
+                        let toks: Vec<&str> = right.split_whitespace().collect();
+                        if let Some(freq) = toks.first().and_then(|s| s.parse::<f64>().ok()) {
+                            let col = int_col_after_colon.unwrap_or_else(|| if toks.len() >= 4 { 2 } else { 1 });
+                            let inten = toks
+                                .get(col)
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0)
+                                .max(0.0);
+                            orca_ir_ints.insert(mode_idx, (freq, inten));
+                            seen_rows = true;
+                        }
+                    }
+                }
+                j += 1;
+            }
+        }
+
+        // 5c. ORCA NORMAL MODES matrix (3N x 3N column blocks)
+        if line == "NORMAL MODES" {
+            let mut j = i + 1;
+            // Skip descriptive header lines until first column-index row (all integers)
+            while j < lines.len() && j < i + 12 {
+                let l = lines[j].trim();
+                let toks: Vec<&str> = l.split_whitespace().collect();
+                if !toks.is_empty() && toks.iter().all(|t| t.parse::<usize>().is_ok()) {
+                    break;
+                }
+                j += 1;
+            }
+            let mut cur_cols: Vec<usize> = Vec::new();
+            while j < lines.len() {
+                let l = lines[j].trim();
+                if l.is_empty() {
+                    if !orca_norm_cols.is_empty() {
+                        // Peek ahead across blank line(s): multi-block ORCA NORMAL MODES may have a blank line
+                        // before the next all-integer column header (e.g. "6 7 8 9 10 11")
+                        let mut k = j + 1;
+                        while k < lines.len() && lines[k].trim().is_empty() {
+                            k += 1;
+                        }
+                        let next_is_col_hdr = lines
+                            .get(k)
+                            .map(|nl| {
+                                let nt: Vec<&str> = nl.trim().split_whitespace().collect();
+                                !nt.is_empty() && nt.iter().all(|t| t.parse::<usize>().is_ok())
+                            })
+                            .unwrap_or(false);
+                        if !next_is_col_hdr {
+                            break;
+                        }
+                    }
+                    j += 1;
+                    continue;
+                }
+                if l.starts_with("---") || l.starts_with("IR SPECTRUM") || l.starts_with("THERMO") {
+                    break;
+                }
+                let toks: Vec<&str> = l.split_whitespace().collect();
+                if !toks.is_empty() && toks.iter().all(|t| t.parse::<usize>().is_ok()) {
+                    cur_cols = toks.iter().filter_map(|t| t.parse::<usize>().ok()).collect();
+                    j += 1;
+                    continue;
+                }
+                if !cur_cols.is_empty() && toks.len() >= 2 {
+                    if let Ok(row_idx) = toks[0].parse::<usize>() {
+                        for (c_off, &col_id) in cur_cols.iter().enumerate() {
+                            if let Some(val) = toks.get(1 + c_off).and_then(|s| s.parse::<f64>().ok()) {
+                                let entry = orca_norm_cols.entry(col_id).or_default();
+                                if entry.len() <= row_idx {
+                                    entry.resize(row_idx + 1, 0.0);
+                                }
+                                entry[row_idx] = val;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+        }
+
+        // 5d. Gaussian / xTB g98.out Frequencies + IR Inten + Atom AN X Y Z normal modes
+        // Exclude "Frequencies ---" (3 dashes from Gaussian Freq=HPModes) to prevent double-counting.
+        if line.starts_with("Frequencies --") && !line.starts_with("Frequencies ---") {
+            let mut block_syms: Vec<Option<String>> = Vec::new();
+            if i > 0 {
+                let prev = lines[i - 1].trim();
+                let ptoks: Vec<&str> = prev.split_whitespace().collect();
+                if !ptoks.is_empty()
+                    && ptoks.len() <= 3
+                    && ptoks.iter().all(|t| t.chars().all(|c| c.is_ascii_alphanumeric() || c == '\'' || c == '"'))
+                {
+                    block_syms = ptoks.into_iter().map(|s| Some(s.to_string())).collect();
+                }
+            }
+            let block_freqs: Vec<f64> = line
+                .split("--")
+                .nth(1)
+                .map(|r| {
+                    r.split_whitespace()
+                        .filter_map(|t| t.parse::<f64>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let k_modes = block_freqs.len();
+            let mut block_ints = vec![0.0_f64; k_modes];
+            let mut block_disps: Vec<Vec<[f64; 3]>> = vec![Vec::new(); k_modes];
+
+            let mut j = i + 1;
+            let mut in_atom_table = false;
+            while j < lines.len() {
+                let l = lines[j].trim();
+                if l.starts_with("Frequencies --") || l.starts_with("Thermochemistry") || l.starts_with("-------------------") {
+                    break;
+                }
+                if l.starts_with("IR Inten") {
+                    if let Some(rest) = l.split("--").nth(1) {
+                        for (m_i, tok) in rest.split_whitespace().enumerate() {
+                            if m_i < k_modes {
+                                if let Ok(v) = tok.parse::<f64>() {
+                                    block_ints[m_i] = v.max(0.0);
+                                }
+                            }
+                        }
+                    }
+                } else if l.starts_with("Atom") && l.contains("AN") && l.contains('X') {
+                    in_atom_table = true;
+                } else if in_atom_table {
+                    let toks: Vec<&str> = l.split_whitespace().collect();
+                    // Row: "1   8   0.00  0.00  0.07   0.00  0.00 -0.05 ..."
+                    if toks.len() >= 2 + 3 * k_modes && toks[0].parse::<usize>().is_ok() && toks[1].parse::<i32>().is_ok() {
+                        for m_i in 0..k_modes {
+                            let base = 2 + 3 * m_i;
+                            if let (Ok(dx), Ok(dy), Ok(dz)) = (
+                                toks[base].parse::<f64>(),
+                                toks[base + 1].parse::<f64>(),
+                                toks[base + 2].parse::<f64>(),
+                            ) {
+                                block_disps[m_i].push([dx, dy, dz]);
+                            }
+                        }
+                    } else if l.is_empty() || toks.len() < 5 {
+                        in_atom_table = false;
+                        if !block_disps[0].is_empty() {
+                            break;
+                        }
+                    }
+                }
+                j += 1;
+            }
+
+            for m_i in 0..k_modes {
+                let f = block_freqs[m_i];
+                if f.abs() < 1e-2 {
+                    continue;
+                }
+                let idx = gauss_modes.len() + 1;
+                if f > 20.0 {
+                    ir_freqs.push(f);
+                }
+                gauss_modes.push(QuantumIrMode {
+                    mode_index: idx,
+                    wavenumber_cm1: f,
+                    intensity_km_mol: block_ints[m_i],
+                    symmetry: block_syms.get(m_i).cloned().flatten(),
+                    is_imaginary: f < 0.0,
+                    displacements: std::mem::take(&mut block_disps[m_i]),
+                });
+            }
+        } else if line.contains("cm**-1") && line.contains(':') && orca_vib_freqs.is_empty() {
+            // Standalone ORCA snippet (like unit tests without VIBRATIONAL FREQUENCIES banner)
+            if let Some((left, after)) = line.split_once(':') {
+                if let (Ok(idx), Some(f)) = (
+                    left.trim().parse::<usize>(),
+                    after.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()),
+                ) {
+                    if f.abs() > 1e-2 {
+                        let imag = f < 0.0 || line.contains("imaginary");
+                        orca_vib_freqs.insert(idx, (f, imag));
+                        if f > 20.0 {
+                            ir_freqs.push(f);
+                        }
                     }
                 }
             }
@@ -388,17 +1212,71 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
         i += 1;
     }
 
-    let optimized_molecule = coords_to_3d_mol(&last_coords);
-    if optimized_molecule.is_none() && energy_hartree.is_none() && homo_ev.is_none() {
-        return Err("Unrecognized or empty ORCA/Gaussian quantum file".to_string());
+    // Assemble final structured `ir_modes`
+    let mut ir_modes: Vec<QuantumIrMode> = Vec::new();
+    if !gauss_modes.is_empty() {
+        ir_modes = gauss_modes;
+    } else if !orca_vib_freqs.is_empty() || !orca_ir_ints.is_empty() {
+        let mut all_ids: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        all_ids.extend(orca_vib_freqs.keys().copied());
+        all_ids.extend(orca_ir_ints.keys().copied());
+        let natoms = last_coords.len();
+        for mode_id in all_ids {
+            let (wn, imag) = orca_vib_freqs
+                .get(&mode_id)
+                .copied()
+                .or_else(|| orca_ir_ints.get(&mode_id).map(|&(f, _)| (f, f < 0.0)))
+                .unwrap_or((0.0, false));
+            if wn.abs() < 1e-2 {
+                continue;
+            }
+            let inten = orca_ir_ints.get(&mode_id).map(|&(_, v)| v).unwrap_or(0.0);
+            let displacements = orca_norm_cols
+                .get(&mode_id)
+                .and_then(|flat| {
+                    if natoms > 0 && flat.len() >= 3 * natoms {
+                        Some(
+                            (0..natoms)
+                                .map(|a| [flat[3 * a], flat[3 * a + 1], flat[3 * a + 2]])
+                                .collect(),
+                        )
+                    } else if flat.len() >= 3 && flat.len() % 3 == 0 {
+                        Some(flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            if !imag && wn > 20.0 && !ir_freqs.iter().any(|&x| (x - wn).abs() < 1e-3) {
+                ir_freqs.push(wn);
+            }
+            ir_modes.push(QuantumIrMode {
+                mode_index: mode_id,
+                wavenumber_cm1: wn,
+                intensity_km_mol: inten,
+                symmetry: None,
+                is_imaginary: imag,
+                displacements,
+            });
+        }
     }
-    if energy_hartree.is_some() && !converged && !text.contains("ERROR") {
+
+    let imaginary_mode_count = ir_modes.iter().filter(|m| m.is_imaginary).count();
+    let optimized_molecule = coords_to_3d_mol(&last_coords);
+    if optimized_molecule.is_none()
+        && energy_hartree.is_none()
+        && homo_ev.is_none()
+        && ir_modes.is_empty()
+    {
+        return Err("Unrecognized or empty ORCA/Gaussian/xTB/Molden quantum file".to_string());
+    }
+    if (energy_hartree.is_some() || !ir_modes.is_empty()) && !converged && !text.contains("ERROR") {
         converged = true;
     }
-    let homo_lumo_gap_ev = match (homo_ev, lumo_ev) {
+    let homo_lumo_gap_ev = homo_lumo_gap_override.or_else(|| match (homo_ev, lumo_ev) {
         (Some(h), Some(l)) => Some(l - h),
         _ => None,
-    };
+    });
 
     Ok(QuantumOutputReport {
         program,
@@ -409,11 +1287,57 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
         homo_lumo_gap_ev,
         dipole_debye,
         ir_frequencies_cm1: ir_freqs,
+        ir_modes,
+        imaginary_mode_count,
         optimized_molecule,
     })
 }
 
-/// Convenience helper for loading an `.out`/`.log`/`.inp`/`.gjf` file directly as a `ChemMolecule`.
+/// Parses a completed xTB `--ohess` working directory, combining `g98.out` (preferred for full
+/// normal-mode displacements + intensities + geometry), `molden.input`, `vibspectrum`, `xtbopt.xyz`,
+/// and stdout log into a unified `QuantumOutputReport`.
+pub fn parse_xtb_workdir(dir: &Path, stdout_text: &str, is_gfnff: bool) -> Result<QuantumOutputReport, String> {
+    let mut rep = if let Ok(g98) = std::fs::read_to_string(dir.join("g98.out")) {
+        parse_quantum_output(&g98)?
+    } else if let Ok(molden) = std::fs::read_to_string(dir.join("molden.input")) {
+        parse_molden_vibrations(&molden)?
+    } else if let Ok(vib) = std::fs::read_to_string(dir.join("vibspectrum")) {
+        parse_quantum_output(&vib)?
+    } else {
+        parse_quantum_output(stdout_text)?
+    };
+
+    rep.program = if is_gfnff {
+        "xTB (GFN-FF)".to_string()
+    } else {
+        "xTB".to_string()
+    };
+
+    // Enrich with optimized geometry from xtbopt.xyz if missing
+    if rep.optimized_molecule.is_none() {
+        if let Ok(opt_xyz) = std::fs::read_to_string(dir.join("xtbopt.xyz")) {
+            if let Ok(m) = crate::xyz_to_molecule(&opt_xyz) {
+                rep.optimized_molecule = Some(m);
+            }
+        }
+    }
+    // Enrich with SCF energy / HOMO-LUMO gap / dipole from stdout
+    if let Ok(std_rep) = parse_quantum_output(stdout_text) {
+        if rep.energy_hartree.is_none() {
+            rep.energy_hartree = std_rep.energy_hartree;
+        }
+        if rep.homo_lumo_gap_ev.is_none() {
+            rep.homo_lumo_gap_ev = std_rep.homo_lumo_gap_ev;
+        }
+        if rep.dipole_debye.is_none() {
+            rep.dipole_debye = std_rep.dipole_debye;
+        }
+        rep.converged = rep.converged || std_rep.converged;
+    }
+    Ok(rep)
+}
+
+/// Convenience helper for loading an `.out`/`.log`/`.inp`/`.gjf`/`.molden` file directly as a `ChemMolecule`.
 pub fn quantum_file_to_molecule(text: &str) -> Result<ChemMolecule, String> {
     let rep = parse_quantum_output(text)?;
     rep.optimized_molecule
@@ -432,15 +1356,21 @@ mod tests {
     use crate::smiles_to_molecule;
 
     #[test]
-    fn test_orca_and_gaussian_export_and_parse_roundtrip() {
-        let m = smiles_to_molecule("O").unwrap();
+    fn test_orca_and_gaussian_export_adds_explicit_h_and_parses_ir_modes() {
+        let m = smiles_to_molecule("CCO").unwrap();
         let spec = QuantumJobSpec::default();
         let inp = export_orca_input(&m, &spec);
         assert!(inp.contains("! B3LYP def2-TZVP") && inp.contains("* xyz 0 1"));
+        // Ethanol must have 3 heavy + 6 explicit H = 9 coordinate lines!
+        let h_lines = inp.lines().filter(|l| l.trim_start().starts_with("H ")).count();
+        assert_eq!(h_lines, 6, "ORCA deck must include all 6 explicit H atoms:\n{inp}");
+
         let gjf = export_gaussian_input(&m, &spec);
         assert!(gjf.contains("#p B3LYP/def2-TZVP"));
+        assert_eq!(gjf.lines().filter(|l| l.trim_start().starts_with("H ")).count(), 6);
+
         let xtb = export_xtb_input(&m, &spec);
-        assert!(xtb.contains("--gfn 2"));
+        assert!(xtb.starts_with("9\n") && xtb.contains("--gfn 2"));
 
         let sample_orca_out = "\
                                  * O   R   C   A *
@@ -458,8 +1388,33 @@ ORBITAL ENERGIES
 
 FINAL SINGLE POINT ENERGY       -76.432198765
 Magnitude (Debye)      :      1.85420
+
+VIBRATIONAL FREQUENCIES
+-----------------------
+   5:       -42.10 cm**-1 ***imaginary mode***
    6:      1635.42 cm**-1
    7:      3812.15 cm**-1
+
+NORMAL MODES
+------------
+                  6           7
+      0       0.000000    0.000000
+      1       0.000000    0.000000
+      2       0.070000    0.050000
+      3       0.000000    0.000000
+      4       0.430000    0.580000
+      5      -0.550000   -0.400000
+      6       0.000000    0.000000
+      7      -0.430000   -0.580000
+      8      -0.550000   -0.400000
+
+IR SPECTRUM
+-----------
+ Mode   freq       eps      Int      T**2         TX        TY        TZ
+----------------------------------------------------------------------------
+   6:   1635.42   0.012400   71.40  0.004400  ( 0.000000  0.000000 -0.066332)
+   7:   3812.15   0.009100   45.20  0.001200  ( 0.000000  0.034641  0.000000)
+
                              ****ORCA TERMINATED NORMALLY****
 ";
         let rep = parse_quantum_output(sample_orca_out).expect("parse ORCA out");
@@ -468,9 +1423,155 @@ Magnitude (Debye)      :      1.85420
         assert!((rep.energy_hartree.unwrap() + 76.432198765).abs() < 1e-6);
         assert!((rep.homo_lumo_gap_ev.unwrap() - 9.7281).abs() < 1e-3);
         assert!((rep.dipole_debye.unwrap() - 1.8542).abs() < 1e-3);
-        assert_eq!(rep.ir_frequencies_cm1.len(), 2);
-        let opt = rep.optimized_molecule.expect("water 3D geom");
-        assert_eq!(opt.atoms.len(), 3);
-        assert_eq!(opt.bonds.len(), 2);
+        assert_eq!(rep.imaginary_mode_count, 1);
+        assert_eq!(rep.ir_modes.len(), 3);
+        let m6 = rep.ir_modes.iter().find(|m| m.mode_index == 6).unwrap();
+        assert!((m6.intensity_km_mol - 71.40).abs() < 1e-2);
+        assert_eq!(m6.displacements.len(), 3);
+
+        let ir_pred = rep.to_ir_prediction(None).expect("convert to IrPrediction");
+        assert_eq!(ir_pred.imaginary_count, 1);
+        assert_eq!(ir_pred.source, IrSpectrumSource::OrcaDft);
+        assert!(ir_pred.mode_geometry_3d.is_some());
+        assert!(ir_pred.bands.iter().any(|b| b.normal_mode_vectors.is_some()));
+    }
+
+    #[test]
+    fn test_gaussian_g98_xtb_vibspectrum_and_molden_parsers() {
+        let g98 = "\
+ Gaussian 98: xtb output
+ Standard orientation:
+ ---------------------------------------------------------------------
+ Center     Atomic     Atomic              Coordinates (Angstroms)
+ Number     Number      Type              X           Y           Z
+ ---------------------------------------------------------------------
+    1          8           0        0.000000    0.000000    0.117300
+    2          1           0        0.000000    0.757200   -0.469200
+    3          1           0        0.000000   -0.757200   -0.469200
+ ---------------------------------------------------------------------
+                      1                      2
+                     A1                     B2
+ Frequencies --   1595.10                3755.80
+ Red. masses --      1.08                   1.04
+ IR Inten    --     68.50                  42.10
+ Atom AN      X      Y      Z        X      Y      Z
+   1   8     0.00   0.00   0.07     0.00   0.07   0.00
+   2   1     0.00   0.43  -0.55     0.00  -0.55   0.43
+   3   1     0.00  -0.43  -0.55     0.00  -0.55  -0.43
+ Normal termination of Gaussian 98.
+";
+        let rep = parse_quantum_output(g98).expect("parse g98");
+        assert_eq!(rep.ir_modes.len(), 2);
+        assert_eq!(rep.ir_modes[0].symmetry.as_deref(), Some("A1"));
+        assert!((rep.ir_modes[0].intensity_km_mol - 68.50).abs() < 1e-2);
+        assert_eq!(rep.ir_modes[0].displacements.len(), 3);
+
+        let vib = "\
+$vibrational spectrum
+# mode   symmetry   wave number   IR intensity    selection rules
+#                      cm**(-1)      (km/mol)       IR     RAMAN
+     1                   0.00          0.00000      -        -
+     7       a        1610.50         64.20000     YES      YES
+     8       b        3680.10         38.90000     YES      YES
+$end
+";
+        let vrep = parse_quantum_output(vib).expect("parse vibspectrum");
+        assert_eq!(vrep.program, "xTB");
+        assert_eq!(vrep.ir_modes.len(), 2);
+        assert!((vrep.ir_modes[0].intensity_km_mol - 64.2).abs() < 1e-2);
+
+        let molden = "\
+[Molden Format]
+[FREQ]
+1615.0
+3720.0
+[INT]
+70.5
+41.0
+[FR-COORD]
+O 0.0 0.0 0.22
+H 0.0 1.43 -0.88
+H 0.0 -1.43 -0.88
+[FR-NORM-COORD]
+vibration 1
+0.0 0.0 0.07
+0.0 0.43 -0.55
+0.0 -0.43 -0.55
+vibration 2
+0.0 0.07 0.0
+0.0 -0.55 0.43
+0.0 -0.55 -0.43
+";
+        let mrep = parse_quantum_output(molden).expect("parse molden");
+        assert_eq!(mrep.program, "Molden");
+        assert_eq!(mrep.ir_modes.len(), 2);
+        assert_eq!(mrep.ir_modes[0].displacements.len(), 3);
+        assert!(mrep.optimized_molecule.is_some());
+        // Direct xTB g98.out import should detect program = "xTB"
+        assert_eq!(rep.program, "xTB");
+    }
+
+    #[test]
+    fn test_orca_multiblock_normal_modes_with_blank_lines_and_gaussian_hpmodes() {
+        // Multi-block ORCA NORMAL MODES separated by a blank line + parenthesized (cm**-1) IR header
+        let orca_multi = "\
+* O   R   C   A *
+CARTESIAN COORDINATES (ANGSTROEM)
+---------------------------------
+  O      0.000000    0.000000    0.117300
+  H      0.000000    0.757200   -0.469200
+  H      0.000000   -0.757200   -0.469200
+
+VIBRATIONAL FREQUENCIES
+-----------------------
+   0:         0.00 cm**-1
+   6:      1635.42 cm**-1
+
+NORMAL MODES
+------------
+                  0           1
+      0       0.000000    0.000000
+      1       0.000000    0.000000
+      2       0.000000    0.000000
+
+                  6
+      0       0.000000
+      1       0.000000
+      2       0.070000
+      3       0.000000
+      4       0.430000
+      5      -0.550000
+      6       0.000000
+      7      -0.430000
+      8      -0.550000
+
+IR SPECTRUM
+-----------
+ Mode   freq (cm**-1)   eps   Int (km/mol)   T**2
+----------------------------------------------------
+   6:   1635.42        0.01   75.25          0.0044
+";
+        let orep = parse_quantum_output(orca_multi).expect("parse multi-block ORCA");
+        assert_eq!(orep.ir_modes.len(), 1);
+        assert!((orep.ir_modes[0].intensity_km_mol - 75.25).abs() < 1e-2);
+        assert_eq!(orep.ir_modes[0].displacements.len(), 3);
+        assert!((orep.ir_modes[0].displacements[1][1] - 0.43).abs() < 1e-4);
+
+        // Gaussian HPModes ("Frequencies ---") followed by standard ("Frequencies --") must NOT double-count
+        let gauss_hp = "\
+ Gaussian, Inc.
+ Frequencies ---   1600.1234
+ Frequencies --    1600.12
+ IR Inten    --      65.40
+ Atom AN      X      Y      Z
+   1   8     0.00   0.00   0.07
+   2   1     0.00   0.43  -0.55
+   3   1     0.00  -0.43  -0.55
+ Normal termination of Gaussian 16.
+";
+        let grep = parse_quantum_output(gauss_hp).expect("parse Gaussian HPModes");
+        assert_eq!(grep.program, "Gaussian");
+        assert_eq!(grep.ir_modes.len(), 1, "HPModes triple-dash header must not duplicate standard modes");
+        assert!((grep.ir_modes[0].intensity_km_mol - 65.40).abs() < 1e-2);
     }
 }

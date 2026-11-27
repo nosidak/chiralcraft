@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use chiralcraft_chem::{
     analyze_organometallic_complexes, compute_analysis_report, compute_medchem_report,
     estimate_chemical_properties, predict_ir_spectrum, predict_uv_vis, simulate_hrms,
-    AlertSeverity, ChemMolecule,
+    AlertSeverity, ChemMolecule, IrPrediction,
 };
 use chiralcraft_doc::{CopyBackground, ExportOptions, SceneTable, SceneTlcPlate};
 use chiralcraft_formats::{
@@ -17,6 +17,7 @@ use chiralcraft_formats::{
 use egui::{Color32, RichText};
 
 use crate::chem_db::JsonValue;
+use crate::quantum_runner::{QcBinaryAvailability, QcRunBackend};
 
 // ============================================================================
 // 1. Persistent User Configuration (~/.config/chiralcraft/config.json)
@@ -32,6 +33,9 @@ pub struct UserConfig {
     pub crossing_clearance_pt: f64,
     pub show_right_dock: bool,
     pub recent_files: Vec<String>,
+    pub xtb_path: String,
+    pub orca_path: String,
+    pub gaussian_path: String,
 }
 
 impl Default for UserConfig {
@@ -45,6 +49,9 @@ impl Default for UserConfig {
             crossing_clearance_pt: 3.6,
             show_right_dock: true,
             recent_files: Vec::new(),
+            xtb_path: String::new(),
+            orca_path: String::new(),
+            gaussian_path: String::new(),
         }
     }
 }
@@ -114,6 +121,15 @@ impl UserConfig {
                 .take(10)
                 .collect();
         }
+        if let Some(s) = root.get("xtb_path").and_then(|v| v.as_str()) {
+            cfg.xtb_path = s.to_string();
+        }
+        if let Some(s) = root.get("orca_path").and_then(|v| v.as_str()) {
+            cfg.orca_path = s.to_string();
+        }
+        if let Some(s) = root.get("gaussian_path").and_then(|v| v.as_str()) {
+            cfg.gaussian_path = s.to_string();
+        }
         cfg
     }
 
@@ -131,7 +147,7 @@ impl UserConfig {
             .map(|r| format!("\"{}\"", json_esc(r)))
             .collect();
         let json = format!(
-            "{{\n  \"theme\": \"{}\",\n  \"png_dpi\": {},\n  \"svg_padding_pt\": {:.1},\n  \"copy_bg\": \"{}\",\n  \"rear_opacity\": {:.2},\n  \"crossing_clearance_pt\": {:.1},\n  \"show_right_dock\": {},\n  \"recent_files\": [{}]\n}}\n",
+            "{{\n  \"theme\": \"{}\",\n  \"png_dpi\": {},\n  \"svg_padding_pt\": {:.1},\n  \"copy_bg\": \"{}\",\n  \"rear_opacity\": {:.2},\n  \"crossing_clearance_pt\": {:.1},\n  \"show_right_dock\": {},\n  \"xtb_path\": \"{}\",\n  \"orca_path\": \"{}\",\n  \"gaussian_path\": \"{}\",\n  \"recent_files\": [{}]\n}}\n",
             json_esc(&self.theme),
             self.png_dpi,
             self.svg_padding_pt,
@@ -139,6 +155,9 @@ impl UserConfig {
             self.rear_opacity,
             self.crossing_clearance_pt,
             self.show_right_dock,
+            json_esc(&self.xtb_path),
+            json_esc(&self.orca_path),
+            json_esc(&self.gaussian_path),
             recents.join(", ")
         );
         let _ = fs::write(path, json);
@@ -178,6 +197,8 @@ pub struct QuantumStudioState {
     pub import_path: String,
     pub parsed_report: Option<QuantumOutputReport>,
     pub parse_error: String,
+    cached_preview_key: String,
+    cached_preview_text: String,
 }
 
 impl Default for QuantumStudioState {
@@ -188,8 +209,46 @@ impl Default for QuantumStudioState {
             import_path: String::new(),
             parsed_report: None,
             parse_error: String::new(),
+            cached_preview_key: String::new(),
+            cached_preview_text: String::new(),
         }
     }
+}
+
+fn quantum_preview_cache_key(mol: &ChemMolecule, spec: &QuantumJobSpec) -> String {
+    let mut hash = 14695981039346656037u64;
+    let mut mix = |v: u64| {
+        hash ^= v;
+        hash = hash.wrapping_mul(1099511628211);
+    };
+    mix(mol.atoms.len() as u64);
+    mix(mol.bonds.len() as u64);
+    for a in &mol.atoms {
+        mix(a.z as u64);
+        mix(a.charge as u64);
+        mix(a.x.to_bits());
+        mix(a.y.to_bits());
+        mix(a.z_coord.to_bits());
+    }
+    for b in &mol.bonds {
+        mix(b.begin_atom as u64);
+        mix(b.end_atom as u64);
+        mix(b.order as u64);
+    }
+    format!(
+        "{hash:016x}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}",
+        spec.program,
+        spec.method,
+        spec.basis,
+        spec.job_type,
+        spec.charge,
+        spec.multiplicity,
+        spec.solvent,
+        spec.nprocs,
+        spec.add_explicit_hydrogens,
+        spec.pre_optimize_uff,
+        spec.xtb_gfn_level
+    )
 }
 
 pub enum DockQuantumAction {
@@ -197,6 +256,9 @@ pub enum DockQuantumAction {
     CopyText(String, String),
     ExportFile { path: String, content: String },
     StampOptimized3d(ChemMolecule),
+    PlotQuantumIr(IrPrediction),
+    RunLocalQc(QcRunBackend),
+    RedetectQcBinaries,
     OpenFloatingStudio(&'static str),
     ConfigChanged,
 }
@@ -205,14 +267,28 @@ pub fn render_quantum_panel_contents(
     ui: &mut egui::Ui,
     qstate: &mut QuantumStudioState,
     active_mol: Option<&ChemMolecule>,
+    user_cfg: &mut UserConfig,
+    qc_bins: &QcBinaryAvailability,
 ) -> DockQuantumAction {
     let mut act = DockQuantumAction::None;
     ui.strong("Export DFT / Semi-Empirical Input");
     ui.horizontal_wrapped(|ui| {
         ui.selectable_value(&mut qstate.spec.program, QuantumProgram::Orca, "ORCA (.inp)");
         ui.selectable_value(&mut qstate.spec.program, QuantumProgram::Gaussian, "Gaussian (.gjf)");
-        ui.selectable_value(&mut qstate.spec.program, QuantumProgram::Xtb, "xTB (GFN2)");
+        ui.selectable_value(&mut qstate.spec.program, QuantumProgram::Xtb, "xTB (GFN2/FF)");
     });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut qstate.spec.add_explicit_hydrogens, "Explicit H (3D)");
+        ui.checkbox(&mut qstate.spec.pre_optimize_uff, "UFF Pre-Opt");
+    });
+    if qstate.spec.program == QuantumProgram::Xtb {
+        ui.horizontal(|ui| {
+            ui.small("xTB Level:");
+            ui.selectable_value(&mut qstate.spec.xtb_gfn_level, 2, "GFN2-xTB");
+            ui.selectable_value(&mut qstate.spec.xtb_gfn_level, 1, "GFN1");
+            ui.selectable_value(&mut qstate.spec.xtb_gfn_level, 0, "GFN-FF");
+        });
+    }
     egui::Grid::new("q_grid").num_columns(2).spacing([6.0, 3.0]).show(ui, |ui| {
         ui.label("Method:");
         ui.add(egui::TextEdit::singleline(&mut qstate.spec.method).desired_width(110.0));
@@ -247,10 +323,16 @@ pub fn render_quantum_panel_contents(
         ui.end_row();
     });
 
-    let mut preview = active_mol
-        .filter(|m| !m.atoms.is_empty())
-        .map(|m| export_quantum_input(m, &qstate.spec))
-        .unwrap_or_else(|| "# Draw a molecule to generate an ORCA / Gaussian / xTB input deck".into());
+    let mut preview = if let Some(m) = active_mol.filter(|m| !m.atoms.is_empty()) {
+        let key = quantum_preview_cache_key(m, &qstate.spec);
+        if qstate.cached_preview_key != key {
+            qstate.cached_preview_text = export_quantum_input(m, &qstate.spec);
+            qstate.cached_preview_key = key;
+        }
+        qstate.cached_preview_text.clone()
+    } else {
+        "# Draw a molecule to generate an ORCA / Gaussian / xTB input deck".into()
+    };
     egui::ScrollArea::vertical().id_salt("q_prev_scroll").max_height(125.0).show(ui, |ui| {
         ui.add(egui::TextEdit::multiline(&mut preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(6));
     });
@@ -272,9 +354,9 @@ pub fn render_quantum_panel_contents(
     });
 
     ui.separator();
-    ui.strong("Import ORCA (.out) / Gaussian (.log)");
+    ui.strong("Import ORCA (.out) / Gaussian (.log) / xTB / Molden");
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut qstate.import_path).desired_width(145.0).hint_text("path/to/job.out"));
+        ui.add(egui::TextEdit::singleline(&mut qstate.import_path).desired_width(145.0).hint_text("job.out / .log / g98.out / .molden"));
         if ui.small_button("Parse").clicked() && !qstate.import_path.trim().is_empty() {
             match fs::read_to_string(qstate.import_path.trim())
                 .map_err(|e| e.to_string())
@@ -301,12 +383,33 @@ pub fn render_quantum_panel_contents(
             }
             if let (Some(h), Some(l), Some(g)) = (rep.homo_ev, rep.lumo_ev, rep.homo_lumo_gap_ev) {
                 ui.small(format!("HOMO: {h:.2} eV | LUMO: {l:.2} eV | Gap: {g:.2} eV"));
+            } else if let Some(g) = rep.homo_lumo_gap_ev {
+                ui.small(format!("HOMO-LUMO Gap: {g:.2} eV"));
             }
             if let Some(d) = rep.dipole_debye {
                 ui.small(format!("Dipole: {d:.3} Debye"));
             }
-            if !rep.ir_frequencies_cm1.is_empty() {
-                ui.small(format!("DFT IR Modes: {} (max {:.0} cm^-1)", rep.ir_frequencies_cm1.len(), rep.ir_frequencies_cm1.iter().copied().fold(0.0_f64, f64::max)));
+            if !rep.ir_modes.is_empty() || !rep.ir_frequencies_cm1.is_empty() {
+                let n_modes = rep.ir_modes.len().max(rep.ir_frequencies_cm1.len());
+                let max_wn = rep
+                    .ir_modes
+                    .iter()
+                    .map(|m| m.wavenumber_cm1)
+                    .chain(rep.ir_frequencies_cm1.iter().copied())
+                    .fold(0.0_f64, f64::max);
+                ui.small(format!(
+                    "Harmonic IR Modes: {n_modes} (max {max_wn:.0} cm^-1{})",
+                    if rep.imaginary_mode_count > 0 {
+                        format!(", ⚠ {} imag", rep.imaginary_mode_count)
+                    } else {
+                        String::new()
+                    }
+                ));
+                if ui.small_button("Plot Quantum IR in FT-IR Studio").clicked() {
+                    if let Some(ir_pred) = rep.to_ir_prediction(None) {
+                        act = DockQuantumAction::PlotQuantumIr(ir_pred);
+                    }
+                }
             }
             if let Some(opt) = &rep.optimized_molecule {
                 if ui.small_button("Stamp DFT 3D Geometry on Canvas").clicked() {
@@ -315,6 +418,46 @@ pub fn render_quantum_panel_contents(
             }
         });
     }
+
+    ui.separator();
+    egui::CollapsingHeader::new("Local QC Binaries (xTB / ORCA / Gaussian)")
+        .default_open(false)
+        .show(ui, |ui| {
+            let xtb_st = qc_bins.xtb_path.as_deref().unwrap_or("Not found");
+            let orca_st = if let Some(p) = &qc_bins.orca_path {
+                p.as_str()
+            } else if qc_bins.gnome_orca_skipped {
+                "Not found (skipped GNOME /usr/bin/orca)"
+            } else {
+                "Not found"
+            };
+            ui.small(format!("xTB: {xtb_st}"));
+            ui.small(format!("ORCA: {orca_st}"));
+            let mut path_changed = false;
+            ui.horizontal(|ui| {
+                ui.small("xtb:");
+                path_changed |= ui.add(egui::TextEdit::singleline(&mut user_cfg.xtb_path).desired_width(145.0).hint_text("auto (PATH)")).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.small("orca:");
+                path_changed |= ui.add(egui::TextEdit::singleline(&mut user_cfg.orca_path).desired_width(145.0).hint_text("/opt/orca/orca")).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.small("g16:");
+                path_changed |= ui.add(egui::TextEdit::singleline(&mut user_cfg.gaussian_path).desired_width(145.0).hint_text("auto (PATH)")).changed();
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("Re-detect Binaries").clicked() {
+                    act = DockQuantumAction::RedetectQcBinaries;
+                }
+                if qc_bins.xtb_path.is_some() && active_mol.is_some() && ui.small_button("Run GFN2-xTB IR").clicked() {
+                    act = DockQuantumAction::RunLocalQc(QcRunBackend::XtbGfn2);
+                }
+            });
+            if path_changed && matches!(act, DockQuantumAction::None) {
+                act = DockQuantumAction::ConfigChanged;
+            }
+        });
     act
 }
 
@@ -322,6 +465,8 @@ pub fn show_quantum_window(
     ctx: &egui::Context,
     qstate: &mut QuantumStudioState,
     active_mol: Option<&ChemMolecule>,
+    user_cfg: &mut UserConfig,
+    qc_bins: &QcBinaryAvailability,
 ) -> DockQuantumAction {
     if !qstate.show_window {
         return DockQuantumAction::None;
@@ -334,7 +479,7 @@ pub fn show_quantum_window(
         .default_width(430.0)
         .resizable(true)
         .show(ctx, |ui| {
-            act = render_quantum_panel_contents(ui, qstate, active_mol);
+            act = render_quantum_panel_contents(ui, qstate, active_mol, user_cfg, qc_bins);
         });
     qstate.show_window = open;
     act
@@ -360,6 +505,9 @@ pub fn show_right_studio_dock(
     active_mol: Option<&ChemMolecule>,
     live_name: Option<&str>,
     qstate: &mut QuantumStudioState,
+    user_cfg: &mut UserConfig,
+    qc_bins: &QcBinaryAvailability,
+    active_quantum_ir: Option<&IrPrediction>,
     tables: &mut [SceneTable],
     tlc_plates: &mut [SceneTlcPlate],
     rear_opacity: &mut f32,
@@ -479,9 +627,18 @@ pub fn show_right_studio_dock(
                     ui.strong("UV-Vis");
                     ui.label(format!("λmax ≈ {:.0} nm — {}", uv.lambda_max_nm, uv.perceived_color_name));
                     ui.separator();
-                    ui.strong("Diagnostic FT-IR");
-                    for b in ir.bands.iter().take(5) {
-                        ui.small(format!("{:.0} cm^-1 ({}) {}", b.wavenumber_cm1, b.strength, b.assignment));
+                    ui.strong(match active_quantum_ir {
+                        Some(qir) => format!("FT-IR ({})", qir.source.label()),
+                        None => "Diagnostic FT-IR (Rules)".to_string(),
+                    });
+                    let ir_ref = active_quantum_ir.unwrap_or(&ir);
+                    for b in ir_ref.bands.iter().filter(|b| !b.is_imaginary).take(5) {
+                        ui.small(format!(
+                            "{:.0} cm^-1 ({}) {}",
+                            b.scaled_wavenumber(ir_ref.default_scale_factor),
+                            b.strength,
+                            b.assignment
+                        ));
                     }
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
@@ -492,7 +649,7 @@ pub fn show_right_studio_dock(
                     });
                 }
                 DockTab::Quantum => {
-                    act = render_quantum_panel_contents(ui, qstate, active_mol);
+                    act = render_quantum_panel_contents(ui, qstate, active_mol, user_cfg, qc_bins);
                 }
                 DockTab::Inspector => {
                     let mut cfg_changed = false;

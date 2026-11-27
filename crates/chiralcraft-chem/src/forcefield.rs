@@ -7,7 +7,282 @@
 //! - Out-of-plane planarity for sp²/aromatic centers
 //! - Soft-core non-bonded steric repulsion (`1–4` and `>=1–5` pairs)
 
-use crate::{CcAromaticityInfo, ChemMolecule};
+use crate::{BondDisplay, CcAromaticityInfo, CcVal, ChemAtom, ChemMolecule};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplicitHResult {
+    pub molecule: ChemMolecule,
+    /// Maps each atom index in `molecule` to its parent heavy-atom index in the source molecule.
+    /// Heavy atoms map to `Some(i)`; newly added explicit hydrogens map to `Some(parent_heavy_idx)`.
+    pub parent_heavy_atom: Vec<Option<usize>>,
+    pub added_h_count: usize,
+}
+
+/// Computes net formal charge across all atoms in `mol`.
+pub fn total_formal_charge(mol: &ChemMolecule) -> i32 {
+    mol.atoms.iter().map(|a| a.charge).sum()
+}
+
+fn v_add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn v_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn v_scale(a: [f64; 3], s: f64) -> [f64; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+fn v_dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn v_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn v_norm(a: [f64; 3]) -> f64 {
+    v_dot(a, a).sqrt()
+}
+
+fn v_unit(a: [f64; 3]) -> Option<[f64; 3]> {
+    let n = v_norm(a);
+    if n > 1e-8 {
+        Some([a[0] / n, a[1] / n, a[2] / n])
+    } else {
+        None
+    }
+}
+
+fn perp_unit(u: [f64; 3]) -> [f64; 3] {
+    let ref_v = if u[2].abs() < 0.85 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    v_unit(v_cross(u, ref_v)).unwrap_or([1.0, 0.0, 0.0])
+}
+
+/// Converts implicit hydrogens (via `CcVal`) into explicit 3D hydrogen atoms with chemically
+/// reasonable tetrahedral / trigonal / linear geometry suitable for UFF, xTB, ORCA, and Gaussian.
+pub fn add_explicit_hydrogens_3d(mol: &ChemMolecule) -> ExplicitHResult {
+    let n = mol.atoms.len();
+    let mut out = mol.clone();
+    let mut parent_heavy_atom: Vec<Option<usize>> = (0..n).map(Some).collect();
+    if n == 0 {
+        return ExplicitHResult {
+            molecule: out,
+            parent_heavy_atom,
+            added_h_count: 0,
+        };
+    }
+
+    let val = CcVal::compute(mol);
+    let arom = CcAromaticityInfo::perceive(mol);
+    let mut adj: Vec<Vec<(usize, i32)>> = vec![Vec::new(); n];
+    for b in &mol.bonds {
+        if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
+            adj[b.begin_atom].push((b.end_atom, b.order));
+            adj[b.end_atom].push((b.begin_atom, b.order));
+        }
+    }
+
+    let mut next_atom_id = mol.atoms.iter().map(|a| a.id).max().unwrap_or(0).saturating_add(1);
+    let mut next_bond_id = mol.bonds.iter().map(|b| b.id).max().unwrap_or(0).saturating_add(1);
+    let mut added_h_count = 0usize;
+
+    for i in 0..n {
+        let imp_h = val.implicit_h(i) as usize;
+        if imp_h == 0 {
+            continue;
+        }
+        let atom = &mol.atoms[i];
+        let p0 = [atom.x, atom.y, atom.z_coord];
+        let xh_len_ang = match atom.z {
+            6 => 1.09,
+            7 => 1.01,
+            8 => 0.96,
+            15 => 1.42,
+            16 => 1.34,
+            14 => 1.48,
+            5 => 1.19,
+            _ => ideal_bond_len_ang(atom.z, 1, 1, false),
+        };
+        let xh_len_pt = xh_len_ang * PT_PER_ANG;
+
+        let has_triple = adj[i].iter().any(|&(_, o)| o >= 3);
+        let has_double = adj[i].iter().any(|&(_, o)| o == 2) || arom.is_atom_aromatic(i);
+        let dirs: Vec<[f64; 3]> = adj[i]
+            .iter()
+            .filter_map(|&(nb, _)| {
+                let nb_a = &mol.atoms[nb];
+                v_unit(v_sub([nb_a.x, nb_a.y, nb_a.z_coord], p0))
+            })
+            .collect();
+
+        let h_dirs: Vec<[f64; 3]> = match dirs.len() {
+            0 => {
+                // Isolated atom: CH4 / NH3 / H2O / HF
+                let tet = [
+                    [1.0, 1.0, 1.0],
+                    [1.0, -1.0, -1.0],
+                    [-1.0, 1.0, -1.0],
+                    [-1.0, -1.0, 1.0],
+                ];
+                let mut out_d = Vec::with_capacity(imp_h);
+                for k in 0..imp_h {
+                    let raw = if k < 4 {
+                        tet[k]
+                    } else {
+                        let ang = (k as f64) * 1.25;
+                        [ang.cos(), ang.sin(), 0.25]
+                    };
+                    out_d.push(v_unit(raw).unwrap_or([1.0, 0.0, 0.0]));
+                }
+                out_d
+            }
+            1 => {
+                let u = dirs[0];
+                let opp = v_scale(u, -1.0);
+                let e1 = perp_unit(u);
+                let e2 = v_unit(v_cross(u, e1)).unwrap_or([0.0, 1.0, 0.0]);
+                if imp_h == 1 {
+                    if has_triple {
+                        vec![opp]
+                    } else {
+                        // ~115° (O-H / sp2 C-H)
+                        let theta = if has_double { 120.0_f64 } else { 109.5_f64 }.to_radians();
+                        let ca = (-theta.cos()).clamp(0.0, 1.0);
+                        let sa = theta.sin();
+                        vec![v_unit(v_add(v_scale(opp, ca), v_scale(e1, sa))).unwrap_or(opp)]
+                    }
+                } else if imp_h == 2 {
+                    if has_double {
+                        // Terminal =CH2 planar 120°
+                        let ca = 0.5_f64;
+                        let sa = (3.0_f64).sqrt() * 0.5;
+                        vec![
+                            v_unit(v_add(v_scale(opp, ca), v_scale(e1, sa))).unwrap_or(opp),
+                            v_unit(v_add(v_scale(opp, ca), v_scale(e1, -sa))).unwrap_or(opp),
+                        ]
+                    } else {
+                        // Pyramidal -NH2 / -PH2 (~109.5°)
+                        let theta = 109.47_f64.to_radians();
+                        let ca = -theta.cos();
+                        let sa = theta.sin();
+                        let d1 = v_add(v_scale(opp, ca), v_add(v_scale(e1, sa * 0.866), v_scale(e2, sa * 0.5)));
+                        let d2 = v_add(v_scale(opp, ca), v_add(v_scale(e1, -sa * 0.866), v_scale(e2, sa * 0.5)));
+                        vec![v_unit(d1).unwrap_or(opp), v_unit(d2).unwrap_or(opp)]
+                    }
+                } else {
+                    // Methyl -CH3 / -NH3+ tetrahedral cone around opp
+                    let theta = 109.47_f64.to_radians();
+                    let ca = -theta.cos();
+                    let sa = theta.sin();
+                    (0..imp_h)
+                        .map(|k| {
+                            let phi = (k as f64) * std::f64::consts::TAU / (imp_h as f64);
+                            let radial = v_add(v_scale(e1, phi.cos()), v_scale(e2, phi.sin()));
+                            v_unit(v_add(v_scale(opp, ca), v_scale(radial, sa))).unwrap_or(opp)
+                        })
+                        .collect()
+                }
+            }
+            2 => {
+                let sum = v_add(dirs[0], dirs[1]);
+                let bis = v_unit(v_scale(sum, -1.0)).unwrap_or_else(|| perp_unit(dirs[0]));
+                let norm = v_unit(v_cross(dirs[0], dirs[1])).unwrap_or_else(|| perp_unit(bis));
+                if imp_h == 1 {
+                    if has_double {
+                        vec![bis]
+                    } else {
+                        // Slightly out-of-plane for sp3 secondary amine / methine
+                        let d = v_add(v_scale(bis, 0.82), v_scale(norm, 0.57));
+                        vec![v_unit(d).unwrap_or(bis)]
+                    }
+                } else {
+                    // Methylene -CH2- tetrahedral pair
+                    let half = (109.47_f64 * 0.5).to_radians();
+                    let ch = half.cos();
+                    let sh = half.sin();
+                    let d1 = v_add(v_scale(bis, ch), v_scale(norm, sh));
+                    let d2 = v_add(v_scale(bis, ch), v_scale(norm, -sh));
+                    let mut out_d = vec![v_unit(d1).unwrap_or(bis), v_unit(d2).unwrap_or(bis)];
+                    while out_d.len() < imp_h {
+                        out_d.push(bis);
+                    }
+                    out_d
+                }
+            }
+            _ => {
+                // 3+ neighbors (methine C-H): place H opposite vector sum of neighbors
+                let mut sum = [0.0; 3];
+                for d in &dirs {
+                    sum = v_add(sum, *d);
+                }
+                let dir = if v_norm(sum) > 0.15 {
+                    v_unit(v_scale(sum, -1.0)).unwrap_or([0.0, 0.0, 1.0])
+                } else {
+                    // Neighbors nearly coplanar: pick normal to first two bonds
+                    let n_vec = v_unit(v_cross(dirs[0], dirs[1])).unwrap_or([0.0, 0.0, 1.0]);
+                    if p0[2] >= 0.0 { n_vec } else { v_scale(n_vec, -1.0) }
+                };
+                vec![dir; imp_h]
+            }
+        };
+
+        for d in h_dirs {
+            let mut h_atom = ChemAtom::new(next_atom_id, 1);
+            next_atom_id += 1;
+            h_atom.x = p0[0] + d[0] * xh_len_pt;
+            h_atom.y = p0[1] + d[1] * xh_len_pt;
+            h_atom.z_coord = p0[2] + d[2] * xh_len_pt;
+            let h_idx = out.add_atom(h_atom);
+            out.add_bond(next_bond_id, i, h_idx, 1, BondDisplay::Solid);
+            next_bond_id += 1;
+            parent_heavy_atom.push(Some(i));
+            added_h_count += 1;
+        }
+        // Keep explicit_num_hydrogens neutral since hydrogens are now materialized as graph nodes.
+        out.atoms[i].explicit_num_hydrogens = None;
+    }
+
+    out.has_3d_coords = true;
+    ExplicitHResult {
+        molecule: out,
+        parent_heavy_atom,
+        added_h_count,
+    }
+}
+
+/// Prepares a 2D or 3D `ChemMolecule` for quantum chemistry (xTB / ORCA / Gaussian):
+/// optionally materializes explicit 3D hydrogens and runs UFF-lite geometry optimization.
+pub fn prepare_molecule_for_quantum(
+    mol: &ChemMolecule,
+    add_explicit_h: bool,
+    pre_optimize_uff: bool,
+) -> ExplicitHResult {
+    let mut res = if add_explicit_h {
+        add_explicit_hydrogens_3d(mol)
+    } else {
+        ExplicitHResult {
+            molecule: mol.clone(),
+            parent_heavy_atom: (0..mol.atoms.len()).map(Some).collect(),
+            added_h_count: 0,
+        }
+    };
+    if pre_optimize_uff && res.molecule.atoms.len() >= 2 {
+        let (opt, _) = optimize_geometry_3d(&res.molecule, 180);
+        res.molecule = opt;
+    }
+    res
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForceFieldReport {
@@ -251,7 +526,11 @@ pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecu
                 let dy = p[j][1] - p[i][1];
                 let dz = p[j][2] - p[i][2];
                 let r = (dx * dx + dy * dy + dz * dz).sqrt().max(0.25);
-                let r_min = 2.45;
+                let r_min = match (mol.atoms[i].z == 1, mol.atoms[j].z == 1) {
+                    (true, true) => 1.55,
+                    (true, false) | (false, true) => 1.85,
+                    (false, false) => 2.45,
+                };
                 if r < r_min {
                     let dr = r - r_min;
                     let krep = 14.0;
@@ -344,5 +623,33 @@ mod tests {
         assert!((d01 - 1.52).abs() < 0.08, "C-C bond should relax to ~1.52 Å, got {d01:.3}");
         let ang = measure_angle_deg(&opt, 0, 1, 2).unwrap();
         assert!((ang - 109.5).abs() < 4.0, "C-C-C sp3 angle should relax to ~109.5°, got {ang:.1}°");
+    }
+
+    #[test]
+    fn test_explicit_h_3d_builder_and_quantum_prep() {
+        // Ethanol: C-C-O -> 3 heavy + 6 explicit H = 9 atoms
+        let mut eth = ChemMolecule::new();
+        let mut c0 = ChemAtom::new(1, 6); c0.x = 0.0; c0.y = 0.0;
+        let mut c1 = ChemAtom::new(2, 6); c1.x = 14.4; c1.y = 0.0;
+        let mut o2 = ChemAtom::new(3, 8); o2.x = 22.0; o2.y = 12.0;
+        eth.add_atom(c0); eth.add_atom(c1); eth.add_atom(o2);
+        eth.add_bond(10, 0, 1, 1, BondDisplay::Solid);
+        eth.add_bond(11, 1, 2, 1, BondDisplay::Solid);
+
+        let prep = prepare_molecule_for_quantum(&eth, true, true);
+        assert_eq!(prep.added_h_count, 6);
+        assert_eq!(prep.molecule.atoms.len(), 9);
+        assert_eq!(prep.parent_heavy_atom.len(), 9);
+        assert_eq!(CcVal::compute(&prep.molecule).implicit_h_counts.iter().sum::<u8>(), 0);
+
+        // Verify all X-H bond lengths are chemically reasonable (0.85..1.25 Å)
+        for b in &prep.molecule.bonds {
+            let za = prep.molecule.atoms[b.begin_atom].z;
+            let zb = prep.molecule.atoms[b.end_atom].z;
+            if za == 1 || zb == 1 {
+                let d = measure_distance_angstrom(&prep.molecule, b.begin_atom, b.end_atom).unwrap();
+                assert!((0.85..=1.25).contains(&d), "X-H distance out of range: {d:.3} Å");
+            }
+        }
     }
 }

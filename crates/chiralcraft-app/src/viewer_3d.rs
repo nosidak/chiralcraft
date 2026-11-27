@@ -23,6 +23,18 @@ pub enum RenderMode3d {
     Wireframe,
 }
 
+#[derive(Debug, Clone)]
+pub struct VibrationalAnimState {
+    pub base_mol_3d: ChemMolecule,
+    pub wavenumber_cm1: f64,
+    pub label: String,
+    pub mode_vectors: Vec<[f64; 3]>,
+    pub amplitude_pt: f64,
+    pub speed_hz: f64,
+    pub playing: bool,
+    pub show_vectors: bool,
+}
+
 pub struct Viewer3dState {
     pub open: bool,
     pub yaw: f64,
@@ -35,6 +47,7 @@ pub struct Viewer3dState {
     pub unit_cell: Option<CrystalUnitCell>,
     pub measure_atoms: Vec<usize>,
     pub last_opt_summary: String,
+    pub vib_anim: Option<VibrationalAnimState>,
 }
 
 impl Default for Viewer3dState {
@@ -51,6 +64,7 @@ impl Default for Viewer3dState {
             unit_cell: None,
             measure_atoms: Vec::new(),
             last_opt_summary: String::new(),
+            vib_anim: None,
         }
     }
 }
@@ -194,6 +208,36 @@ pub fn show_3d_viewer_window(
                 ui.add(egui::Slider::new(&mut state.zoom, 0.35..=3.5).text("Zoom"));
             });
 
+            // Optional Vibrational Normal-Mode Animation Controls (from xTB / ORCA / Gaussian / Molden IR)
+            let mut stop_vib = false;
+            if let Some(anim) = &mut state.vib_anim {
+                ui.horizontal_wrapped(|ui| {
+                    let lbl = if anim.playing { "Pause" } else { "Play" };
+                    if ui.small_button(lbl).clicked() {
+                        anim.playing = !anim.playing;
+                    }
+                    ui.checkbox(&mut anim.show_vectors, "Vectors");
+                    ui.add(
+                        egui::Slider::new(&mut anim.amplitude_pt, 1.5..=14.0)
+                            .fixed_decimals(1)
+                            .text("Amp"),
+                    );
+                    ui.colored_label(
+                        Color32::from_rgb(50, 195, 255),
+                        format!("v = {:.1} cm^-1 ({})", anim.wavenumber_cm1, anim.label),
+                    );
+                    if ui.small_button("× Stop").clicked() {
+                        stop_vib = true;
+                    }
+                });
+                if anim.playing {
+                    ctx.request_repaint();
+                }
+            }
+            if stop_vib {
+                state.vib_anim = None;
+            }
+
             let avail = Vec2::new(ui.available_width().max(260.0), (ui.available_height() - 36.0).max(200.0));
             let (rect, resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
             if resp.dragged() {
@@ -217,9 +261,28 @@ pub fn show_3d_viewer_window(
             p.rect_filled(rect, 4.0, bg);
             p.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(90)), egui::StrokeKind::Inside);
 
-            if let Some(raw_mol) = active_mol {
-                if !raw_mol.atoms.is_empty() {
-                    let mol = lift_molecule_2d_to_3d(raw_mol);
+            let anim_phase = ui.input(|i| i.time);
+            let display_mol_owned: Option<ChemMolecule> = if let Some(anim) = &state.vib_anim {
+                let mut m = anim.base_mol_3d.clone();
+                let s = if anim.playing {
+                    (anim_phase * std::f64::consts::TAU * anim.speed_hz).sin()
+                } else {
+                    0.85
+                };
+                for (idx, a) in m.atoms.iter_mut().enumerate() {
+                    if let Some(v) = anim.mode_vectors.get(idx) {
+                        a.x += s * anim.amplitude_pt * v[0];
+                        a.y -= s * anim.amplitude_pt * v[1];
+                        a.z_coord += s * anim.amplitude_pt * v[2];
+                    }
+                }
+                Some(m)
+            } else {
+                active_mol.filter(|m| !m.atoms.is_empty()).map(lift_molecule_2d_to_3d)
+            };
+
+            if let Some(mol) = display_mol_owned {
+                if !mol.atoms.is_empty() {
                     let nf = mol.atoms.len() as f64;
                     let cx = mol.atoms.iter().map(|a| a.x).sum::<f64>() / nf;
                     let cy = mol.atoms.iter().map(|a| a.y).sum::<f64>() / nf;
@@ -350,6 +413,32 @@ pub fn show_3d_viewer_window(
                                         Color32::WHITE
                                     };
                                     p.text(pos, egui::Align2::CENTER_CENTER, sym, FontId::proportional((rad * 0.95).clamp(7.5, 13.0)), lcol);
+                                }
+                            }
+                        }
+                    }
+
+                    // Draw vibrational displacement vectors when animating a quantum normal mode
+                    if let Some(anim) = &state.vib_anim {
+                        if anim.show_vectors {
+                            let vec_col = Color32::from_rgb(255, 205, 45);
+                            for (idx, pt) in rot_pts.iter().enumerate() {
+                                if let Some(v) = anim.mode_vectors.get(idx) {
+                                    let mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                                    if mag < 0.04 {
+                                        continue;
+                                    }
+                                    let tip_raw = rotate_point_3d(
+                                        (mol.atoms[idx].x - cx) + v[0] * anim.amplitude_pt * 1.8,
+                                        (mol.atoms[idx].y - cy) - v[1] * anim.amplitude_pt * 1.8,
+                                        (mol.atoms[idx].z_coord - cz) + v[2] * anim.amplitude_pt * 1.8,
+                                        state.yaw,
+                                        state.pitch,
+                                    );
+                                    let p0 = project(*pt).0;
+                                    let p1 = project(tip_raw).0;
+                                    p.line_segment([p0, p1], Stroke::new(1.8_f32, vec_col));
+                                    p.circle_filled(p1, 2.6, vec_col);
                                 }
                             }
                         }

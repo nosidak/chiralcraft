@@ -100,8 +100,10 @@ fn tools_list_json() -> &'static str {
         r#"{"name":"analyze_organometallic","description":"Analyze transition-metal complexes using the 18-electron rule & Green CBC (oxidation state, d^n, total valence e-, geometry).","inputSchema":{"type":"object","properties":{"smiles":{"type":"string"}},"required":["smiles"]}},"#,
         r#"{"name":"export_latex","description":"Export a SMILES structure to compilable LaTeX \\chemfig{...} and TikZ vector code.","inputSchema":{"type":"object","properties":{"smiles":{"type":"string"}},"required":["smiles"]}},"#,
         r#"{"name":"generate_si_procedure","description":"Generate a publication-ready ACS/JOC Supporting Information experimental procedure + 1H/13C NMR, IR, and HRMS characterization block.","inputSchema":{"type":"object","properties":{"smiles":{"type":"string"},"name":{"type":"string"},"solvent":{"type":"string"},"yield_pct":{"type":"number"}},"required":["smiles"]}},"#,
-        r#"{"name":"export_quantum_input","description":"Generate a ready-to-run ORCA (.inp), Gaussian (.gjf), or GFN2-xTB input deck from SMILES.","inputSchema":{"type":"object","properties":{"smiles":{"type":"string"},"program":{"type":"string","enum":["orca","gaussian","xtb"]},"method":{"type":"string"},"basis":{"type":"string"},"solvent":{"type":"string"}},"required":["smiles"]}},"#,
-        r#"{"name":"parse_quantum_output","description":"Parse an ORCA .out or Gaussian .log file for SCF energy, HOMO/LUMO gap, dipole moment, and DFT IR frequencies.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}"#,
+        r#"{"name":"export_quantum_input","description":"Generate a ready-to-run ORCA (.inp), Gaussian (.gjf), or GFN2-xTB input deck (with explicit 3D hydrogens + UFF pre-opt) from SMILES.","inputSchema":{"type":"object","properties":{"smiles":{"type":"string"},"program":{"type":"string","enum":["orca","gaussian","xtb"]},"method":{"type":"string"},"basis":{"type":"string"},"solvent":{"type":"string"}},"required":["smiles"]}},"#,
+        r#"{"name":"parse_quantum_output","description":"Parse an ORCA .out, Gaussian .log, xTB g98.out/vibspectrum, or Molden file for SCF energy, HOMO/LUMO gap, dipole moment, imaginary modes, and harmonic IR frequencies + km/mol intensities.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},"#,
+        r#"{"name":"parse_jcamp_ir","description":"Parse an experimental FT-IR JCAMP-DX (.jdx/.dx, including ASDF/SQZ/DIF/DUP compression) or CSV/DPT file, pick prominent peaks, and optionally compute HQI/Pearson match against a SMILES.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"compare_smiles":{"type":"string"}},"required":["path"]}},"#,
+        r#"{"name":"run_xtb_ir","description":"Run a local GFN2-xTB or GFN-FF harmonic IR calculation (--ohess) on a SMILES structure if xtb is installed on PATH, returning scaled frequencies and intensities (km/mol).","inputSchema":{"type":"object","properties":{"smiles":{"type":"string"},"method":{"type":"string","enum":["gfn2","gfnff"]},"solvent":{"type":"string"}},"required":["smiles"]}}"#,
         r#"]}"#
     )
 }
@@ -491,13 +493,129 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
                 .and_then(|s| chiralcraft_formats::parse_quantum_output(&s))
             {
                 Ok(rep) => {
+                    let mut top_modes: Vec<&chiralcraft_formats::QuantumIrMode> = rep
+                        .ir_modes
+                        .iter()
+                        .filter(|m| !m.is_imaginary)
+                        .collect();
+                    top_modes.sort_by(|a, b| {
+                        b.intensity_km_mol
+                            .partial_cmp(&a.intensity_km_mol)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mode_lines: Vec<String> = top_modes
+                        .iter()
+                        .take(8)
+                        .map(|m| format!("  Mode #{}: {:.1} cm^-1 (Int {:.1} km/mol)", m.mode_index, m.wavenumber_cm1, m.intensity_km_mol))
+                        .collect();
                     let txt = format!(
-                        "Program: {} | Converged: {}\nSCF Energy (Eh): {:?}\nHOMO (eV): {:?} | LUMO (eV): {:?} | Gap (eV): {:?}\nDipole (Debye): {:?}\nIR Frequencies: {} mode(s)",
-                        rep.program, rep.converged, rep.energy_hartree, rep.homo_ev, rep.lumo_ev, rep.homo_lumo_gap_ev, rep.dipole_debye, rep.ir_frequencies_cm1.len()
+                        "Program: {} | Converged: {}\nSCF Energy (Eh): {:?}\nHOMO (eV): {:?} | LUMO (eV): {:?} | Gap (eV): {:?}\nDipole (Debye): {:?}\nIR Modes: {} (Imaginary: {})\n{}",
+                        rep.program,
+                        rep.converged,
+                        rep.energy_hartree,
+                        rep.homo_ev,
+                        rep.lumo_ev,
+                        rep.homo_lumo_gap_ev,
+                        rep.dipole_debye,
+                        rep.ir_modes.len().max(rep.ir_frequencies_cm1.len()),
+                        rep.imaginary_mode_count,
+                        mode_lines.join("\n")
                     );
                     tool_text_result(&txt, false)
                 }
                 Err(e) => tool_text_result(&format!("Quantum parse error: {e}"), true),
+            }
+        }
+        "parse_jcamp_ir" => {
+            let Some(path) = get_s("path") else {
+                return tool_text_result("Missing required argument: path", true);
+            };
+            match fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| chiralcraft_formats::parse_experimental_ir_file(path, &s))
+            {
+                Ok(spec) => {
+                    let abs = spec.ir_absorbance_curve();
+                    let peaks = chiralcraft_chem::pick_ir_peaks(&abs, 0.12, 10);
+                    let pk_str: Vec<String> = peaks.iter().map(|p| format!("{:.0} cm^-1", p.wavenumber_cm1)).collect();
+                    let mut txt = format!(
+                        "Title: {} | IR: {} | Points: {}\nTop Experimental Peaks: {}",
+                        spec.title,
+                        spec.is_infrared(),
+                        spec.raw_points.len(),
+                        pk_str.join(", ")
+                    );
+                    if let Some(smi) = get_s("compare_smiles") {
+                        if let Ok(mol) = smiles_to_molecule(smi) {
+                            let ir = chiralcraft_chem::predict_ir_spectrum(&mol);
+                            let params = chiralcraft_chem::IrRenderParams::default();
+                            let calc_abs = ir.simulate_absorbance(&params, 400);
+                            let cmp = chiralcraft_chem::compare_ir_spectra(&calc_abs, &abs, 400.0, 4000.0);
+                            txt.push_str(&format!(
+                                "\nComparison vs '{}' (Rule IR): HQI = {:.1}% | Pearson r = {:.3}",
+                                smi, cmp.hqi_pct, cmp.pearson_r
+                            ));
+                        }
+                    }
+                    tool_text_result(&txt, false)
+                }
+                Err(e) => tool_text_result(&format!("Experimental IR parse error: {e}"), true),
+            }
+        }
+        "run_xtb_ir" => {
+            let Some(smi) = get_s("smiles") else {
+                return tool_text_result("Missing required argument: smiles", true);
+            };
+            let bins = crate::quantum_runner::detect_qc_binaries("", "", "");
+            let Some(xtb_bin) = bins.xtb_path else {
+                return tool_text_result("xtb binary not found on PATH. Install via `conda install -c conda-forge xtb` or export an input deck with `export_quantum_input`.", true);
+            };
+            let backend = match get_s("method").unwrap_or("gfn2").to_ascii_lowercase().as_str() {
+                "gfnff" | "gfn-ff" => crate::quantum_runner::QcRunBackend::XtbGfnFf,
+                _ => crate::quantum_runner::QcRunBackend::XtbGfn2,
+            };
+            let mut spec = chiralcraft_formats::QuantumJobSpec::default();
+            if let Some(s) = get_s("solvent") {
+                spec.solvent = s.to_string();
+            }
+            match smiles_to_molecule(smi) {
+                Ok(mut mol) => {
+                    clean_up_structure_preserving_stereo(&mut mol, &[], 14.40);
+                    let lifted = chiralcraft_doc::lift_molecule_2d_to_3d(&mol);
+                    let cancel = std::sync::atomic::AtomicBool::new(false);
+                    match crate::quantum_runner::run_qc_job_blocking(
+                        backend,
+                        &lifted,
+                        format!("{smi}|{backend:?}"),
+                        &spec,
+                        &xtb_bin,
+                        &cancel,
+                    ) {
+                        Ok(out) => {
+                            let scale = out.ir_prediction.default_scale_factor;
+                            let mut lines = vec![format!(
+                                "{} completed in {:.1}s | Modes: {} | Imaginary: {}\n{}",
+                                out.ir_prediction.source.label(),
+                                out.elapsed_secs,
+                                out.ir_prediction.bands.len(),
+                                out.ir_prediction.imaginary_count,
+                                out.ir_prediction.format_report(scale)
+                            )];
+                            for b in out.ir_prediction.bands.iter().take(12) {
+                                lines.push(format!(
+                                    "  {:.1} cm^-1 (Int {:.1} km/mol, {}) — {}",
+                                    b.scaled_wavenumber(scale),
+                                    b.intensity_km_mol.unwrap_or(0.0),
+                                    b.strength,
+                                    b.assignment
+                                ));
+                            }
+                            tool_text_result(&lines.join("\n"), false)
+                        }
+                        Err(e) => tool_text_result(&format!("xTB run failed: {e}"), true),
+                    }
+                }
+                Err(e) => tool_text_result(&format!("Invalid SMILES: {e}"), true),
             }
         }
         other => tool_text_result(&format!("Unknown tool: {other}"), true),
@@ -532,7 +650,7 @@ mod tests {
         assert!(!list.contains('\n'), "tools/list must be single-line NDJSON");
         let parsed = JsonValue::parse(&list).expect("tools/list must be valid JSON");
         let tools = parsed.get("result").and_then(|r| r.get("tools")).and_then(|t| t.as_array()).unwrap();
-        assert_eq!(tools.len(), 17, "All 17 MCP tools must be exposed");
+        assert_eq!(tools.len(), 19, "All 19 MCP tools must be exposed");
 
         let analyze = handle_mcp_request(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"analyze_smiles","arguments":{"smiles":"CCO"}}}"#,
@@ -545,5 +663,18 @@ mod tests {
         ).unwrap();
         assert!(!svg.contains('\n') && JsonValue::parse(&svg).is_ok());
         assert!(svg.contains("chiralcraft:document") && svg.contains("#F2F5F9"));
+
+        // Verify parse_jcamp_ir end-to-end with HQI comparison
+        let tmp_jdx = std::env::temp_dir().join(format!("chiralcraft-mcp-ir-{}.jdx", std::process::id()));
+        let sample_jdx = "##TITLE=Test Ketone IR\n##DATA TYPE=INFRARED SPECTRUM\n##XUNITS=1/CM\n##YUNITS=TRANSMITTANCE\n##FIRSTX=4000\n##LASTX=400\n##NPOINTS=5\n##XYDATA=(X++(Y..Y))\n4000 0.98 0.95 0.15 0.92 0.97\n##END=\n";
+        fs::write(&tmp_jdx, sample_jdx).unwrap();
+        let jdx_req = format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"parse_jcamp_ir","arguments":{{"path":"{}","compare_smiles":"CC(=O)C"}}}}}}"#,
+            json_escape(&tmp_jdx.to_string_lossy())
+        );
+        let jdx_resp = handle_mcp_request(&jdx_req).unwrap();
+        let _ = fs::remove_file(&tmp_jdx);
+        assert!(!jdx_resp.contains('\n') && JsonValue::parse(&jdx_resp).is_ok());
+        assert!(jdx_resp.contains("Test Ketone IR") && jdx_resp.contains("HQI ="));
     }
 }

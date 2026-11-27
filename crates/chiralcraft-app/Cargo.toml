@@ -12,6 +12,10 @@ description = "ChiralCraft — Pure-Rust scientific chemical structure editor & 
 name = "chiralcraft"
 path = "src/main.rs"
 
+[features]
+default = []
+ml-ir = ["chiralcraft-chem/ml-ir"]
+
 [dependencies]
 chiralcraft-chem = { path = "../chiralcraft-chem" }
 chiralcraft-formats = { path = "../chiralcraft-formats" }

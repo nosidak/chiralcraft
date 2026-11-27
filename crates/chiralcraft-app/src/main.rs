@@ -22,6 +22,7 @@ mod omni_suite;
 mod palettes;
 mod pro_panels;
 mod pro_suite;
+mod quantum_runner;
 mod viewer_3d;
 
 use std::collections::{BTreeMap, HashMap};
@@ -58,7 +59,8 @@ use chiralcraft_formats::{
     inchi_to_inchikey, molecule_to_3mf_xml, molecule_to_fasta, molecule_to_helm, molecule_to_inchi,
     molecule_to_molfile_v2000, molecule_to_molfile_v3000, molecule_to_sln,
     molecule_to_smiles, molecules_to_sdf, molfile_to_molecule, molfile_v3000_to_molecule,
-    monomer_to_all_atom_molecule, parse_jcamp_dx, parse_quantum_output, sdf_to_molecules,
+    monomer_to_all_atom_molecule, parse_experimental_ir_file, parse_jcamp_dx, parse_quantum_output,
+    sdf_to_molecules,
     sequence_to_biopolymer_molecule, smiles_to_molecule, CdxmlDocument, JcampSpectrum,
     MonomerLibrary, PolymerKind, QuantumJobSpec, QuantumProgram, SdfRecord,
 };
@@ -105,7 +107,7 @@ use crate::io_bridge::{
 use crate::omni_suite::{
     show_eln_safety_window, show_energy_profile_window, show_ino_poly_window,
     show_latex_export_window, show_screening_window, show_spectroscopy_window, InoPolyTab,
-    OmniSuiteAction, OmniSuiteState, SpecTab,
+    IrEngineMode, OmniSuiteAction, OmniSuiteState, SpecTab,
 };
 use crate::pro_panels::{
     show_biographics_toolbar, show_diff_compare_window, show_helm_monomer_window, show_nmr_window,
@@ -117,7 +119,8 @@ use crate::pro_suite::{
     show_publication_composer_window, show_retrosynthesis_window, IsomerTab, ProSuiteAction,
     ProSuiteState,
 };
-use crate::viewer_3d::{show_3d_viewer_window, Viewer3dAction, Viewer3dState};
+use crate::quantum_runner::{NistIrFetchState, QcRunBackend, QuantumRunnerState};
+use crate::viewer_3d::{show_3d_viewer_window, VibrationalAnimState, Viewer3dAction, Viewer3dState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiTheme {
@@ -438,6 +441,10 @@ struct ChiralCraftApp {
     dock_tab: DockTab,
     /// Computational Chemistry Bridge (ORCA / Gaussian / xTB) state.
     quantum: QuantumStudioState,
+    /// Non-blocking local quantum runner (`xtb`, `orca`, `g16`) for real harmonic FT-IR.
+    qc_runner: QuantumRunnerState,
+    /// Optional online NIST Chemistry WebBook experimental IR (`.jdx`) fetcher.
+    nist_ir_fetch: NistIrFetchState,
     /// Optional deterministic GPU screenshot capture path (`chiralcraft --screenshot <preset> <out.png>`).
     screenshot_out_path: Option<String>,
     screenshot_frames: u8,
@@ -599,6 +606,8 @@ impl ChiralCraftApp {
             show_right_dock: initial_dock,
             dock_tab: DockTab::Analysis,
             quantum: QuantumStudioState::default(),
+            qc_runner: QuantumRunnerState::default(),
+            nist_ir_fetch: NistIrFetchState::default(),
             screenshot_out_path: None,
             screenshot_frames: 0,
         }
@@ -2262,6 +2271,40 @@ impl ChiralCraftApp {
                 self.viewer_3d.open = true;
                 self.status_msg = "Stamped DFT-optimized 3D geometry onto canvas".into();
             }
+            DockQuantumAction::PlotQuantumIr(ir_pred) => {
+                self.omni_suite.ir_render.scale_factor = ir_pred.default_scale_factor;
+                self.omni_suite.ir_render.use_per_band_widths = false;
+                self.omni_suite.ir_engine = IrEngineMode::QuantumImported;
+                self.omni_suite.ir_quantum_mol_sig = self
+                    .active_mol()
+                    .map(molecule_to_smiles)
+                    .unwrap_or_default();
+                self.omni_suite.ir_status_msg = format!(
+                    "Plotted {} ({} modes)",
+                    ir_pred.source.label(),
+                    ir_pred.bands.len()
+                );
+                self.omni_suite.ir_quantum_pred = Some(ir_pred);
+                self.omni_suite.spec_tab = SpecTab::FtIr;
+                self.omni_suite.show_spectroscopy = true;
+                self.status_msg = "Loaded quantum harmonic IR into Multi-Spectroscopy Studio".into();
+            }
+            DockQuantumAction::RunLocalQc(backend) => {
+                self.launch_local_quantum_ir(backend);
+            }
+            DockQuantumAction::RedetectQcBinaries => {
+                self.qc_runner.redetect(
+                    &self.user_config.xtb_path,
+                    &self.user_config.orca_path,
+                    &self.user_config.gaussian_path,
+                );
+                self.persist_user_config();
+                self.status_msg = format!(
+                    "QC binaries: xTB={} | ORCA={}",
+                    if self.qc_runner.binaries.xtb_path.is_some() { "OK" } else { "none" },
+                    if self.qc_runner.binaries.orca_path.is_some() { "OK" } else { "none" }
+                );
+            }
             DockQuantumAction::OpenFloatingStudio(which) => match which {
                 "3d" => { self.viewer_3d.open = true; }
                 "isomers" => { self.pro_suite.show_isomers = true; }
@@ -2325,6 +2368,129 @@ impl ChiralCraftApp {
                 Err(e) => self.status_msg = format!("Export error: {e}"),
             },
             OmniSuiteAction::StatusMsg(m) => self.status_msg = m,
+            OmniSuiteAction::RunQuantumIr(backend) => {
+                self.launch_local_quantum_ir(backend);
+            }
+            OmniSuiteAction::CancelQuantumIr => {
+                self.qc_runner.cancel();
+                self.status_msg = "Cancelled local quantum FTIR job".into();
+            }
+            OmniSuiteAction::ImportQuantumIrFile(path) => {
+                match fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| parse_quantum_output(&s))
+                {
+                    Ok(rep) => {
+                        if let Some(ir_pred) = rep.to_ir_prediction(None) {
+                            let n_modes = ir_pred.bands.len();
+                            let src = ir_pred.source.label();
+                            self.omni_suite.ir_render.scale_factor = ir_pred.default_scale_factor;
+                            self.omni_suite.ir_render.use_per_band_widths = false;
+                            self.omni_suite.ir_engine = IrEngineMode::QuantumImported;
+                            self.omni_suite.ir_quantum_mol_sig = self
+                                .active_mol()
+                                .map(molecule_to_smiles)
+                                .unwrap_or_default();
+                            self.omni_suite.ir_selected_band = None;
+                            self.omni_suite.ir_status_msg = format!("Loaded {src}: {n_modes} harmonic modes");
+                            self.omni_suite.ir_quantum_pred = Some(ir_pred);
+                            self.quantum.parsed_report = Some(rep);
+                            self.status_msg = format!("Imported {src} IR ({n_modes} modes) from {path}");
+                        } else {
+                            self.omni_suite.ir_status_msg = "No IR vibrational modes found in quantum output".into();
+                            self.status_msg = self.omni_suite.ir_status_msg.clone();
+                        }
+                    }
+                    Err(e) => {
+                        self.omni_suite.ir_status_msg = format!("QC import error: {e}");
+                        self.status_msg = self.omni_suite.ir_status_msg.clone();
+                    }
+                }
+            }
+            OmniSuiteAction::LoadExpIrFile(path) => {
+                match fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| parse_experimental_ir_file(&path, &s))
+                {
+                    Ok(spec) => {
+                        self.status_msg = format!("Overlaid experimental IR: {} ({} pts)", spec.title, spec.raw_points.len());
+                        self.omni_suite.ir_exp_overlay = Some(spec);
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("Experimental IR load failed: {e}");
+                    }
+                }
+            }
+            OmniSuiteAction::FetchNistIr(query) => {
+                let inchi = self.active_mol().map(molecule_to_inchi);
+                self.nist_ir_fetch.start_fetch(query, inchi);
+                self.status_msg = "Querying NIST Chemistry WebBook for experimental IR...".into();
+            }
+            OmniSuiteAction::Animate3dVibMode {
+                geom_3d,
+                wavenumber_cm1,
+                label,
+                vectors,
+            } => {
+                self.viewer_3d.open = true;
+                self.viewer_3d.vib_anim = Some(VibrationalAnimState {
+                    base_mol_3d: geom_3d,
+                    wavenumber_cm1,
+                    label: label.clone(),
+                    mode_vectors: vectors,
+                    amplitude_pt: 6.5,
+                    speed_hz: 1.6,
+                    playing: true,
+                    show_vectors: true,
+                });
+                self.status_msg = format!("Animating 3D normal mode: {wavenumber_cm1:.1} cm^-1 ({label})");
+            }
+        }
+    }
+
+    fn launch_local_quantum_ir(&mut self, backend: QcRunBackend) {
+        self.qc_runner.ensure_detected(
+            &self.user_config.xtb_path,
+            &self.user_config.orca_path,
+            &self.user_config.gaussian_path,
+        );
+        let Some(mol) = self.active_mol().cloned() else {
+            self.status_msg = "Draw or select a molecule first".into();
+            return;
+        };
+        let bin_opt = match backend {
+            QcRunBackend::XtbGfn2 | QcRunBackend::XtbGfnFf => self.qc_runner.binaries.xtb_path.clone(),
+            QcRunBackend::OrcaDft => self.qc_runner.binaries.orca_path.clone(),
+            QcRunBackend::GaussianDft => self.qc_runner.binaries.gaussian_path.clone(),
+        };
+        let Some(bin_path) = bin_opt else {
+            self.status_msg = format!("{} binary not found — configure path in DFT dock", backend.label());
+            return;
+        };
+        let smi = molecule_to_smiles(&mol);
+        let spec = self.quantum.spec.clone();
+        let cache_key = format!(
+            "{smi}|{backend:?}|{}|{}|{}|{}|{}",
+            spec.method, spec.basis, spec.solvent, spec.charge, spec.multiplicity
+        );
+        let lifted = lift_molecule_2d_to_3d(&mol);
+        self.qc_runner.start_ir_job(backend, &lifted, cache_key, spec, bin_path);
+        if let Some(hit) = self.qc_runner.last_outcome.clone().filter(|_| !self.qc_runner.running) {
+            self.omni_suite.ir_render.scale_factor = hit.ir_prediction.default_scale_factor;
+            self.omni_suite.ir_render.use_per_band_widths = false;
+            self.omni_suite.ir_status_msg = format!(
+                "Cached {} ({} modes)",
+                hit.ir_prediction.source.label(),
+                hit.ir_prediction.bands.len()
+            );
+            self.omni_suite.ir_quantum_mol_sig = smi;
+            self.omni_suite.ir_quantum_pred = Some(hit.ir_prediction);
+            self.quantum.parsed_report = Some(hit.report);
+            self.status_msg = "Loaded cached quantum FTIR spectrum".into();
+        } else {
+            self.omni_suite.show_spectroscopy = true;
+            self.omni_suite.spec_tab = SpecTab::FtIr;
+            self.status_msg = format!("Running {} harmonic FTIR in background...", backend.label());
         }
     }
 
@@ -8009,12 +8175,72 @@ impl ChiralCraftApp {
         }
 
         // ---- 6e. All-Discipline Omni-Suite Windows (IR/UV/2D-NMR, 18e-/Polymer, Energy Profiles, ELN/GHS, LaTeX, Screening) ----
+        if self.omni_suite.show_spectroscopy
+            || self.quantum.show_window
+            || (self.show_right_dock && self.dock_tab == DockTab::Quantum)
+        {
+            self.qc_runner.ensure_detected(
+                &self.user_config.xtb_path,
+                &self.user_config.orca_path,
+                &self.user_config.gaussian_path,
+            );
+        }
+        if let Some(res) = self.qc_runner.poll() {
+            match res {
+                Ok(out) => {
+                    let n_modes = out.ir_prediction.bands.len();
+                    let src = out.ir_prediction.source.label();
+                    self.omni_suite.ir_render.scale_factor = out.ir_prediction.default_scale_factor;
+                    self.omni_suite.ir_render.use_per_band_widths = false;
+                    self.omni_suite.ir_selected_band = None;
+                    self.omni_suite.ir_quantum_mol_sig = out
+                        .cache_key
+                        .split('|')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    self.omni_suite.ir_status_msg = format!(
+                        "{} ({src}) ready in {:.1}s ({n_modes} modes)",
+                        out.backend.label(),
+                        out.elapsed_secs
+                    );
+                    self.omni_suite.ir_quantum_pred = Some(out.ir_prediction);
+                    self.quantum.parsed_report = Some(out.report);
+                    self.status_msg = self.omni_suite.ir_status_msg.clone();
+                }
+                Err(e) => {
+                    self.status_msg = format!("Quantum FTIR failed: {e}");
+                }
+            }
+        }
+        if let Some(res) = self.nist_ir_fetch.poll() {
+            match res {
+                Ok(sp) => {
+                    self.status_msg = format!("Loaded NIST IR overlay: {}", sp.title);
+                    self.omni_suite.ir_exp_overlay = Some(sp);
+                }
+                Err(e) => {
+                    self.status_msg = format!("NIST IR fetch failed: {e}");
+                }
+            }
+        }
+        if self.qc_runner.running || self.nist_ir_fetch.fetching {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
         let active_name_str = active_mol_clone
             .as_ref()
             .map(|m| self.compute_live_name(m).0)
             .unwrap_or_else(|| "Target Compound".to_string());
         let omni_acts = [
-            show_spectroscopy_window(ctx, &mut self.omni_suite, active_mol_clone.as_ref()),
+            show_spectroscopy_window(
+                ctx,
+                &mut self.omni_suite,
+                active_mol_clone.as_ref(),
+                &active_name_str,
+                &self.qc_runner,
+                &self.nist_ir_fetch,
+            ),
             show_ino_poly_window(ctx, &mut self.omni_suite, active_mol_clone.as_ref(), active_blen),
             show_energy_profile_window(ctx, &mut self.omni_suite),
             show_eln_safety_window(ctx, &mut self.omni_suite, active_mol_clone.as_ref(), &active_name_str, &self.stoich_rows),
@@ -8026,7 +8252,13 @@ impl ChiralCraftApp {
         }
 
         // ---- 6f. Unified Right-Side Tabbed Studio Dock + Quantum Chemistry Floating Window ----
-        let q_win_act = show_quantum_window(ctx, &mut self.quantum, active_mol_clone.as_ref());
+        let q_win_act = show_quantum_window(
+            ctx,
+            &mut self.quantum,
+            active_mol_clone.as_ref(),
+            &mut self.user_config,
+            &self.qc_runner.binaries,
+        );
         self.handle_dock_quantum_action(ctx, q_win_act);
         if self.show_right_dock {
             let mut dock_open = self.show_right_dock;
@@ -8044,6 +8276,9 @@ impl ChiralCraftApp {
                     active_mol_clone.as_ref(),
                     live_nm_opt,
                     &mut self.quantum,
+                    &mut self.user_config,
+                    &self.qc_runner.binaries,
+                    self.omni_suite.ir_quantum_pred.as_ref(),
                     &mut doc.scene.tables,
                     &mut doc.scene.tlc_plates,
                     &mut rear_op,

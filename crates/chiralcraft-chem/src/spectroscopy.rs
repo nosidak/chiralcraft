@@ -22,104 +22,649 @@ fn build_adj(mol: &ChemMolecule) -> Vec<Vec<(usize, i32)>> {
 }
 
 // ============================================================================
-// 1. Simulated FT-IR Spectrum (4000 - 400 cm^-1)
+// 1. Multi-Backend FT-IR Spectroscopy Engine (4000 - 400 cm^-1)
+//    Supports Instant Rule-Based, GFN2-xTB / GFN-FF, ORCA/Gaussian DFT, Molden,
+//    and optional feature-gated ML backends via a unified IrPrediction model.
 // ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IrSpectrumSource {
+    RuleBased,
+    XtbGfn2,
+    XtbGfnFf,
+    OrcaDft,
+    GaussianDft,
+    Molden,
+    MlModel(String),
+}
+
+impl IrSpectrumSource {
+    pub fn label(&self) -> String {
+        match self {
+            IrSpectrumSource::RuleBased => "Rule-Based (Instant)".to_string(),
+            IrSpectrumSource::XtbGfn2 => "GFN2-xTB (Harmonic)".to_string(),
+            IrSpectrumSource::XtbGfnFf => "GFN-FF (Harmonic)".to_string(),
+            IrSpectrumSource::OrcaDft => "ORCA DFT (Harmonic)".to_string(),
+            IrSpectrumSource::GaussianDft => "Gaussian DFT (Harmonic)".to_string(),
+            IrSpectrumSource::Molden => "Molden (Harmonic)".to_string(),
+            IrSpectrumSource::MlModel(name) => format!("ML ({name})"),
+        }
+    }
+
+    pub fn is_quantum(&self) -> bool {
+        matches!(
+            self,
+            IrSpectrumSource::XtbGfn2
+                | IrSpectrumSource::XtbGfnFf
+                | IrSpectrumSource::OrcaDft
+                | IrSpectrumSource::GaussianDft
+                | IrSpectrumSource::Molden
+        )
+    }
+
+    pub fn recommended_scale_factor(&self) -> f64 {
+        match self {
+            IrSpectrumSource::RuleBased | IrSpectrumSource::MlModel(_) => 1.0,
+            IrSpectrumSource::XtbGfn2 | IrSpectrumSource::XtbGfnFf => 0.970,
+            IrSpectrumSource::OrcaDft | IrSpectrumSource::GaussianDft | IrSpectrumSource::Molden => 0.967,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrLineShape {
+    Lorentzian,
+    Gaussian,
+    PseudoVoigt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrYAxis {
+    TransmittancePct,
+    Absorbance,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrRenderParams {
+    pub scale_factor: f64,
+    /// Global FWHM (cm⁻¹) used for quantum/stick spectra (or when `use_per_band_widths == false`).
+    pub fwhm_cm1: f64,
+    /// When true, uses each band's own `width_cm1` HWHM (preserves broad O–H vs sharp C=O in rule mode).
+    pub use_per_band_widths: bool,
+    pub line_shape: IrLineShape,
+    pub y_axis: IrYAxis,
+    pub x_min_cm1: f64,
+    pub x_max_cm1: f64,
+}
+
+impl Default for IrRenderParams {
+    fn default() -> Self {
+        Self {
+            scale_factor: 1.0,
+            fwhm_cm1: 18.0,
+            use_per_band_widths: true,
+            line_shape: IrLineShape::Lorentzian,
+            y_axis: IrYAxis::TransmittancePct,
+            x_min_cm1: 400.0,
+            x_max_cm1: 4000.0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IrBand {
+    /// Raw unscaled wavenumber (cm⁻¹). Negative values represent imaginary modes.
     pub wavenumber_cm1: f64,
-    pub intensity: f64, // 0.0..=1.0 absorption depth
+    /// Normalized absorption depth `0.0..=1.0` used for plotting and relative strength.
+    pub intensity: f64,
+    /// Physical IR intensity in `km/mol` when computed by xTB / ORCA / Gaussian.
+    pub intensity_km_mol: Option<f64>,
+    /// Band HWHM (cm⁻¹) for rule-based broadening.
     pub width_cm1: f64,
-    pub strength: &'static str, // "s", "m", "w", "br"
-    pub assignment: &'static str,
+    /// Spectroscopic strength descriptor (`"vs"`, `"s"`, `"m"`, `"w"`, `"br"`, `"imag"`).
+    pub strength: String,
+    pub assignment: String,
+    pub symmetry: Option<String>,
+    pub is_imaginary: bool,
+    pub mode_index: Option<usize>,
+    /// Canvas heavy-atom indices highlighted when this band is selected.
     pub atom_indices: Vec<usize>,
+    /// Optional per-atom kinetic-energy / displacement weights `(atom_idx, 0.0..=1.0)`.
+    pub atom_weights: Vec<(usize, f64)>,
+    /// Optional 3D Cartesian normal-mode displacements per atom (in explicit-H 3D geometry order).
+    pub normal_mode_vectors: Option<Vec<[f64; 3]>>,
+}
+
+impl IrBand {
+    pub fn rule(
+        wavenumber_cm1: f64,
+        intensity: f64,
+        width_cm1: f64,
+        strength: &str,
+        assignment: impl Into<String>,
+        atom_indices: Vec<usize>,
+    ) -> Self {
+        Self {
+            wavenumber_cm1,
+            intensity: intensity.clamp(0.0, 1.0),
+            intensity_km_mol: None,
+            width_cm1,
+            strength: strength.to_string(),
+            assignment: assignment.into(),
+            symmetry: None,
+            is_imaginary: wavenumber_cm1 < 0.0,
+            mode_index: None,
+            atom_indices,
+            atom_weights: Vec::new(),
+            normal_mode_vectors: None,
+        }
+    }
+
+    pub fn scaled_wavenumber(&self, scale_factor: f64) -> f64 {
+        if self.is_imaginary {
+            self.wavenumber_cm1
+        } else {
+            self.wavenumber_cm1 * scale_factor
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IrPrediction {
+    pub source: IrSpectrumSource,
     pub bands: Vec<IrBand>,
+    pub imaginary_count: usize,
+    pub default_scale_factor: f64,
     pub report_text: String,
+    /// Explicit-H 3D equilibrium geometry matching `IrBand::normal_mode_vectors` (for 3D vibration animation).
+    pub mode_geometry_3d: Option<ChemMolecule>,
+}
+
+/// Converts `%Transmittance` (`0..=100`) to `Absorbance` (`-log10(T)`).
+#[inline]
+pub fn transmittance_pct_to_absorbance(t_pct: f64) -> f64 {
+    let t = (t_pct / 100.0).clamp(1e-4, 1.0);
+    -t.log10()
+}
+
+/// Converts `Absorbance` (`>= 0`) to `%Transmittance` (`0..=100`).
+#[inline]
+pub fn absorbance_to_transmittance_pct(abs: f64) -> f64 {
+    (100.0 * 10.0_f64.powf(-abs.max(0.0))).clamp(0.5, 100.0)
+}
+
+fn eval_lineshape(wn: f64, center: f64, hwhm: f64, shape: IrLineShape) -> f64 {
+    let g = hwhm.max(2.0);
+    let dx = (wn - center) / g;
+    match shape {
+        IrLineShape::Lorentzian => 1.0 / (1.0 + dx * dx),
+        IrLineShape::Gaussian => (-std::f64::consts::LN_2 * dx * dx).exp(),
+        IrLineShape::PseudoVoigt => {
+            let lor = 1.0 / (1.0 + dx * dx);
+            let gau = (-std::f64::consts::LN_2 * dx * dx).exp();
+            0.5 * lor + 0.5 * gau
+        }
+    }
 }
 
 impl IrPrediction {
-    /// Evaluates a smooth FT-IR %Transmittance curve `(cm^-1, %T 0..100)` from `4000` down to `400 cm^-1`.
+    /// Backwards-compatible default `%Transmittance` curve `(cm^-1, %T 0..100)` from `4000` down to `400 cm^-1`.
     pub fn simulate_transmittance(&self, samples: usize) -> Vec<(f64, f64)> {
+        let params = IrRenderParams {
+            scale_factor: self.default_scale_factor,
+            use_per_band_widths: !self.source.is_quantum(),
+            y_axis: IrYAxis::TransmittancePct,
+            ..IrRenderParams::default()
+        };
+        self.simulate_curve(&params, samples)
+    }
+
+    /// Evaluates a smooth Absorbance curve `(cm^-1, A >= 0)` from `x_max_cm1` down to `x_min_cm1`.
+    pub fn simulate_absorbance(&self, params: &IrRenderParams, samples: usize) -> Vec<(f64, f64)> {
         if samples < 2 {
             return Vec::new();
         }
+        let hi = params.x_max_cm1.max(params.x_min_cm1 + 10.0);
+        let lo = params.x_min_cm1.min(hi - 10.0);
+        let span = hi - lo;
+        let global_hwhm = (params.fwhm_cm1 * 0.5).max(2.0);
         let mut out = Vec::with_capacity(samples);
         for k in 0..samples {
-            let wn = 4000.0 - 3600.0 * (k as f64) / ((samples - 1) as f64);
+            let wn = hi - span * (k as f64) / ((samples - 1) as f64);
             let mut abs = 0.0_f64;
             for b in &self.bands {
-                let dx = (wn - b.wavenumber_cm1) / b.width_cm1.max(8.0);
-                // Lorentzian band shape
-                abs += b.intensity / (1.0 + dx * dx);
+                if b.is_imaginary || b.wavenumber_cm1 <= 0.0 || b.intensity <= 1e-6 {
+                    continue;
+                }
+                let center = b.scaled_wavenumber(params.scale_factor);
+                let hwhm = if params.use_per_band_widths && !self.source.is_quantum() {
+                    b.width_cm1.max(4.0)
+                } else {
+                    global_hwhm
+                };
+                if (wn - center).abs() > hwhm * 18.0 {
+                    continue;
+                }
+                abs += b.intensity * eval_lineshape(wn, center, hwhm, params.line_shape);
             }
-            let transmittance = (100.0 * (-abs * 2.1).exp()).clamp(4.0, 100.0);
-            out.push((wn, transmittance));
+            out.push((wn, abs));
         }
+        out
+    }
+
+    /// Evaluates either `%Transmittance` or `Absorbance` curve `(cm^-1, y)` from `x_max_cm1` down to `x_min_cm1`.
+    pub fn simulate_curve(&self, params: &IrRenderParams, samples: usize) -> Vec<(f64, f64)> {
+        let abs_curve = self.simulate_absorbance(params, samples);
+        match params.y_axis {
+            IrYAxis::Absorbance => abs_curve,
+            IrYAxis::TransmittancePct => abs_curve
+                .into_iter()
+                .map(|(wn, a)| (wn, absorbance_to_transmittance_pct(a * 0.92)))
+                .collect(),
+        }
+    }
+
+    /// Formats an ACS/JOC-style `IR (cm^-1): νmax ...` experimental summary line.
+    pub fn format_report(&self, scale_factor: f64) -> String {
+        let mut real_bands: Vec<&IrBand> = self
+            .bands
+            .iter()
+            .filter(|b| !b.is_imaginary && b.wavenumber_cm1 >= 400.0 && b.intensity >= 0.15)
+            .collect();
+        if self.source.is_quantum() {
+            real_bands.sort_by(|a, b| {
+                b.intensity
+                    .partial_cmp(&a.intensity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            real_bands.truncate(10);
+            real_bands.sort_by(|a, b| {
+                b.wavenumber_cm1
+                    .partial_cmp(&a.wavenumber_cm1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            real_bands.truncate(8);
+        }
+        let summary: Vec<String> = real_bands
+            .iter()
+            .map(|b| format!("{:.0} ({})", b.scaled_wavenumber(scale_factor), b.strength))
+            .collect();
+        let src_tag = match &self.source {
+            IrSpectrumSource::RuleBased => "neat".to_string(),
+            other => format!("calc, {}", other.label()),
+        };
+        format!("IR ({src_tag}, cm⁻¹): νmax {}.", summary.join(", "))
+    }
+
+    /// Exports the broadened spectrum curve as a 2-column CSV (`wavenumber_cm1,value`).
+    pub fn to_csv(&self, params: &IrRenderParams, samples: usize) -> String {
+        let header = match params.y_axis {
+            IrYAxis::TransmittancePct => "wavenumber_cm1,transmittance_pct\n",
+            IrYAxis::Absorbance => "wavenumber_cm1,absorbance\n",
+        };
+        let mut out = String::from(header);
+        for (wn, y) in self.simulate_curve(params, samples) {
+            out.push_str(&format!("{wn:.2},{y:.5}\n"));
+        }
+        out
+    }
+
+    /// Exports the broadened spectrum as a standard IUPAC JCAMP-DX 5.00 IR `.jdx` file.
+    pub fn to_jcamp_dx(&self, title: &str, params: &IrRenderParams, samples: usize) -> String {
+        let curve = self.simulate_curve(params, samples.max(16));
+        let first_x = curve.first().map(|p| p.0).unwrap_or(params.x_max_cm1);
+        let last_x = curve.last().map(|p| p.0).unwrap_or(params.x_min_cm1);
+        let yunits = match params.y_axis {
+            IrYAxis::TransmittancePct => "TRANSMITTANCE",
+            IrYAxis::Absorbance => "ABSORBANCE",
+        };
+        let mut out = format!(
+            "##TITLE={title}\n##JCAMP-DX=5.00\n##DATA TYPE=INFRARED SPECTRUM\n##ORIGIN=ChiralCraft ({})\n##XUNITS=1/CM\n##YUNITS={yunits}\n##FIRSTX={first_x:.4}\n##LASTX={last_x:.4}\n##XFACTOR=1.0\n##YFACTOR=1.0\n##NPOINTS={}\n##XYDATA=(X++(Y..Y))\n",
+            self.source.label(),
+            curve.len()
+        );
+        for chunk in curve.chunks(8) {
+            if let Some(first) = chunk.first() {
+                out.push_str(&format!("{:.3}", first.0));
+                for &(_, y) in chunk {
+                    let y_val = if params.y_axis == IrYAxis::TransmittancePct {
+                        y / 100.0
+                    } else {
+                        y
+                    };
+                    out.push_str(&format!(" {y_val:.5}"));
+                }
+                out.push('\n');
+            }
+        }
+        out.push_str("##END=\n");
         out
     }
 }
 
-/// Predicts diagnostic FT-IR vibrational bands and exact atom indices for `mol`.
+/// Pluggable backend trait for FT-IR prediction engines (pure-Rust rules, xTB, DFT, or optional ML).
+pub trait IrBackend {
+    fn name(&self) -> &str;
+    fn predict(&self, mol: &ChemMolecule) -> Result<IrPrediction, String>;
+}
+
+/// Instant pure-Rust functional-group correlation backend.
+pub struct RuleBasedIrBackend;
+
+impl IrBackend for RuleBasedIrBackend {
+    fn name(&self) -> &str {
+        "Rule-Based (Pure Rust)"
+    }
+
+    fn predict(&self, mol: &ChemMolecule) -> Result<IrPrediction, String> {
+        Ok(predict_ir_spectrum(mol))
+    }
+}
+
+/// Feature-gated extension seam (`--features ml-ir`) for plugging in an ONNX / Chemprop-IR model
+/// without adding ML runtime dependencies to the default pure-Rust ChiralCraft binary.
+#[cfg(feature = "ml-ir")]
+pub trait MlIrModelHook: IrBackend + Send + Sync {
+    fn model_path(&self) -> &str;
+}
+
+// ============================================================================
+// 1b. Experimental Peak Picking & Quantitative Spectral Comparison (HQI / r)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrPeak {
+    pub wavenumber_cm1: f64,
+    pub y_value: f64,
+    pub prominence: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IrComparisonMetrics {
+    /// Hit Quality Index (`0.0..=100.0`, squared cosine similarity in absorbance space).
+    pub hqi_pct: f64,
+    /// Mean-centered Pearson correlation (`-1.0..=1.0`).
+    pub pearson_r: f64,
+    /// Uncentered cosine similarity (`0.0..=1.0`).
+    pub cosine_sim: f64,
+    pub overlap_points: usize,
+}
+
+/// Detects prominent absorbance maxima from an IR curve `(wavenumber_cm1, absorbance)`.
+pub fn pick_ir_peaks(curve_wn_abs: &[(f64, f64)], min_prominence: f64, max_peaks: usize) -> Vec<IrPeak> {
+    if curve_wn_abs.len() < 5 || max_peaks == 0 {
+        return Vec::new();
+    }
+    let mut pts = curve_wn_abs.to_vec();
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let max_y = pts.iter().map(|p| p.1).fold(0.0_f64, f64::max);
+    if max_y <= 1e-9 {
+        return Vec::new();
+    }
+    let thresh = min_prominence.max(0.02) * max_y;
+    let n = pts.len();
+    let win = (n / 40).clamp(2, 18);
+    let mut found = Vec::new();
+    for i in 1..(n - 1) {
+        let y = pts[i].1;
+        if y >= pts[i - 1].1 && y > pts[i + 1].1 && y >= thresh {
+            let lo = i.saturating_sub(win);
+            let hi = (i + win).min(n - 1);
+            let left_min = pts[lo..i].iter().map(|p| p.1).fold(y, f64::min);
+            let right_min = pts[(i + 1)..=hi].iter().map(|p| p.1).fold(y, f64::min);
+            let prom = y - left_min.max(right_min);
+            if prom >= thresh * 0.45 {
+                found.push(IrPeak {
+                    wavenumber_cm1: pts[i].0,
+                    y_value: y,
+                    prominence: prom,
+                });
+            }
+        }
+    }
+    found.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap_or(std::cmp::Ordering::Equal));
+    let mut kept: Vec<IrPeak> = Vec::new();
+    for pk in found {
+        if !kept.iter().any(|k| (k.wavenumber_cm1 - pk.wavenumber_cm1).abs() < 18.0) {
+            kept.push(pk);
+            if kept.len() >= max_peaks {
+                break;
+            }
+        }
+    }
+    kept.sort_by(|a, b| b.wavenumber_cm1.partial_cmp(&a.wavenumber_cm1).unwrap_or(std::cmp::Ordering::Equal));
+    kept
+}
+
+fn sample_sorted_linear(sorted_pts: &[(f64, f64)], x: f64) -> Option<f64> {
+    if sorted_pts.len() < 2 {
+        return None;
+    }
+    if x < sorted_pts.first()?.0 || x > sorted_pts.last()?.0 {
+        return None;
+    }
+    let idx = sorted_pts.partition_point(|&(px, _)| px < x);
+    if idx == 0 {
+        return Some(sorted_pts[0].1);
+    }
+    if idx >= sorted_pts.len() {
+        return Some(sorted_pts[sorted_pts.len() - 1].1);
+    }
+    let (x0, y0) = sorted_pts[idx - 1];
+    let (x1, y1) = sorted_pts[idx];
+    if (x1 - x0).abs() < 1e-12 {
+        Some(y0)
+    } else {
+        let t = (x - x0) / (x1 - x0);
+        Some(y0 + t * (y1 - y0))
+    }
+}
+
+/// Computes Hit Quality Index (HQI %), Pearson correlation `r`, and cosine similarity between
+/// two IR absorbance spectra `(wavenumber_cm1, absorbance)` over `[wn_min, wn_max]`.
+pub fn compare_ir_spectra(
+    calc_wn_abs: &[(f64, f64)],
+    exp_wn_abs: &[(f64, f64)],
+    wn_min: f64,
+    wn_max: f64,
+) -> IrComparisonMetrics {
+    let mut a = calc_wn_abs.to_vec();
+    let mut b = exp_wn_abs.to_vec();
+    a.sort_by(|u, v| u.0.partial_cmp(&v.0).unwrap_or(std::cmp::Ordering::Equal));
+    b.sort_by(|u, v| u.0.partial_cmp(&v.0).unwrap_or(std::cmp::Ordering::Equal));
+    if a.len() < 2 || b.len() < 2 {
+        return IrComparisonMetrics {
+            hqi_pct: 0.0,
+            pearson_r: 0.0,
+            cosine_sim: 0.0,
+            overlap_points: 0,
+        };
+    }
+    let lo = wn_min.max(a.first().unwrap().0).max(b.first().unwrap().0);
+    let hi = wn_max.min(a.last().unwrap().0).min(b.last().unwrap().0);
+    if hi <= lo + 4.0 {
+        return IrComparisonMetrics {
+            hqi_pct: 0.0,
+            pearson_r: 0.0,
+            cosine_sim: 0.0,
+            overlap_points: 0,
+        };
+    }
+
+    let step = 2.0_f64;
+    let count = (((hi - lo) / step).floor() as usize).clamp(10, 2000);
+    let mut va = Vec::with_capacity(count);
+    let mut vb = Vec::with_capacity(count);
+    for k in 0..=count {
+        let wn = lo + (hi - lo) * (k as f64) / (count as f64);
+        if let (Some(ya), Some(yb)) = (sample_sorted_linear(&a, wn), sample_sorted_linear(&b, wn)) {
+            va.push(ya.max(0.0));
+            vb.push(yb.max(0.0));
+        }
+    }
+    let m = va.len();
+    if m < 4 {
+        return IrComparisonMetrics {
+            hqi_pct: 0.0,
+            pearson_r: 0.0,
+            cosine_sim: 0.0,
+            overlap_points: m,
+        };
+    }
+
+    let dot: f64 = va.iter().zip(&vb).map(|(x, y)| x * y).sum();
+    let na: f64 = va.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let nb: f64 = vb.iter().map(|y| y * y).sum::<f64>().sqrt();
+    let cos = if na > 1e-12 && nb > 1e-12 {
+        (dot / (na * nb)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let hqi_pct = (cos * cos * 100.0).clamp(0.0, 100.0);
+
+    let ma = va.iter().sum::<f64>() / (m as f64);
+    let mb = vb.iter().sum::<f64>() / (m as f64);
+    let mut cov = 0.0;
+    let mut sda = 0.0;
+    let mut sdb = 0.0;
+    for (x, y) in va.iter().zip(&vb) {
+        let dx = x - ma;
+        let dy = y - mb;
+        cov += dx * dy;
+        sda += dx * dx;
+        sdb += dy * dy;
+    }
+    let pearson_r = if sda > 1e-12 && sdb > 1e-12 {
+        (cov / (sda.sqrt() * sdb.sqrt())).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+
+    IrComparisonMetrics {
+        hqi_pct,
+        pearson_r,
+        cosine_sim: cos,
+        overlap_points: m,
+    }
+}
+
+/// Shortest cycle length containing `start` (up to `max_len`), used for carbonyl ring-strain rules.
+fn smallest_ring_size(adj: &[Vec<(usize, i32)>], start: usize, max_len: usize) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for &(nbr, _) in &adj[start] {
+        // BFS from `nbr` to `start` without using the direct edge `(start, nbr)`
+        let mut dist = vec![usize::MAX; adj.len()];
+        let mut q = std::collections::VecDeque::new();
+        dist[nbr] = 1;
+        q.push_back(nbr);
+        while let Some(u) = q.pop_front() {
+            let d = dist[u];
+            if d >= max_len || best.map(|b| d + 1 >= b).unwrap_or(false) {
+                continue;
+            }
+            for &(v, _) in &adj[u] {
+                if u == nbr && v == start {
+                    continue;
+                }
+                if v == start {
+                    let cyc = d + 1;
+                    best = Some(best.map(|b| b.min(cyc)).unwrap_or(cyc));
+                    break;
+                }
+                if dist[v] == usize::MAX {
+                    dist[v] = d + 1;
+                    q.push_back(v);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Predicts diagnostic FT-IR vibrational bands and exact atom indices for `mol` (Tier 1 Instant Rule Engine).
 pub fn predict_ir_spectrum(mol: &ChemMolecule) -> IrPrediction {
     let n = mol.atoms.len();
     let adj = build_adj(mol);
     let val = CcVal::compute(mol);
     let arom = CcAromaticityInfo::perceive(mol);
-    let mut bands = Vec::new();
+    let mut bands: Vec<IrBand> = Vec::new();
 
     let mut has_sp3_ch = false;
+    let mut has_ch2 = false;
+    let mut has_ch3 = false;
     let mut has_arom_ch = false;
     let mut has_arom_ring = false;
     let mut sp3_c_atoms = Vec::new();
+    let mut ch2_atoms = Vec::new();
+    let mut ch3_atoms = Vec::new();
     let mut arom_atoms = Vec::new();
+
+    let tot_h_of = |idx: usize| -> u8 {
+        let imp_h = val.implicit_h_counts.get(idx).copied().unwrap_or(0);
+        let exp_h = adj[idx].iter().filter(|&&(k, _)| mol.atoms[k].z == 1).count() as u8;
+        imp_h.saturating_add(exp_h)
+    };
+
+    let mut handled_anhydride_o: BTreeSet<usize> = BTreeSet::new();
 
     for i in 0..n {
         let z = mol.atoms[i].z;
-        let imp_h = val.implicit_h_counts.get(i).copied().unwrap_or(0);
-        let exp_h = adj[i].iter().filter(|&&(k, _)| mol.atoms[k].z == 1).count() as u8;
-        let tot_h = imp_h.saturating_add(exp_h);
+        let tot_h = tot_h_of(i);
 
+        // 1. O-H stretches (carboxylic acid, phenol, alcohol)
         if z == 8 && tot_h >= 1 {
-            // Check if carboxylic acid -C(=O)-OH vs phenol vs alcohol
             let is_acid = adj[i].iter().any(|&(c, _)| {
                 mol.atoms[c].z == 6 && adj[c].iter().any(|&(o2, o)| o2 != i && mol.atoms[o2].z == 8 && o == 2)
             });
             let is_phenol = adj[i].iter().any(|&(c, _)| arom.is_atom_aromatic(c));
             if is_acid {
-                bands.push(IrBand {
-                    wavenumber_cm1: 3000.0,
-                    intensity: 0.78,
-                    width_cm1: 210.0,
-                    strength: "br",
-                    assignment: "Carboxylic Acid O–H stretch (very broad)",
-                    atom_indices: vec![i],
-                });
+                bands.push(IrBand::rule(
+                    3000.0,
+                    0.80,
+                    210.0,
+                    "br",
+                    "Carboxylic Acid O–H stretch (very broad)",
+                    vec![i],
+                ));
             } else {
-                bands.push(IrBand {
-                    wavenumber_cm1: if is_phenol { 3380.0 } else { 3340.0 },
-                    intensity: 0.72,
-                    width_cm1: 110.0,
-                    strength: "br",
-                    assignment: if is_phenol { "Phenol O–H stretch" } else { "Alcohol O–H stretch (H-bonded)" },
-                    atom_indices: vec![i],
-                });
+                bands.push(IrBand::rule(
+                    if is_phenol { 3380.0 } else { 3340.0 },
+                    0.74,
+                    110.0,
+                    "br",
+                    if is_phenol { "Phenol O–H stretch" } else { "Alcohol O–H stretch (H-bonded)" },
+                    vec![i],
+                ));
             }
+        // 2. N-H stretches (primary NH2 doublet vs secondary N-H, amine vs amide)
         } else if z == 7 && tot_h >= 1 {
             let is_amide = adj[i].iter().any(|&(c, _)| {
                 mol.atoms[c].z == 6 && adj[c].iter().any(|&(o2, o)| mol.atoms[o2].z == 8 && o == 2)
             });
-            bands.push(IrBand {
-                wavenumber_cm1: if is_amide { 3310.0 } else { 3370.0 },
-                intensity: 0.52,
-                width_cm1: 42.0,
-                strength: "m",
-                assignment: if is_amide { "Amide N–H stretch" } else { "Amine N–H stretch" },
-                atom_indices: vec![i],
-            });
+            if tot_h >= 2 {
+                if is_amide {
+                    bands.push(IrBand::rule(3355.0, 0.54, 34.0, "m", "Primary Amide N–H asym stretch", vec![i]));
+                    bands.push(IrBand::rule(3185.0, 0.50, 38.0, "m", "Primary Amide N–H sym stretch", vec![i]));
+                } else {
+                    bands.push(IrBand::rule(3400.0, 0.48, 36.0, "m", "Primary Amine N–H asym stretch", vec![i]));
+                    bands.push(IrBand::rule(3320.0, 0.46, 36.0, "m", "Primary Amine N–H sym stretch", vec![i]));
+                }
+                bands.push(IrBand::rule(1615.0, 0.52, 24.0, "m", "Primary NH₂ scissoring bend", vec![i]));
+            } else {
+                bands.push(IrBand::rule(
+                    if is_amide { 3305.0 } else { 3345.0 },
+                    0.52,
+                    40.0,
+                    "m",
+                    if is_amide { "Secondary Amide N–H stretch" } else { "Secondary Amine N–H stretch" },
+                    vec![i],
+                ));
+            }
+        // 3. Thiol S-H stretch
+        } else if z == 16 && tot_h >= 1 {
+            bands.push(IrBand::rule(2565.0, 0.28, 22.0, "w", "Thiol S–H stretch", vec![i]));
+        // 4. Carbon centers (aromatic, sp3, carbonyls, anhydrides, aldehydes, terminal alkynes, cumulenes)
         } else if z == 6 {
             if arom.is_atom_aromatic(i) {
                 has_arom_ring = true;
@@ -132,102 +677,298 @@ pub fn predict_ir_spectrum(mol: &ChemMolecule) -> IrPrediction {
                 if sp3_c_atoms.len() < 4 {
                     sp3_c_atoms.push(i);
                 }
+                if tot_h == 2 {
+                    has_ch2 = true;
+                    if ch2_atoms.len() < 4 {
+                        ch2_atoms.push(i);
+                    }
+                } else if tot_h >= 3 {
+                    has_ch3 = true;
+                    if ch3_atoms.len() < 4 {
+                        ch3_atoms.push(i);
+                    }
+                }
             }
-            // Carbonyl C=O diagnostic frequencies!
+
+            // Terminal alkyne ≡C–H stretch
+            if tot_h >= 1 && adj[i].iter().any(|&(k, o)| o == 3 && mol.atoms[k].z == 6) {
+                bands.push(IrBand::rule(3300.0, 0.72, 18.0, "s", "Terminal Alkyne ≡C–H stretch", vec![i]));
+            }
+
+            // Cumulene / Allene C=C=C or Isocyanate -N=C=O
+            let dbl_nbrs: Vec<usize> = adj[i].iter().filter(|&&(_, o)| o == 2).map(|&(k, _)| k).collect();
+            if dbl_nbrs.len() == 2 {
+                let (za, zb) = (mol.atoms[dbl_nbrs[0]].z, mol.atoms[dbl_nbrs[1]].z);
+                let mut at = vec![i, dbl_nbrs[0], dbl_nbrs[1]];
+                if (za == 7 && zb == 8) || (za == 8 && zb == 7) {
+                    bands.push(IrBand::rule(2270.0, 0.92, 20.0, "vs", "Isocyanate –N=C=O asym stretch", at));
+                    continue;
+                } else if za == 6 && zb == 6 {
+                    bands.push(IrBand::rule(1955.0, 0.68, 20.0, "m", "Allene C=C=C asym stretch", at));
+                } else if za == 8 && zb == 8 {
+                    at.sort_unstable();
+                    bands.push(IrBand::rule(2349.0, 0.90, 18.0, "vs", "CO₂ asym stretch", at));
+                    continue;
+                }
+            }
+
+            // Metal carbonyl M–C≡O (triple or double bonded to O and bonded to a d-block transition metal)
+            if let Some(&(o_idx, ord)) = adj[i].iter().find(|&&(k, o)| mol.atoms[k].z == 8 && o >= 2) {
+                let bonded_metal = adj[i].iter().find(|&&(k, _)| {
+                    let kz = mol.atoms[k].z;
+                    (21..=30).contains(&kz) || (39..=48).contains(&kz) || (72..=80).contains(&kz)
+                });
+                if let Some(&(m_idx, _)) = bonded_metal {
+                    if ord == 3 || adj[i].len() == 2 {
+                        bands.push(IrBand::rule(
+                            1985.0,
+                            0.94,
+                            18.0,
+                            "vs",
+                            "Metal Carbonyl M–C≡O stretch",
+                            vec![m_idx, i, o_idx],
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            // Carbonyl C=O diagnostic frequencies (with ring-strain, anhydride, and conjugation shifts)
             if let Some(&(o_idx, _)) = adj[i].iter().find(|&&(k, o)| mol.atoms[k].z == 8 && o == 2) {
+                // Check for anhydride: C(=O)-O-C(=O)
+                let anhy_o = adj[i].iter().find(|&&(k, o)| {
+                    k != o_idx
+                        && mol.atoms[k].z == 8
+                        && o == 1
+                        && adj[k].iter().any(|&(c2, _)| {
+                            c2 != i
+                                && mol.atoms[c2].z == 6
+                                && adj[c2].iter().any(|&(o3, o3ord)| o3 != k && mol.atoms[o3].z == 8 && o3ord == 2)
+                        })
+                });
+                if let Some(&(bridge_o, _)) = anhy_o {
+                    if handled_anhydride_o.insert(bridge_o) {
+                        let ring_sz = smallest_ring_size(&adj, i, 7);
+                        let (hi_wn, lo_wn, desc) = if matches!(ring_sz, Some(5)) {
+                            (1855.0, 1785.0, "Cyclic 5-Ring Anhydride C=O")
+                        } else {
+                            (1820.0, 1755.0, "Anhydride C=O")
+                        };
+                        bands.push(IrBand::rule(hi_wn, 0.88, 20.0, "s", format!("{desc} sym stretch"), vec![i, o_idx, bridge_o]));
+                        bands.push(IrBand::rule(lo_wn, 0.86, 20.0, "s", format!("{desc} asym stretch"), vec![i, o_idx, bridge_o]));
+                    }
+                    continue;
+                }
+
                 let has_hal = adj[i].iter().any(|&(k, _)| matches!(mol.atoms[k].z, 9 | 17 | 35));
                 let has_n = adj[i].iter().any(|&(k, o)| mol.atoms[k].z == 7 && o == 1);
                 let has_oh = adj[i].iter().any(|&(k, o)| {
-                    k != o_idx && mol.atoms[k].z == 8 && o == 1 && val.implicit_h_counts.get(k).copied().unwrap_or(0) >= 1
+                    k != o_idx && mol.atoms[k].z == 8 && o == 1 && tot_h_of(k) >= 1
                 });
                 let has_or = adj[i].iter().any(|&(k, o)| {
                     k != o_idx && mol.atoms[k].z == 8 && o == 1 && adj[k].len() >= 2
                 });
-                let conj = adj[i].iter().any(|&(k, _)| k != o_idx && (arom.is_atom_aromatic(k) || adj[k].iter().any(|&(_, o2)| o2 == 2)));
-                let shift = if conj { -20.0 } else { 0.0 };
-                let (wn, desc) = if has_hal {
-                    (1800.0 + shift, "Acyl Halide C=O stretch")
-                } else if has_or {
-                    (1742.0 + shift, "Ester C=O stretch")
-                } else if has_oh {
-                    (1712.0 + shift, "Carboxylic Acid C=O stretch")
-                } else if has_n {
-                    (1665.0 + shift, "Amide I C=O stretch")
-                } else if tot_h >= 1 {
-                    (1728.0 + shift, "Aldehyde C=O stretch")
-                } else {
-                    (1715.0 + shift, "Ketone C=O stretch")
-                };
-                bands.push(IrBand {
-                    wavenumber_cm1: wn,
-                    intensity: 0.94,
-                    width_cm1: 22.0,
-                    strength: "s",
-                    assignment: desc,
-                    atom_indices: vec![i, o_idx],
+                let conj = adj[i].iter().any(|&(k, _)| {
+                    k != o_idx && (arom.is_atom_aromatic(k) || adj[k].iter().any(|&(_, o2)| o2 == 2))
                 });
-                if has_n {
-                    bands.push(IrBand {
-                        wavenumber_cm1: 1545.0,
-                        intensity: 0.58,
-                        width_cm1: 24.0,
-                        strength: "m",
-                        assignment: "Amide II N–H bend / C–N stretch",
-                        atom_indices: vec![i, o_idx],
-                    });
+                let ring_sz = smallest_ring_size(&adj, i, 7);
+                let ring_shift = match ring_sz {
+                    Some(3) => 100.0,
+                    Some(4) => 65.0,
+                    Some(5) => 30.0,
+                    _ => 0.0,
+                };
+                let conj_shift = if conj { -22.0 } else { 0.0 };
+
+                let (wn, desc) = if has_hal {
+                    (1800.0 + conj_shift, "Acyl Halide C=O stretch")
+                } else if has_or {
+                    if matches!(ring_sz, Some(4)) {
+                        (1820.0 + conj_shift, "β-Lactone C=O stretch (ring-strained)")
+                    } else if matches!(ring_sz, Some(5)) {
+                        (1772.0 + conj_shift, "γ-Lactone C=O stretch")
+                    } else {
+                        (1742.0 + conj_shift, "Ester C=O stretch")
+                    }
+                } else if has_oh {
+                    (1712.0 + conj_shift, "Carboxylic Acid C=O stretch")
+                } else if has_n {
+                    if matches!(ring_sz, Some(4)) {
+                        (1755.0 + conj_shift, "β-Lactam C=O stretch (ring-strained)")
+                    } else if matches!(ring_sz, Some(5)) {
+                        (1700.0 + conj_shift, "γ-Lactam C=O stretch")
+                    } else {
+                        (1665.0 + conj_shift, "Amide I C=O stretch")
+                    }
+                } else if tot_h >= 1 {
+                    (1728.0 + conj_shift, "Aldehyde C=O stretch")
+                } else if matches!(ring_sz, Some(4)) {
+                    (1780.0 + conj_shift, "Cyclobutanone C=O stretch (ring-strained)")
+                } else if matches!(ring_sz, Some(5)) {
+                    (1745.0 + conj_shift, "Cyclopentanone C=O stretch")
+                } else {
+                    (1715.0 + conj_shift + ring_shift, "Ketone C=O stretch")
+                };
+
+                bands.push(IrBand::rule(wn, 0.94, 20.0, "vs", desc, vec![i, o_idx]));
+
+                if tot_h >= 1 && !has_hal && !has_n && !has_oh && !has_or {
+                    // Aldehyde Fermi doublet (C-H stretch)
+                    bands.push(IrBand::rule(2825.0, 0.44, 22.0, "m", "Aldehyde C–H Fermi doublet (high)", vec![i]));
+                    bands.push(IrBand::rule(2720.0, 0.42, 22.0, "m", "Aldehyde C–H Fermi doublet (low)", vec![i]));
+                }
+                if has_n && !matches!(ring_sz, Some(4)) {
+                    bands.push(IrBand::rule(1545.0, 0.58, 24.0, "m", "Amide II N–H bend / C–N stretch", vec![i, o_idx]));
                 }
             }
+        // 5. Nitro & Azide nitrogen centers
         } else if z == 7 {
-            let oxys: Vec<usize> = adj[i].iter().filter(|&&(k, _)| mol.atoms[k].z == 8 && adj[k].len() == 1).map(|&(k, _)| k).collect();
+            let oxys: Vec<usize> = adj[i]
+                .iter()
+                .filter(|&&(k, _)| mol.atoms[k].z == 8 && adj[k].len() == 1)
+                .map(|&(k, _)| k)
+                .collect();
             if oxys.len() >= 2 {
                 let mut at = vec![i];
                 at.extend(oxys);
-                bands.push(IrBand { wavenumber_cm1: 1530.0, intensity: 0.85, width_cm1: 24.0, strength: "s", assignment: "Nitro N=O asym stretch", atom_indices: at.clone() });
-                bands.push(IrBand { wavenumber_cm1: 1350.0, intensity: 0.76, width_cm1: 22.0, strength: "s", assignment: "Nitro N=O sym stretch", atom_indices: at });
+                bands.push(IrBand::rule(1530.0, 0.85, 24.0, "s", "Nitro N=O asym stretch", at.clone()));
+                bands.push(IrBand::rule(1350.0, 0.76, 22.0, "s", "Nitro N=O sym stretch", at));
             }
+            // Azide -N=N+=N- (central N with two N neighbors, at least one multiple bond)
+            let n_nbrs: Vec<(usize, i32)> = adj[i].iter().copied().filter(|&(k, _)| mol.atoms[k].z == 7).collect();
+            if n_nbrs.len() == 2 && n_nbrs.iter().any(|&(_, o)| o >= 2) {
+                bands.push(IrBand::rule(
+                    2135.0,
+                    0.90,
+                    18.0,
+                    "vs",
+                    "Azide –N₃ asym stretch",
+                    vec![n_nbrs[0].0, i, n_nbrs[1].0],
+                ));
+            }
+        // 6. Sulfur (sulfone/sulfonamide/sulfoxide)
         } else if z == 16 {
-            let oxys: Vec<usize> = adj[i].iter().filter(|&&(k, o)| mol.atoms[k].z == 8 && o == 2).map(|&(k, _)| k).collect();
+            let oxys: Vec<usize> = adj[i]
+                .iter()
+                .filter(|&&(k, o)| mol.atoms[k].z == 8 && o == 2)
+                .map(|&(k, _)| k)
+                .collect();
             if oxys.len() >= 2 {
-                bands.push(IrBand { wavenumber_cm1: 1325.0, intensity: 0.82, width_cm1: 22.0, strength: "s", assignment: "Sulfone / Sulfonamide S=O asym", atom_indices: vec![i, oxys[0], oxys[1]] });
-                bands.push(IrBand { wavenumber_cm1: 1155.0, intensity: 0.86, width_cm1: 22.0, strength: "s", assignment: "Sulfone / Sulfonamide S=O sym", atom_indices: vec![i, oxys[0], oxys[1]] });
+                bands.push(IrBand::rule(1325.0, 0.82, 22.0, "s", "Sulfone / Sulfonamide S=O asym", vec![i, oxys[0], oxys[1]]));
+                bands.push(IrBand::rule(1155.0, 0.86, 22.0, "s", "Sulfone / Sulfonamide S=O sym", vec![i, oxys[0], oxys[1]]));
             } else if oxys.len() == 1 {
-                bands.push(IrBand { wavenumber_cm1: 1050.0, intensity: 0.78, width_cm1: 22.0, strength: "s", assignment: "Sulfoxide S=O stretch", atom_indices: vec![i, oxys[0]] });
+                bands.push(IrBand::rule(1050.0, 0.78, 22.0, "s", "Sulfoxide S=O stretch", vec![i, oxys[0]]));
+            }
+        // 7. Phosphorus (phosphine oxide / phosphate P=O)
+        } else if z == 15 {
+            if let Some(&(o_idx, _)) = adj[i].iter().find(|&&(k, o)| mol.atoms[k].z == 8 && o == 2) {
+                bands.push(IrBand::rule(1250.0, 0.84, 24.0, "s", "Phosphoryl P=O stretch", vec![i, o_idx]));
             }
         }
     }
 
-    // Bond-based bands (C#N, C#C, C=C, C-O, C-F, C-Cl, C-Br)
+    // Bond-based bands (C#N, C#C, C=C + alkene OOP wag, C-O, Si-O, C-F, C-Cl, C-Br)
     for b in &mol.bonds {
-        if b.begin_atom >= n || b.end_atom >= n { continue; }
+        if b.begin_atom >= n || b.end_atom >= n {
+            continue;
+        }
         let (u, v) = (b.begin_atom, b.end_atom);
         let (zu, zv) = (mol.atoms[u].z, mol.atoms[v].z);
         if b.order == 3 && ((zu == 6 && zv == 7) || (zu == 7 && zv == 6)) {
-            bands.push(IrBand { wavenumber_cm1: 2235.0, intensity: 0.65, width_cm1: 16.0, strength: "m", assignment: "Nitrile C≡N stretch", atom_indices: vec![u, v] });
+            bands.push(IrBand::rule(2235.0, 0.65, 16.0, "m", "Nitrile C≡N stretch", vec![u, v]));
         } else if b.order == 3 && zu == 6 && zv == 6 {
-            bands.push(IrBand { wavenumber_cm1: 2140.0, intensity: 0.45, width_cm1: 18.0, strength: "w", assignment: "Alkyne C≡C stretch", atom_indices: vec![u, v] });
+            bands.push(IrBand::rule(2140.0, 0.45, 18.0, "w", "Alkyne C≡C stretch", vec![u, v]));
         } else if b.order == 2 && zu == 6 && zv == 6 && !arom.is_atom_aromatic(u) && !arom.is_atom_aromatic(v) {
-            bands.push(IrBand { wavenumber_cm1: 1648.0, intensity: 0.52, width_cm1: 20.0, strength: "m", assignment: "Alkene C=C stretch", atom_indices: vec![u, v] });
+            bands.push(IrBand::rule(1648.0, 0.52, 20.0, "m", "Alkene C=C stretch", vec![u, v]));
+            let hu = tot_h_of(u);
+            let hv = tot_h_of(v);
+            if hu >= 1 || hv >= 1 {
+                bands.push(IrBand::rule(3080.0, 0.34, 22.0, "w", "Alkene =C–H stretch", vec![u, v]));
+            }
+            if (hu == 2 && hv == 1) || (hu == 1 && hv == 2) {
+                bands.push(IrBand::rule(990.0, 0.58, 18.0, "m", "Vinyl =C–H OOP bend (990)", vec![u, v]));
+                bands.push(IrBand::rule(910.0, 0.64, 18.0, "s", "Vinyl =CH₂ OOP wag (910)", vec![u, v]));
+            } else if (hu == 2 && hv == 0) || (hu == 0 && hv == 2) {
+                bands.push(IrBand::rule(890.0, 0.64, 18.0, "s", "Geminal =CH₂ OOP wag", vec![u, v]));
+            } else if hu == 1 && hv == 1 {
+                bands.push(IrBand::rule(968.0, 0.60, 18.0, "s", "Disubstituted Alkene =C–H OOP bend", vec![u, v]));
+            }
         } else if b.order == 1 && ((zu == 6 && zv == 8) || (zu == 8 && zv == 6)) {
-            bands.push(IrBand { wavenumber_cm1: 1185.0, intensity: 0.64, width_cm1: 28.0, strength: "s", assignment: "C–O stretch (ether/ester/alcohol)", atom_indices: vec![u, v] });
+            bands.push(IrBand::rule(1185.0, 0.64, 28.0, "s", "C–O stretch (ether/ester/alcohol)", vec![u, v]));
+        } else if b.order == 1 && ((zu == 14 && zv == 8) || (zu == 8 && zv == 14)) {
+            bands.push(IrBand::rule(1080.0, 0.86, 30.0, "vs", "Siloxane / Silane Si–O stretch", vec![u, v]));
         } else if b.order == 1 && ((zu == 6 && zv == 9) || (zu == 9 && zv == 6)) {
-            bands.push(IrBand { wavenumber_cm1: 1140.0, intensity: 0.74, width_cm1: 26.0, strength: "s", assignment: "C–F stretch", atom_indices: vec![u, v] });
+            bands.push(IrBand::rule(1140.0, 0.74, 26.0, "s", "C–F stretch", vec![u, v]));
         } else if b.order == 1 && ((zu == 6 && zv == 17) || (zu == 17 && zv == 6)) {
-            bands.push(IrBand { wavenumber_cm1: 745.0, intensity: 0.60, width_cm1: 22.0, strength: "m", assignment: "C–Cl stretch", atom_indices: vec![u, v] });
+            bands.push(IrBand::rule(745.0, 0.60, 22.0, "m", "C–Cl stretch", vec![u, v]));
         } else if b.order == 1 && ((zu == 6 && zv == 35) || (zu == 35 && zv == 6)) {
-            bands.push(IrBand { wavenumber_cm1: 620.0, intensity: 0.55, width_cm1: 22.0, strength: "m", assignment: "C–Br stretch", atom_indices: vec![u, v] });
+            bands.push(IrBand::rule(620.0, 0.55, 22.0, "m", "C–Br stretch", vec![u, v]));
         }
     }
 
     if has_arom_ch {
-        bands.push(IrBand { wavenumber_cm1: 3055.0, intensity: 0.36, width_cm1: 24.0, strength: "w", assignment: "Aromatic C–H stretch", atom_indices: arom_atoms.iter().take(4).copied().collect() });
+        bands.push(IrBand::rule(
+            3055.0,
+            0.36,
+            24.0,
+            "w",
+            "Aromatic C–H stretch",
+            arom_atoms.iter().take(4).copied().collect(),
+        ));
     }
     if has_sp3_ch {
-        bands.push(IrBand { wavenumber_cm1: 2935.0, intensity: 0.55, width_cm1: 35.0, strength: "m", assignment: "Aliphatic sp³ C–H stretch", atom_indices: sp3_c_atoms });
+        bands.push(IrBand::rule(2935.0, 0.55, 35.0, "m", "Aliphatic sp³ C–H stretch", sp3_c_atoms));
+    }
+    if has_ch2 {
+        bands.push(IrBand::rule(1465.0, 0.44, 22.0, "m", "Aliphatic CH₂ scissoring bend", ch2_atoms));
+    }
+    if has_ch3 {
+        bands.push(IrBand::rule(1375.0, 0.40, 20.0, "m", "Aliphatic CH₃ umbrella bend", ch3_atoms));
     }
     if has_arom_ring {
-        bands.push(IrBand { wavenumber_cm1: 1595.0, intensity: 0.52, width_cm1: 20.0, strength: "m", assignment: "Aromatic ring C=C stretch", atom_indices: arom_atoms.clone() });
-        bands.push(IrBand { wavenumber_cm1: 1490.0, intensity: 0.50, width_cm1: 20.0, strength: "m", assignment: "Aromatic ring breathing", atom_indices: arom_atoms.clone() });
-        bands.push(IrBand { wavenumber_cm1: 755.0, intensity: 0.62, width_cm1: 24.0, strength: "s", assignment: "Aromatic C–H out-of-plane bend", atom_indices: arom_atoms });
+        bands.push(IrBand::rule(1595.0, 0.52, 20.0, "m", "Aromatic ring C=C stretch", arom_atoms.clone()));
+        bands.push(IrBand::rule(1490.0, 0.50, 20.0, "m", "Aromatic ring breathing", arom_atoms.clone()));
+
+        // Refine benzene 6-ring OOP substitution pattern when a single 6-carbon aromatic ring is present
+        let sub_positions: Vec<usize> = arom_atoms
+            .iter()
+            .copied()
+            .filter(|&a| {
+                adj[a]
+                    .iter()
+                    .any(|&(nb, _)| mol.atoms[nb].z != 1 && !arom.is_atom_aromatic(nb))
+            })
+            .collect();
+        if arom_atoms.len() == 6 && sub_positions.len() == 1 {
+            bands.push(IrBand::rule(750.0, 0.68, 18.0, "s", "Monosubstituted Benzene C–H OOP bend", arom_atoms.clone()));
+            bands.push(IrBand::rule(695.0, 0.64, 18.0, "s", "Monosubstituted Benzene ring puckering", arom_atoms));
+        } else if arom_atoms.len() == 6 && sub_positions.len() == 2 {
+            // Determine ortho (dist 1), meta (dist 2), or para (dist 3) within the ring
+            let (s0, s1) = (sub_positions[0], sub_positions[1]);
+            let mut dist = vec![usize::MAX; n];
+            let mut q = std::collections::VecDeque::new();
+            dist[s0] = 0;
+            q.push_back(s0);
+            while let Some(u) = q.pop_front() {
+                for &(v, _) in &adj[u] {
+                    if arom.is_atom_aromatic(v) && dist[v] == usize::MAX {
+                        dist[v] = dist[u] + 1;
+                        q.push_back(v);
+                    }
+                }
+            }
+            match dist[s1] {
+                1 => bands.push(IrBand::rule(750.0, 0.66, 20.0, "s", "ortho-Disubstituted Benzene C–H OOP bend", arom_atoms)),
+                2 => {
+                    bands.push(IrBand::rule(780.0, 0.64, 20.0, "s", "meta-Disubstituted Benzene C–H OOP bend", arom_atoms.clone()));
+                    bands.push(IrBand::rule(690.0, 0.58, 18.0, "m", "meta-Disubstituted Benzene ring bend", arom_atoms));
+                }
+                3 => bands.push(IrBand::rule(820.0, 0.68, 20.0, "s", "para-Disubstituted Benzene C–H OOP bend", arom_atoms)),
+                _ => bands.push(IrBand::rule(755.0, 0.62, 24.0, "s", "Aromatic C–H out-of-plane bend", arom_atoms)),
+            }
+        } else {
+            bands.push(IrBand::rule(755.0, 0.62, 24.0, "s", "Aromatic C–H out-of-plane bend", arom_atoms));
+        }
     }
 
     // Deduplicate closely spaced identical assignments and sort high -> low cm^-1
@@ -238,13 +979,16 @@ pub fn predict_ir_spectrum(mol: &ChemMolecule) -> IrPrediction {
             dedup.push(b);
         }
     }
-    let summary: Vec<String> = dedup
-        .iter()
-        .take(8)
-        .map(|b| format!("{:.0} ({})", b.wavenumber_cm1, b.strength))
-        .collect();
-    let report_text = format!("IR (neat, cm⁻¹): νmax {}.", summary.join(", "));
-    IrPrediction { bands: dedup, report_text }
+    let mut pred = IrPrediction {
+        source: IrSpectrumSource::RuleBased,
+        bands: dedup,
+        imaginary_count: 0,
+        default_scale_factor: 1.0,
+        report_text: String::new(),
+        mode_geometry_3d: None,
+    };
+    pred.report_text = pred.format_report(1.0);
+    pred
 }
 
 // ============================================================================
@@ -539,5 +1283,36 @@ mod tests {
 
         let uv = predict_uv_vis(&eth);
         assert!(uv.lambda_max_nm < 220.0);
+    }
+
+    #[test]
+    fn test_expanded_rule_ir_ring_strain_and_hqi_comparison() {
+        // Cyclobutanone: 4-membered ring ketone should shift C=O up to ~1780 cm^-1
+        let mut cb = ChemMolecule::new();
+        for id in 1..=4 {
+            cb.add_atom(ChemAtom::new(id, 6));
+        }
+        cb.add_atom(ChemAtom::new(5, 8));
+        cb.add_bond(10, 0, 1, 1, BondDisplay::Solid);
+        cb.add_bond(11, 1, 2, 1, BondDisplay::Solid);
+        cb.add_bond(12, 2, 3, 1, BondDisplay::Solid);
+        cb.add_bond(13, 3, 0, 1, BondDisplay::Solid);
+        cb.add_bond(14, 0, 4, 2, BondDisplay::Solid);
+
+        let ir = predict_ir_spectrum(&cb);
+        let co = ir.bands.iter().find(|b| b.assignment.contains("C=O")).expect("C=O band");
+        assert!(co.wavenumber_cm1 >= 1770.0, "Cyclobutanone C=O expected >=1770, got {}", co.wavenumber_cm1);
+
+        let params = IrRenderParams::default();
+        let abs_curve = ir.simulate_absorbance(&params, 400);
+        let self_cmp = compare_ir_spectra(&abs_curve, &abs_curve, 400.0, 4000.0);
+        assert!(self_cmp.hqi_pct > 99.9, "Self HQI must be ~100%, got {}", self_cmp.hqi_pct);
+        assert!(self_cmp.pearson_r > 0.999);
+
+        let peaks = pick_ir_peaks(&abs_curve, 0.1, 10);
+        assert!(peaks.iter().any(|p| (p.wavenumber_cm1 - 1780.0).abs() < 25.0));
+
+        let jdx = ir.to_jcamp_dx("Cyclobutanone", &params, 120);
+        assert!(jdx.contains("##DATA TYPE=INFRARED SPECTRUM") && jdx.contains("##XYDATA=(X++(Y..Y))"));
     }
 }
