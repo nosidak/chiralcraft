@@ -90,6 +90,11 @@ pub const BUILTIN_NAMES: &[(&str, &str)] = &[
     ("naphthalene", "c1ccc2ccccc2c1"),
     ("anthracene", "c1ccc2cc3ccccc3cc2c1"),
     ("phenanthrene", "c1ccc2c(c1)ccc1ccccc12"),
+    ("adamantane", "C1C2CC3CC1CC(C2)C3"),
+    ("norbornane", "C1CC2CCC1C2"),
+    ("cubane", "C12C3C4C1C5C2C3C45"),
+    ("decalin", "C1CCC2CCCCC2C1"),
+    ("acetanilide", "CC(=O)Nc1ccccc1"),
     ("pyridine", "c1ccncc1"),
     ("pyrimidine", "c1cncnc1"),
     ("pyrazine", "c1cnccn1"),
@@ -552,7 +557,42 @@ pub fn molecule_to_name(mol: &ChemMolecule, smiles: &str, dict: &NameDictionary)
         .filter(|&i| arom.is_atom_aromatic(i) && mol.atoms[i].z == 16)
         .collect();
 
-    // Fast exact recognition of flagship drugs, solvents, amino acids & parent rings
+    // Fast exact recognition of flagship drugs, solvents, bridged cages, amino acids & parent rings
+    let c_deg3 = (0..mol.atoms.len())
+        .filter(|&i| mol.atoms[i].z == 6 && mol.neighbors(i).iter().filter(|&&(nb, _)| mol.atoms[nb].z != 1).count() == 3)
+        .count();
+    let c_deg2 = (0..mol.atoms.len())
+        .filter(|&i| mol.atoms[i].z == 6 && mol.neighbors(i).iter().filter(|&&(nb, _)| mol.atoms[nb].z != 1).count() == 2)
+        .count();
+    let heavy_bonds = mol
+        .bonds
+        .iter()
+        .filter(|b| b.begin_atom < mol.atoms.len() && b.end_atom < mol.atoms.len() && mol.atoms[b.begin_atom].z != 1 && mol.atoms[b.end_atom].z != 1)
+        .count();
+    if arom_c.is_empty() && arom_n.is_empty() && mol.bonds.iter().all(|b| b.order == 1) {
+        if formula == "C10H16" && heavy_n == 10 && heavy_bonds == 12 && c_deg3 == 4 && c_deg2 == 6 {
+            return "adamantane".to_string();
+        }
+        if formula == "C7H12" && heavy_n == 7 && heavy_bonds == 8 && c_deg3 == 2 && c_deg2 == 5 {
+            return "norbornane (bicyclo[2.2.1]heptane)".to_string();
+        }
+        if formula == "C8H8" && heavy_n == 8 && heavy_bonds == 12 && c_deg3 == 8 {
+            return "cubane".to_string();
+        }
+        if formula == "C8H14" && heavy_n == 8 && heavy_bonds == 9 && c_deg3 == 2 && c_deg2 == 6 {
+            return "bicyclo[2.2.2]octane".to_string();
+        }
+        if formula == "C10H18" && heavy_n == 10 && heavy_bonds == 11 && c_deg3 == 2 && c_deg2 == 8 {
+            return "decahydronaphthalene (decalin)".to_string();
+        }
+        if formula == "C12H24O6" && heavy_n == 18 && heavy_bonds == 18 {
+            return "18-crown-6".to_string();
+        }
+    }
+    if formula == "C20H14N4" && heavy_n == 24 && heavy_bonds == 28 {
+        return "porphine".to_string();
+    }
+
     match (formula.as_str(), arom_c.len(), arom_n.len(), heavy_n) {
         ("C9H8O4", 6, 0, 13) => return "2-acetoxybenzoic acid (aspirin)".to_string(),
         ("C8H10N4O2", 5, 4, 14) => return "1,3,7-trimethyl-3,7-dihydro-1H-purine-2,6-dione (caffeine)".to_string(),
@@ -1436,5 +1476,50 @@ mod tests {
         assert_eq!(molecule_to_name(&cyc, "CC1CCCCC1O", &dict), "2-methylcyclohexanol");
         assert!(!is_fallback_chemical_name("2-methylcyclohexanol"));
         assert!(is_fallback_chemical_name("Compound (C17H19NO3)"));
+    }
+
+    #[test]
+    fn test_bridged_cages_and_macrocycle_naming() {
+        let dict = NameDictionary::with_builtins();
+        // Adamantane (10 C, 12 single bonds, four deg-3 bridgeheads + six deg-2 bridges)
+        let mut adam = ChemMolecule::new();
+        for i in 0..10 {
+            adam.add_atom(ChemAtom::new((i + 1) as u32, 6));
+        }
+        // Bridgeheads: 0, 1, 2, 3; CH2 bridges: 4=(0,1), 5=(0,2), 6=(0,3), 7=(1,2), 8=(1,3), 9=(2,3)
+        let edges = [
+            (0, 4), (4, 1), (0, 5), (5, 2), (0, 6), (6, 3),
+            (1, 7), (7, 2), (1, 8), (8, 3), (2, 9), (9, 3),
+        ];
+        for (idx, &(u, v)) in edges.iter().enumerate() {
+            adam.add_bond((20 + idx) as u32, u, v, 1, BondDisplay::Solid);
+        }
+        assert_eq!(molecule_to_name(&adam, "", &dict), "adamantane");
+
+        // Norbornane (7 C, 8 single bonds, two deg-3 bridgeheads + five deg-2)
+        let mut norb = ChemMolecule::new();
+        for i in 0..7 {
+            norb.add_atom(ChemAtom::new((i + 1) as u32, 6));
+        }
+        let nedges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0), (0, 6), (6, 3)];
+        for (idx, &(u, v)) in nedges.iter().enumerate() {
+            norb.add_bond((40 + idx) as u32, u, v, 1, BondDisplay::Solid);
+        }
+        assert_eq!(molecule_to_name(&norb, "", &dict), "norbornane (bicyclo[2.2.1]heptane)");
+
+        // Cubane (8 C, 12 single bonds, all deg-3)
+        let mut cub = ChemMolecule::new();
+        for i in 0..8 {
+            cub.add_atom(ChemAtom::new((i + 1) as u32, 6));
+        }
+        let cedges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ];
+        for (idx, &(u, v)) in cedges.iter().enumerate() {
+            cub.add_bond((60 + idx) as u32, u, v, 1, BondDisplay::Solid);
+        }
+        assert_eq!(molecule_to_name(&cub, "", &dict), "cubane");
     }
 }

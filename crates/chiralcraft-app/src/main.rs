@@ -18,6 +18,7 @@ mod hotkeys;
 mod icons;
 mod io_bridge;
 mod mcp;
+mod native_dialogs;
 mod omni_suite;
 mod palettes;
 mod pro_panels;
@@ -271,7 +272,7 @@ impl OpenDocTab {
             win_pos: Vec2::new(24.0 + cascade, 18.0 + cascade),
             win_size: Vec2::new(760.0, 620.0),
             scroll: Vec2::ZERO,
-            maximized: false,
+            maximized: true,
             minimized: false,
         }
     }
@@ -940,7 +941,8 @@ impl ChiralCraftApp {
             self.crossing_clearance_pt,
         );
         self.last_copied_svg = Some(svg.clone());
-        let _ = atomic_write_text("/tmp/chiralcraft-copy.svg", &svg);
+        let mirror_path = std::env::temp_dir().join("chiralcraft-copy.svg");
+        let _ = atomic_write_text(&mirror_path.to_string_lossy(), &svg);
         match copy_svg_to_os_clipboard(&svg) {
             Ok(backend) => {
                 self.status_msg = format!(
@@ -951,7 +953,7 @@ impl ChiralCraftApp {
             Err(_) => {
                 ctx.copy_text(svg.clone());
                 self.status_msg = format!(
-                    "Copied Editable SVG XML ({} bytes) to clipboard & /tmp/chiralcraft-copy.svg",
+                    "Copied Editable SVG XML ({} bytes) to clipboard",
                     svg.len()
                 );
             }
@@ -1721,10 +1723,21 @@ impl ChiralCraftApp {
                 self.status_msg = if col_opt.is_some() { "Applied Highlight Color".to_string() } else { "Cleared Highlight Color".to_string() };
             }
             ProPanelAction::ExportStoichiometryCsv(csv) => {
-                let path = "/tmp/chiralcraft-stoichiometry.csv";
-                if fs::write(path, &csv).is_ok() {
-                    ctx.copy_text(csv);
-                    self.status_msg = format!("Exported Stoichiometry CSV to {path} & clipboard");
+                ctx.copy_text(csv.clone());
+                match native_dialogs::save_text_with_dialog(
+                    "Export Stoichiometry CSV",
+                    "chiralcraft-stoichiometry.csv",
+                    &csv,
+                ) {
+                    Ok(Some(path)) => {
+                        self.status_msg = format!("Exported Stoichiometry CSV to {path} & clipboard");
+                    }
+                    Ok(None) => {
+                        self.status_msg = "Copied Stoichiometry CSV to clipboard".to_string();
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("CSV export error: {e} (copied to clipboard)");
+                    }
                 }
             }
         }
@@ -1954,7 +1967,8 @@ impl ChiralCraftApp {
         self.status_msg = format!("Arranged {arranged} intermediates into a catalytic cycle");
     }
 
-    /// Stamps predicted ¹H or ¹³C NMR δ (ppm) shift captions directly beside assigned atoms on canvas.
+    /// Stamps predicted ¹H or ¹³C NMR δ (ppm) shift captions directly beside assigned atoms on canvas,
+    /// placing each badge radially outward from the ring/molecule centroid and resolving collisions.
     fn stamp_nmr_shift_labels(&mut self, carbon13: bool) {
         let Some(mi) = self.active_mol_index() else {
             self.status_msg = "Draw or select a molecule first to stamp NMR shifts".to_string();
@@ -1968,35 +1982,163 @@ impl ChiralCraftApp {
             self.status_msg = format!("No {} NMR peaks to stamp", pred.nucleus);
             return;
         }
+        let nf = mol.atoms.len().max(1) as f64;
+        let mx = mol.atoms.iter().map(|a| a.x).sum::<f64>() / nf;
+        let my = mol.atoms.iter().map(|a| a.y).sum::<f64>() / nf;
+
+        struct PlacedBadge {
+            text: String,
+            cx: f64,
+            cy: f64,
+            w: f64,
+            h: f64,
+            just: LabelJustification,
+        }
+        let mut badges: Vec<PlacedBadge> = Vec::new();
+        let mut seen_atoms = std::collections::HashSet::new();
+        for pk in &pred.peaks {
+            if !seen_atoms.insert(pk.atom_idx) {
+                continue;
+            }
+            let Some(a) = mol.atoms.get(pk.atom_idx) else {
+                continue;
+            };
+            // Compute outward unit vector away from bonded neighbors and molecule centroid
+            let mut vx = 0.0_f64;
+            let mut vy = 0.0_f64;
+            for (nb, _) in mol.neighbors(pk.atom_idx) {
+                if let Some(na) = mol.atoms.get(nb) {
+                    let dx = a.x - na.x;
+                    let dy = a.y - na.y;
+                    let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+                    vx += dx / d;
+                    vy += dy / d;
+                }
+            }
+            // Blend in centroid vector so internal/ring atoms also point outward
+            let cdx = a.x - mx;
+            let cdy = a.y - my;
+            let cd = (cdx * cdx + cdy * cdy).sqrt();
+            if cd > 1e-3 {
+                vx += 0.65 * (cdx / cd);
+                vy += 0.65 * (cdy / cd);
+            }
+            let vlen = (vx * vx + vy * vy).sqrt();
+            let (ux, uy) = if vlen > 1e-3 {
+                (vx / vlen, vy / vlen)
+            } else {
+                (0.7, -0.7)
+            };
+
+            let txt = if carbon13 {
+                format!("δ {:.1}", pk.shift_ppm)
+            } else {
+                format!("δ {:.2} ({})", pk.shift_ppm, pk.multiplicity)
+            };
+            let w = (txt.chars().count() as f64) * 5.2 + 8.0;
+            let h = 12.0;
+            let just = if ux > 0.28 {
+                LabelJustification::Left
+            } else if ux < -0.28 {
+                LabelJustification::Right
+            } else {
+                LabelJustification::Center
+            };
+            let anchor_x = a.x + ux * 16.5;
+            let anchor_y = a.y + uy * 15.0;
+            let cx = match just {
+                LabelJustification::Left => anchor_x + w * 0.5,
+                LabelJustification::Right => anchor_x - w * 0.5,
+                _ => anchor_x,
+            };
+            badges.push(PlacedBadge {
+                text: txt,
+                cx,
+                cy: anchor_y,
+                w,
+                h,
+                just,
+            });
+        }
+
+        // Iteratively push badges clear of molecule atoms and other badges
+        for _ in 0..20 {
+            let mut moved = false;
+            // 1. Repel from all atoms in the molecule so badges never sit on top of rings/bonds
+            for b in &mut badges {
+                for a in &mol.atoms {
+                    let dx = b.cx - a.x;
+                    let dy = b.cy - a.y;
+                    let rx = b.w * 0.5 + 7.5;
+                    let ry = b.h * 0.5 + 7.5;
+                    if dx.abs() < rx && dy.abs() < ry {
+                        let ox = rx - dx.abs();
+                        let oy = ry - dy.abs();
+                        if oy <= ox {
+                            let sgn = if dy >= 0.0 { 1.0 } else { -1.0 };
+                            b.cy += sgn * (oy * 0.65);
+                        } else {
+                            let sgn = if dx >= 0.0 { 1.0 } else { -1.0 };
+                            b.cx += sgn * (ox * 0.65);
+                        }
+                        moved = true;
+                    }
+                }
+            }
+            // 2. Repel badge-vs-badge bounding boxes
+            let n = badges.len();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let dx = badges[j].cx - badges[i].cx;
+                    let dy = badges[j].cy - badges[i].cy;
+                    let rx = 0.5 * (badges[i].w + badges[j].w) + 4.0;
+                    let ry = 0.5 * (badges[i].h + badges[j].h) + 3.0;
+                    if dx.abs() < rx && dy.abs() < ry {
+                        let ox = rx - dx.abs();
+                        let oy = ry - dy.abs();
+                        if oy <= ox * 1.25 {
+                            let sgn = if dy >= 0.0 { 1.0 } else { -1.0 };
+                            let shift = oy * 0.55 + 0.5;
+                            badges[i].cy -= sgn * shift;
+                            badges[j].cy += sgn * shift;
+                        } else {
+                            let sgn = if dx >= 0.0 { 1.0 } else { -1.0 };
+                            let shift = ox * 0.55 + 0.5;
+                            badges[i].cx -= sgn * shift;
+                            badges[j].cx += sgn * shift;
+                        }
+                        moved = true;
+                    }
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+
         let mut stamped = 0usize;
         self.doc_mut().apply_scene_tx("Stamp NMR Shift Labels", |scene, next_id| {
             // Replace any previously stamped δ labels cleanly
             scene.captions.retain(|c| !c.text.starts_with('δ'));
-            let mut seen_atoms = std::collections::HashSet::new();
-            for pk in &pred.peaks {
-                if !seen_atoms.insert(pk.atom_idx) {
-                    continue;
-                }
-                if let Some(a) = mol.atoms.get(pk.atom_idx) {
-                    let cid = *next_id;
-                    *next_id += 1;
-                    let txt = if carbon13 {
-                        format!("δ {:.1}", pk.shift_ppm)
-                    } else {
-                        format!("δ {:.2} ({})", pk.shift_ppm, pk.multiplicity)
-                    };
-                    scene.captions.push(CaptionNode {
-                        id: cid,
-                        text: txt,
-                        x: a.x + 11.0,
-                        y: a.y - 9.0,
-                        element: None,
-                        generic_nickname: None,
-                        warning: None,
-                        justification: LabelJustification::Left,
-                    });
-                    stamped += 1;
-                }
+            for b in &badges {
+                let cid = *next_id;
+                *next_id += 1;
+                let x = match b.just {
+                    LabelJustification::Left => b.cx - b.w * 0.5,
+                    LabelJustification::Right => b.cx + b.w * 0.5,
+                    _ => b.cx,
+                };
+                scene.captions.push(CaptionNode {
+                    id: cid,
+                    text: b.text.clone(),
+                    x,
+                    y: b.cy,
+                    element: None,
+                    generic_nickname: None,
+                    warning: None,
+                    justification: b.just,
+                });
+                stamped += 1;
             }
         });
         self.status_msg = format!("Stamped {stamped} {} NMR δ shift label(s) on canvas", pred.nucleus);
@@ -2271,10 +2413,13 @@ impl ChiralCraftApp {
                 ctx.copy_text(txt);
                 self.status_msg = msg;
             }
-            DockQuantumAction::ExportFile { path, content } => match fs::write(&path, content) {
-                Ok(()) => self.status_msg = format!("Saved {path}"),
-                Err(e) => self.status_msg = format!("Save error: {e}"),
-            },
+            DockQuantumAction::SaveExportFile { title, suggested_name, content } => {
+                match native_dialogs::save_text_with_dialog(title, &suggested_name, &content) {
+                    Ok(Some(path)) => self.status_msg = format!("Saved {path}"),
+                    Ok(None) => self.status_msg = "Save cancelled".into(),
+                    Err(e) => self.status_msg = format!("Save error: {e}"),
+                }
+            }
             DockQuantumAction::StampOptimized3d(m) => {
                 self.doc_mut().stamp_molecule_tx(m, "DFT Optimized 3D Geometry");
                 self.viewer_3d.open = true;
@@ -2372,10 +2517,13 @@ impl ChiralCraftApp {
                 ctx.copy_text(txt);
                 self.status_msg = msg;
             }
-            OmniSuiteAction::ExportFile { path, content } => match fs::write(&path, content) {
-                Ok(()) => self.status_msg = format!("Exported {path}"),
-                Err(e) => self.status_msg = format!("Export error: {e}"),
-            },
+            OmniSuiteAction::SaveExportFile { title, suggested_name, content } => {
+                match native_dialogs::save_text_with_dialog(title, &suggested_name, &content) {
+                    Ok(Some(path)) => self.status_msg = format!("Exported {path}"),
+                    Ok(None) => self.status_msg = "Export cancelled".into(),
+                    Err(e) => self.status_msg = format!("Export error: {e}"),
+                }
+            }
             OmniSuiteAction::StatusMsg(m) => self.status_msg = m,
             OmniSuiteAction::RunQuantumIr(backend) => {
                 self.launch_local_quantum_ir(backend);
@@ -2565,6 +2713,35 @@ impl ChiralCraftApp {
                     self.status_msg = format!("Stamped retrosynthesis: {}", hit.reaction_name);
                 }
             }
+            ProSuiteAction::LoadExampleTarget(name, smi) => {
+                let blen = self.doc().settings.bond_length_pt;
+                match smiles_to_molecule(smi) {
+                    Ok(mut m) => {
+                        clean_up_structure_preserving_stereo(&mut m, &[], blen);
+                        let (x1, y1, x2, y2) = mol_bbox(&m);
+                        let dx = 220.0 - 0.5 * (x1 + x2);
+                        let dy = 175.0 - 0.5 * (y1 + y2);
+                        for a in &mut m.atoms {
+                            a.x += dx;
+                            a.y += dy;
+                        }
+                        self.doc_mut().stamp_molecule_tx(m.clone(), &format!("Load Example: {name}"));
+                        let new_mi = self.doc().scene.molecules.len().saturating_sub(1);
+                        self.tab_mut().selected_mols = vec![new_mi];
+                        self.pro_suite.retro_hits = suggest_disconnections(&m, blen);
+                        self.pro_suite.highlighted_retro_bond =
+                            self.pro_suite.retro_hits.first().map(|h| h.bond_idx);
+                        self.pro_suite.retro_mol_sig.clear();
+                        self.status_msg = format!(
+                            "Loaded example target {name} ({} disconnection(s) found)",
+                            self.pro_suite.retro_hits.len()
+                        );
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("Failed to load example {name}: {e}");
+                    }
+                }
+            }
             ProSuiteAction::InsertTocFrame(preset) => {
                 let mut bbox = (40.0, 40.0, 200.0, 160.0);
                 self.doc_mut().apply_scene_tx("Insert TOC Graphic Frame", |scene, next_id| {
@@ -2601,9 +2778,9 @@ impl ChiralCraftApp {
                 self.status_msg = format!("Wrapped {count} structure(s) into serpentine reaction scheme");
             }
             ProSuiteAction::ExportTextFile { suggested_name, content } => {
-                let out = format!("/tmp/{suggested_name}");
-                match fs::write(&out, content) {
-                    Ok(()) => self.status_msg = format!("Exported {out}"),
+                match native_dialogs::save_text_with_dialog("Export File", &suggested_name, &content) {
+                    Ok(Some(path)) => self.status_msg = format!("Exported {path}"),
+                    Ok(None) => self.status_msg = "Export cancelled".into(),
                     Err(e) => self.status_msg = format!("Export error: {e}"),
                 }
             }
@@ -5265,8 +5442,8 @@ impl ChiralCraftApp {
                             if ui.add_enabled(has_mols, egui::Button::new("3MF (Ball and Stick)")).clicked() {
                                 if let Some(m) = self.active_mol() {
                                     let xml = molecule_to_3mf_xml(m, true);
-                                    let _ = fs::write("/tmp/chiralcraft-ball-stick.3mf.xml", &xml);
-                                    ctx.copy_text(xml);
+                                    ctx.copy_text(xml.clone());
+                                    let _ = fs::write(std::env::temp_dir().join("chiralcraft-ball-stick.3mf.xml"), &xml);
                                     self.status_msg = "Copied 3MF (Ball and Stick) 3D model".to_string();
                                 }
                                 ui.close_menu();
@@ -5274,17 +5451,23 @@ impl ChiralCraftApp {
                             if ui.add_enabled(has_mols, egui::Button::new("3MF (Stick)")).clicked() {
                                 if let Some(m) = self.active_mol() {
                                     let xml = molecule_to_3mf_xml(m, false);
-                                    let _ = fs::write("/tmp/chiralcraft-stick.3mf.xml", &xml);
-                                    ctx.copy_text(xml);
+                                    ctx.copy_text(xml.clone());
+                                    let _ = fs::write(std::env::temp_dir().join("chiralcraft-stick.3mf.xml"), &xml);
                                     self.status_msg = "Copied 3MF (Stick) 3D model".to_string();
                                 }
                                 ui.close_menu();
                             }
-                            if ui.add_enabled(has_mols, egui::Button::new("PNG (Editable)")).clicked() {
+                            if ui.add_enabled(has_mols, egui::Button::new("PNG (Editable)...")).clicked() {
                                 match self.doc().to_editable_png(self.export_opts.png_dpi) {
                                     Ok(bytes) => {
-                                        if fs::write("/tmp/chiralcraft-copy.png", &bytes).is_ok() {
-                                            self.status_msg = format!("Exported editable PNG ({} bytes, {} DPI) to /tmp/chiralcraft-copy.png", bytes.len(), self.export_opts.png_dpi);
+                                        if let Some(chosen) = native_dialogs::pick_save_file("Save Editable PNG", "chiralcraft.png") {
+                                            match fs::write(&chosen, &bytes) {
+                                                Ok(()) => self.status_msg = format!("Exported editable PNG ({} bytes, {} DPI) to {chosen}", bytes.len(), self.export_opts.png_dpi),
+                                                Err(e) => self.status_msg = format!("PNG save failed: {e}"),
+                                            }
+                                        } else {
+                                            self.file_path_buf = "chiralcraft.png".to_string();
+                                            self.dialog = ActiveDialog::SaveAs;
                                         }
                                     }
                                     Err(e) => self.status_msg = format!("PNG export failed: {e}"),
@@ -5764,11 +5947,28 @@ impl ChiralCraftApp {
                             self.viewer_3d.open = true;
                             ui.close_menu();
                         }
-                        ui.menu_button("Medicinal Chemistry & Synthesis", |ui| {
-                            if ui.button("MedChem, ADMET & PAINS Scorecard...").clicked() {
-                                self.pro_suite.show_medchem = true;
-                                ui.close_menu();
+                        if ui.button("Retrosynthetic Disconnection Advisor...").clicked() {
+                            self.pro_suite.show_retro = true;
+                            if let Some(m) = self.active_mol().cloned() {
+                                let blen = self.doc().settings.bond_length_pt;
+                                self.pro_suite.retro_hits = suggest_disconnections(&m, blen);
+                                self.pro_suite.highlighted_retro_bond = self.pro_suite.retro_hits.first().map(|h| h.bond_idx);
                             }
+                            ui.close_menu();
+                        }
+                        if ui.button("Multi-Spectroscopy Studio (FT-IR / UV–Vis / 2D NMR)...").clicked() {
+                            self.omni_suite.show_spectroscopy = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("MedChem, ADMET & PAINS Scorecard...").clicked() {
+                            self.pro_suite.show_medchem = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Quantum Chemistry Bridge (ORCA / Gaussian / xTB)...").clicked() {
+                            self.quantum.show_window = true;
+                            ui.close_menu();
+                        }
+                        ui.menu_button("Advanced Chemistry Studios", |ui| {
                             if ui.button("HRMS Isotope Envelope & Adducts...").clicked() {
                                 self.pro_suite.show_hrms = true;
                                 ui.close_menu();
@@ -5781,20 +5981,7 @@ impl ChiralCraftApp {
                                 self.pro_suite.show_markush = true;
                                 ui.close_menu();
                             }
-                            if ui.button("Retrosynthetic Disconnection Advisor...").clicked() {
-                                self.pro_suite.show_retro = true;
-                                if let Some(m) = self.active_mol().cloned() {
-                                    let blen = self.doc().settings.bond_length_pt;
-                                    self.pro_suite.retro_hits = suggest_disconnections(&m, blen);
-                                    self.pro_suite.highlighted_retro_bond = self.pro_suite.retro_hits.first().map(|h| h.bond_idx);
-                                }
-                                ui.close_menu();
-                            }
                             ui.separator();
-                            if ui.button("Multi-Spectroscopy Studio (FT-IR / UV–Vis / 2D NMR)...").clicked() {
-                                self.omni_suite.show_spectroscopy = true;
-                                ui.close_menu();
-                            }
                             if ui.button("Organometallic 18e⁻ & Polymer / BigSMILES Studio...").clicked() {
                                 self.omni_suite.show_ino_poly = true;
                                 ui.close_menu();
@@ -5809,10 +5996,6 @@ impl ChiralCraftApp {
                             }
                             if ui.add_enabled(has_mols, egui::Button::new("Optimize 3D Geometry (UFF)")).clicked() {
                                 self.execute_palette_command(ctx, PaletteCommandAction::Optimize3dNow);
-                                ui.close_menu();
-                            }
-                            if ui.button("Quantum Chemistry Bridge (ORCA / Gaussian / xTB)...").clicked() {
-                                self.quantum.show_window = true;
                                 ui.close_menu();
                             }
                         });
@@ -5895,12 +6078,23 @@ impl ChiralCraftApp {
                                     properties: BTreeMap::new(),
                                 })
                                 .collect();
-                            let out = "/tmp/chiralcraft-expanded-generic.sdf";
-                            if fs::write(out, molecules_to_sdf(&recs)).is_ok() {
-                                self.status_msg = format!("Exported {} expanded structure(s) to {out}", recs.len());
+                            let sdf = molecules_to_sdf(&recs);
+                            match native_dialogs::save_text_with_dialog(
+                                "Export Expanded Generic Structures (SDF)",
+                                "expanded_generic.sdf",
+                                &sdf,
+                            ) {
+                                Ok(Some(out)) => {
+                                    self.status_msg = format!("Exported {} expanded structure(s) to {out}", recs.len());
+                                }
+                                Ok(None) => {
+                                    self.file_path_buf = "expanded_generic.sdf".to_string();
+                                    self.dialog = ActiveDialog::SaveAs;
+                                }
+                                Err(e) => {
+                                    self.status_msg = format!("SDF export failed: {e}");
+                                }
                             }
-                            self.file_path_buf = "expanded_generic.sdf".to_string();
-                            self.dialog = ActiveDialog::SaveAs;
                             ui.close_menu();
                         }
                         if ui.button("Toggle Aromatic Display\tAlt+K").clicked() {
@@ -6321,9 +6515,14 @@ impl ChiralCraftApp {
                             ui.close_menu();
                         }
                         if ui.button("Diagnostics Info").clicked() {
+                            let crash_log = std::env::temp_dir().join("chiralcraft-crash.log");
                             self.dialog = ActiveDialog::HelpTopic {
                                 title: "Diagnostics Info".to_string(),
-                                body: "ChiralCraft 1.0 — Pure-Rust Chemical Structure Editor\nDiagnostics crash log: /tmp/chiralcraft-crash.log".to_string(),
+                                body: format!(
+                                    "ChiralCraft {} — Pure-Rust Chemical Structure Editor\nDiagnostics crash log: {}",
+                                    env!("CARGO_PKG_VERSION"),
+                                    crash_log.display()
+                                ),
                             };
                             ui.close_menu();
                         }
@@ -6662,6 +6861,53 @@ impl ChiralCraftApp {
                     });
                 });
             });
+
+        // ---- 4b. Unified Right-Side Tabbed Studio Dock (MUST run before CentralPanel so canvas & floating windows never overlap it!) ----
+        if self.show_right_dock && self.dock_tab == DockTab::Quantum {
+            self.qc_runner.ensure_detected(
+                &self.user_config.xtb_path,
+                &self.user_config.orca_path,
+                &self.user_config.gaussian_path,
+            );
+        }
+        if self.show_right_dock {
+            let active_mol_for_dock = self.active_mol().cloned();
+            let live_nm_owned = active_mol_for_dock.as_ref().map(|m| self.compute_live_name(m).0);
+            let mut dock_open = self.show_right_dock;
+            let mut dock_tab = self.dock_tab;
+            let mut rear_op = self.rear_opacity;
+            let mut cross_gap = self.crossing_clearance_pt;
+            let mut exp_opts = self.export_opts;
+            let dock_act = {
+                let doc = &mut self.tabs[self.active_tab].doc;
+                show_right_studio_dock(
+                    ctx,
+                    &mut dock_open,
+                    &mut dock_tab,
+                    active_mol_for_dock.as_ref(),
+                    live_nm_owned.as_deref(),
+                    &mut self.quantum,
+                    &mut self.user_config,
+                    &self.qc_runner.binaries,
+                    self.omni_suite.ir_quantum_pred.as_ref(),
+                    &mut doc.scene.tables,
+                    &mut doc.scene.tlc_plates,
+                    &mut rear_op,
+                    &mut cross_gap,
+                    &mut exp_opts,
+                )
+            };
+            let dock_toggled = dock_open != self.show_right_dock;
+            self.show_right_dock = dock_open;
+            self.dock_tab = dock_tab;
+            self.rear_opacity = rear_op;
+            self.crossing_clearance_pt = cross_gap;
+            self.export_opts = exp_opts;
+            if dock_toggled {
+                self.persist_user_config();
+            }
+            self.handle_dock_quantum_action(ctx, dock_act);
+        }
 
         // ---- 5. Central MDI Desk + Moveable/Resizeable Document Windows ----
         let desk_bg = match self.ui_theme {
@@ -8875,7 +9121,7 @@ impl ChiralCraftApp {
             self.handle_omni_suite_action(ctx, oa);
         }
 
-        // ---- 6f. Unified Right-Side Tabbed Studio Dock + Quantum Chemistry Floating Window ----
+        // ---- 6f. Quantum Chemistry Floating Window ----
         let q_win_act = show_quantum_window(
             ctx,
             &mut self.quantum,
@@ -8884,43 +9130,6 @@ impl ChiralCraftApp {
             &self.qc_runner.binaries,
         );
         self.handle_dock_quantum_action(ctx, q_win_act);
-        if self.show_right_dock {
-            let mut dock_open = self.show_right_dock;
-            let mut dock_tab = self.dock_tab;
-            let mut rear_op = self.rear_opacity;
-            let mut cross_gap = self.crossing_clearance_pt;
-            let mut exp_opts = self.export_opts;
-            let live_nm_opt = active_mol_clone.as_ref().map(|_| active_name_str.as_str());
-            let dock_act = {
-                let doc = &mut self.tabs[self.active_tab].doc;
-                show_right_studio_dock(
-                    ctx,
-                    &mut dock_open,
-                    &mut dock_tab,
-                    active_mol_clone.as_ref(),
-                    live_nm_opt,
-                    &mut self.quantum,
-                    &mut self.user_config,
-                    &self.qc_runner.binaries,
-                    self.omni_suite.ir_quantum_pred.as_ref(),
-                    &mut doc.scene.tables,
-                    &mut doc.scene.tlc_plates,
-                    &mut rear_op,
-                    &mut cross_gap,
-                    &mut exp_opts,
-                )
-            };
-            let dock_toggled = dock_open != self.show_right_dock;
-            self.show_right_dock = dock_open;
-            self.dock_tab = dock_tab;
-            self.rear_opacity = rear_op;
-            self.crossing_clearance_pt = cross_gap;
-            self.export_opts = exp_opts;
-            if dock_toggled {
-                self.persist_user_config();
-            }
-            self.handle_dock_quantum_action(ctx, dock_act);
-        }
 
         // ---- 6c. Live PubChem / ChEMBL Chemical Database Search Window ----
         self.chem_db_state.poll();
@@ -9195,6 +9404,18 @@ impl ChiralCraftApp {
                     ui.label("File path (.cdxml, .cdx, .mol, .sdf, .smi, .xyz, .cif, .pdb, POSCAR, .jdx, .out/.log, .svg, .png, .pdf):");
                     ui.text_edit_singleline(&mut self.file_path_buf);
                     ui.horizontal(|ui| {
+                        if ui.button("Browse OS...").clicked() {
+                            if let Some(p) = native_dialogs::pick_open_file(
+                                "Open Chemical Document",
+                                &["cdxml", "cdx", "mol", "sdf", "rxn", "smi", "xyz", "cif", "pdb", "jdx", "out", "log", "molden", "svg", "png", "pdf"],
+                            ) {
+                                self.file_path_buf = p.clone();
+                                self.open_path_into_new_tab(&p);
+                                if !self.status_msg.starts_with("Open failed") && !self.status_msg.starts_with("JCAMP-DX open error") {
+                                    self.dialog = ActiveDialog::None;
+                                }
+                            }
+                        }
                         if ui.button("Open").clicked() {
                             let path = self.file_path_buf.trim().to_string();
                             if !path.is_empty() {
@@ -9267,6 +9488,14 @@ impl ChiralCraftApp {
                     ui.label("File path (.cdxml, .cdx, .mol, .sdf, .rxn, .ct, .cml, .tgf, .skc):");
                     ui.text_edit_singleline(&mut self.file_path_buf);
                     ui.horizontal(|ui| {
+                        if ui.button("Browse OS...").clicked() {
+                            if let Some(p) = native_dialogs::pick_open_file(
+                                "Insert Chemical File",
+                                &["cdxml", "cdx", "mol", "sdf", "rxn", "ct", "cml", "tgf", "skc", "smi"],
+                            ) {
+                                self.file_path_buf = p;
+                            }
+                        }
                         if ui.button("Insert").clicked() {
                             match load_document_any(&self.file_path_buf) {
                                 Ok(d) => {
@@ -9385,6 +9614,16 @@ impl ChiralCraftApp {
                         }
                     });
                     ui.horizontal(|ui| {
+                        if ui.button("Browse OS...").clicked() {
+                            let suggested = if self.file_path_buf.trim().is_empty() {
+                                "untitled.cdxml"
+                            } else {
+                                self.file_path_buf.trim()
+                            };
+                            if let Some(p) = native_dialogs::pick_save_file("Save Chemical Document As", suggested) {
+                                self.file_path_buf = p;
+                            }
+                        }
                         if ui.button("Save").clicked() {
                             let dark_ink = self.ui_theme == UiTheme::DarkSlide;
                             match save_document_any_with_opts(self.doc(), &self.file_path_buf, self.export_opts, dark_ink) {
@@ -9923,7 +10162,8 @@ fn main() -> eframe::Result<()> {
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("ChiralCraft panic: {info}\n{bt}\n");
-        let _ = fs::write("/tmp/chiralcraft-crash.log", &msg);
+        let crash_path = std::env::temp_dir().join("chiralcraft-crash.log");
+        let _ = fs::write(&crash_path, &msg);
         eprintln!("{msg}");
     }));
     let args: Vec<String> = env::args().collect();
@@ -11361,5 +11601,46 @@ mod tests {
         app.zoom = 2.0;
         let hi_z_tol = app.atom_hit_tol();
         assert!(low_z_tol > hi_z_tol * 2.0, "Low zoom must expand doc-space hit radius ({low_z_tol} vs {hi_z_tol})");
+    }
+
+    #[test]
+    fn test_retrosynthesis_example_loader_and_non_overlapping_nmr_labels() {
+        // 1. Default new document starts maximized (clean full-bleed white canvas)
+        let mut app = ChiralCraftApp::new();
+        assert!(app.tab().maximized, "New document tabs must start maximized");
+
+        // 2. Retrosynthesis 1-click example loader stamps target & auto-populates disconnections
+        app.handle_pro_suite_action(ProSuiteAction::LoadExampleTarget("Acetanilide", "CC(=O)Nc1ccccc1"));
+        assert_eq!(app.doc().scene.molecules.len(), 1);
+        assert!(!app.pro_suite.retro_hits.is_empty(), "Acetanilide must yield amide disconnection");
+        assert!(app.pro_suite.highlighted_retro_bond.is_some());
+
+        // 3. Stamped 1H-NMR δ badges on Aspirin must be non-overlapping and clear of atoms
+        app.handle_pro_suite_action(ProSuiteAction::LoadExampleTarget("Aspirin", "CC(=O)Oc1ccccc1C(=O)O"));
+        app.stamp_nmr_shift_labels(false);
+        let badges: Vec<&CaptionNode> = app
+            .doc()
+            .scene
+            .captions
+            .iter()
+            .filter(|c| c.text.starts_with('δ'))
+            .collect();
+        assert!(badges.len() >= 4, "Aspirin must stamp multiple 1H-NMR δ labels");
+        for i in 0..badges.len() {
+            for j in (i + 1)..badges.len() {
+                let dy = (badges[i].y - badges[j].y).abs();
+                let dx = (badges[i].x - badges[j].x).abs();
+                assert!(
+                    dy > 9.0 || dx > 28.0,
+                    "NMR badges '{}' and '{}' overlapped at ({:.1},{:.1}) vs ({:.1},{:.1})",
+                    badges[i].text,
+                    badges[j].text,
+                    badges[i].x,
+                    badges[i].y,
+                    badges[j].x,
+                    badges[j].y
+                );
+            }
+        }
     }
 }

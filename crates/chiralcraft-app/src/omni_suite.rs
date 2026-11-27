@@ -179,7 +179,11 @@ pub enum OmniSuiteAction {
     StampEnergyProfile(EnergyProfile),
     PasteCaption(String),
     CopyText(String, String),
-    ExportFile { path: String, content: String },
+    SaveExportFile {
+        title: &'static str,
+        suggested_name: String,
+        content: String,
+    },
     StatusMsg(String),
     RunQuantumIr(QcRunBackend),
     CancelQuantumIr,
@@ -318,8 +322,9 @@ pub fn show_spectroscopy_window(
 
     egui::Window::new("Multi-Spectroscopy Studio (FT-IR / UV-Vis / 2D NMR)")
         .open(&mut open)
-        .default_pos([285.0, 62.0])
-        .default_width(640.0)
+        .default_pos([265.0, 62.0])
+        .default_width(635.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -409,10 +414,19 @@ pub fn show_spectroscopy_window(
                         ui.small("QC Output:");
                         ui.add(
                             egui::TextEdit::singleline(&mut state.ir_quantum_path)
-                                .desired_width(250.0)
-                                .hint_text("path/to/job.out | .log | g98.out | vibspectrum | .molden"),
+                                .desired_width(210.0)
+                                .hint_text("job.out | .log | g98.out | vibspectrum | .molden"),
                         );
-                        if ui.small_button("Import QC IR").clicked() && !state.ir_quantum_path.trim().is_empty() {
+                        if ui.small_button("Browse...").clicked() {
+                            if let Some(p) = crate::native_dialogs::pick_open_file(
+                                "Import Quantum Vibrational Output",
+                                &["out", "log", "molden", "input", "txt"],
+                            ) {
+                                state.ir_quantum_path = p.clone();
+                                act = OmniSuiteAction::ImportQuantumIrFile(p);
+                            }
+                        }
+                        if ui.small_button("Import").clicked() && !state.ir_quantum_path.trim().is_empty() {
                             act = OmniSuiteAction::ImportQuantumIrFile(state.ir_quantum_path.trim().to_string());
                         }
                         if qc_runner.binaries.orca_path.is_some() && !qc_runner.running {
@@ -727,9 +741,18 @@ pub fn show_spectroscopy_window(
                         ui.small("Exp IR (.jdx/.csv/.dpt):");
                         ui.add(
                             egui::TextEdit::singleline(&mut state.ir_exp_path)
-                                .desired_width(185.0)
-                                .hint_text("path/to/experimental.jdx or .csv"),
+                                .desired_width(155.0)
+                                .hint_text("experimental.jdx or .csv"),
                         );
+                        if ui.small_button("Browse...").clicked() {
+                            if let Some(p) = crate::native_dialogs::pick_open_file(
+                                "Open Experimental IR Spectrum",
+                                &["jdx", "dx", "csv", "dpt", "txt"],
+                            ) {
+                                state.ir_exp_path = p.clone();
+                                act = OmniSuiteAction::LoadExpIrFile(p);
+                            }
+                        }
                         if ui.small_button("Overlay").clicked() && !state.ir_exp_path.trim().is_empty() {
                             act = OmniSuiteAction::LoadExpIrFile(state.ir_exp_path.trim().to_string());
                         }
@@ -840,27 +863,30 @@ pub fn show_spectroscopy_window(
                         if ui.button("Paste IR Line on Canvas").clicked() {
                             act = OmniSuiteAction::PasteCaption(active_ir.format_report(state.ir_render.scale_factor));
                         }
-                        if ui.button("Export SVG").clicked() {
+                        if ui.button("Export SVG...").clicked() {
                             let svg = render_ir_spectrum_svg(
                                 &active_ir,
                                 &state.ir_render,
                                 state.ir_exp_overlay.as_ref(),
                                 active_name,
                             );
-                            act = OmniSuiteAction::ExportFile {
-                                path: "/tmp/chiralcraft-ftir.svg".to_string(),
+                            act = OmniSuiteAction::SaveExportFile {
+                                title: "Export FT-IR Spectrum SVG",
+                                suggested_name: "chiralcraft-ftir.svg".to_string(),
                                 content: svg,
                             };
                         }
-                        if ui.button("Export .jdx").clicked() {
-                            act = OmniSuiteAction::ExportFile {
-                                path: "/tmp/chiralcraft-ftir.jdx".to_string(),
+                        if ui.button("Export .jdx...").clicked() {
+                            act = OmniSuiteAction::SaveExportFile {
+                                title: "Export FT-IR JCAMP-DX",
+                                suggested_name: "chiralcraft-ftir.jdx".to_string(),
                                 content: active_ir.to_jcamp_dx(active_name, &state.ir_render, 480),
                             };
                         }
-                        if ui.button("Export .csv").clicked() {
-                            act = OmniSuiteAction::ExportFile {
-                                path: "/tmp/chiralcraft-ftir.csv".to_string(),
+                        if ui.button("Export .csv...").clicked() {
+                            act = OmniSuiteAction::SaveExportFile {
+                                title: "Export FT-IR CSV",
+                                suggested_name: "chiralcraft-ftir.csv".to_string(),
                                 content: active_ir.to_csv(&state.ir_render, 480),
                             };
                         }
@@ -983,8 +1009,9 @@ pub fn show_ino_poly_window(
 
     egui::Window::new("Organometallic 18e- & Polymer / BigSMILES Studio")
         .open(&mut open)
-        .default_pos([300.0, 110.0])
+        .default_pos([260.0, 90.0])
         .default_width(480.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1104,8 +1131,9 @@ pub fn show_energy_profile_window(
 
     egui::Window::new("Reaction Energy Profile (ΔG‡) & Kinetics Builder")
         .open(&mut open)
-        .default_pos([260.0, 110.0])
+        .default_pos([240.0, 90.0])
         .default_width(500.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1211,8 +1239,9 @@ pub fn show_eln_safety_window(
 
     egui::Window::new("ELN Supporting Info & Lab Safety / GHS Handbook")
         .open(&mut open)
-        .default_pos([210.0, 90.0])
+        .default_pos([190.0, 80.0])
         .default_width(600.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             egui::CollapsingHeader::new("Solvent & Reagent Safety Handbook + Liquid Volume (mL) Calculator")
@@ -1311,8 +1340,9 @@ pub fn show_latex_export_window(
 
     egui::Window::new("LaTeX (\\chemfig) & TikZ Code Exporter")
         .open(&mut open)
-        .default_pos([320.0, 120.0])
+        .default_pos([260.0, 95.0])
         .default_width(520.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1332,9 +1362,10 @@ pub fn show_latex_export_window(
                 if ui.button("Copy LaTeX Code").clicked() {
                     act = OmniSuiteAction::CopyText(code.clone(), "Copied LaTeX code to clipboard".into());
                 }
-                if ui.button("Save to /tmp/chiralcraft-export.tex").clicked() {
-                    act = OmniSuiteAction::ExportFile {
-                        path: "/tmp/chiralcraft-export.tex".into(),
+                if ui.button("Save .tex...").clicked() {
+                    act = OmniSuiteAction::SaveExportFile {
+                        title: "Save LaTeX / TikZ Export",
+                        suggested_name: "chiralcraft-export.tex".into(),
                         content: code,
                     };
                 }
@@ -1358,14 +1389,28 @@ pub fn show_screening_window(
 
     egui::Window::new("Multi-Compound SDF / SMILES Virtual Screening Browser")
         .open(&mut open)
-        .default_pos([180.0, 85.0])
+        .default_pos([160.0, 80.0])
         .default_width(680.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("File (.sdf/.smi/.csv):");
-                ui.add(egui::TextEdit::singleline(&mut state.screening_path).desired_width(240.0));
-                if ui.button("Load File").clicked() && !state.screening_path.trim().is_empty() {
+                ui.add(egui::TextEdit::singleline(&mut state.screening_path).desired_width(195.0));
+                let mut do_load = false;
+                if ui.small_button("Browse...").clicked() {
+                    if let Some(p) = crate::native_dialogs::pick_open_file(
+                        "Open Virtual Screening Library",
+                        &["sdf", "smi", "csv", "txt"],
+                    ) {
+                        state.screening_path = p;
+                        do_load = true;
+                    }
+                }
+                if ui.button("Load File").clicked() {
+                    do_load = true;
+                }
+                if do_load && !state.screening_path.trim().is_empty() {
                     match load_screening_library(state.screening_path.trim(), bond_len) {
                         Ok(recs) => {
                             let cnt = recs.len();
@@ -1429,9 +1474,10 @@ pub fn show_screening_window(
                 });
             });
             ui.separator();
-            if ui.add_enabled(!filtered.is_empty(), egui::Button::new("Export Filtered Hits to /tmp/chiralcraft-hits.sdf")).clicked() {
-                act = OmniSuiteAction::ExportFile {
-                    path: "/tmp/chiralcraft-hits.sdf".into(),
+            if ui.add_enabled(!filtered.is_empty(), egui::Button::new("Export Filtered Hits (.sdf)...")).clicked() {
+                act = OmniSuiteAction::SaveExportFile {
+                    title: "Export Filtered Screening Hits",
+                    suggested_name: "chiralcraft-hits.sdf".into(),
                     content: export_screening_sdf(&filtered),
                 };
             }

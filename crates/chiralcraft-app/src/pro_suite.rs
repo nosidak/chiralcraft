@@ -61,6 +61,7 @@ pub struct ProSuiteState {
     // 5. Retrosynthesis Advisor
     pub show_retro: bool,
     pub retro_hits: Vec<RetrosyntheticHit>,
+    pub retro_mol_sig: String,
     pub highlighted_retro_bond: Option<usize>,
 
     // 6. Publication TOC & Scheme Composer
@@ -102,6 +103,7 @@ impl Default for ProSuiteState {
 
             show_retro: false,
             retro_hits: Vec::new(),
+            retro_mol_sig: String::new(),
             highlighted_retro_bond: None,
 
             show_pub_composer: false,
@@ -122,6 +124,7 @@ pub enum ProSuiteAction {
     StampMolecule(ChemMolecule, &'static str),
     StampMoleculeGrid(Vec<(String, ChemMolecule)>, &'static str),
     StampRetrosynthesis(RetrosyntheticHit),
+    LoadExampleTarget(&'static str, &'static str),
     InsertTocFrame(TocPreset),
     StampArrowConditions { above: String, below: String },
     WrapSerpentine(usize),
@@ -142,8 +145,9 @@ pub fn show_medchem_window(
     let mut open = state.show_medchem;
     egui::Window::new("Medicinal Chemistry, ADMET & PAINS Scorecard")
         .open(&mut open)
-        .default_pos([840.0, 70.0])
+        .default_pos([420.0, 72.0])
         .default_width(375.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             let Some(mol) = active_mol.filter(|m| !m.atoms.is_empty()) else {
@@ -234,8 +238,9 @@ pub fn show_isomers_window(
 
     egui::Window::new("pH Microspecies, Tautomers, Stereoisomers & Resonance")
         .open(&mut open)
-        .default_pos([280.0, 95.0])
+        .default_pos([260.0, 88.0])
         .default_width(470.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -393,8 +398,9 @@ pub fn show_hrms_window(
     let mut open = state.show_hrms;
     egui::Window::new("HRMS Isotope Envelope & Adduct Simulator")
         .open(&mut open)
-        .default_pos([340.0, 120.0])
+        .default_pos([260.0, 95.0])
         .default_width(540.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             let Some(mol) = active_mol.filter(|m| !m.atoms.is_empty()) else {
@@ -493,8 +499,9 @@ pub fn show_markush_window(
 
     egui::Window::new("Markush R-Group Library Enumerator & SAR Grid")
         .open(&mut open)
-        .default_pos([200.0, 100.0])
+        .default_pos([180.0, 88.0])
         .default_width(620.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.small("Label atoms on your scaffold as R1 (or R) and R2 — or enumerate directly on any drawn core:");
@@ -592,25 +599,73 @@ pub fn show_retrosynthesis_window(
     let mut act = ProSuiteAction::None;
     let mut open = state.show_retro;
 
+    // Auto-analyze active molecule whenever it changes so the panel never opens blank!
+    let cur_sig = active_mol
+        .filter(|m| !m.atoms.is_empty())
+        .map(|m| {
+            let mut h = 14695981039346656037u64;
+            for a in &m.atoms {
+                h ^= (a.z as u64).wrapping_mul(31);
+                h = h.wrapping_mul(1099511628211);
+            }
+            for b in &m.bonds {
+                h ^= ((b.begin_atom as u64) << 16) ^ ((b.end_atom as u64) << 4) ^ (b.order as u64);
+                h = h.wrapping_mul(1099511628211);
+            }
+            format!("{}:{}:{h:016x}", m.atoms.len(), m.bonds.len())
+        })
+        .unwrap_or_default();
+    if cur_sig != state.retro_mol_sig {
+        state.retro_mol_sig = cur_sig;
+        if let Some(m) = active_mol.filter(|m| !m.atoms.is_empty()) {
+            state.retro_hits = suggest_disconnections(m, bond_len);
+            state.highlighted_retro_bond = state.retro_hits.first().map(|h| h.bond_idx);
+        } else {
+            state.retro_hits.clear();
+            state.highlighted_retro_bond = None;
+        }
+    }
+
     egui::Window::new("Retrosynthetic Disconnection Advisor")
         .open(&mut open)
-        .default_pos([240.0, 140.0])
-        .default_width(530.0)
+        .default_pos([340.0, 90.0])
+        .default_width(500.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Analyze Target Structure").clicked() {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Re-Analyze Target").clicked() {
                     if let Some(m) = active_mol.filter(|m| !m.atoms.is_empty()) {
                         state.retro_hits = suggest_disconnections(m, bond_len);
                         state.highlighted_retro_bond = state.retro_hits.first().map(|h| h.bond_idx);
                     }
                 }
-                ui.weak("Click a disconnection to highlight the strategic bond on canvas.");
+                ui.separator();
+                ui.small("Try example:");
+                for (name, smi) in [
+                    ("Acetanilide", "CC(=O)Nc1ccccc1"),
+                    ("Aspirin", "CC(=O)Oc1ccccc1C(=O)O"),
+                    ("Biphenyl", "c1ccc(-c2ccccc2)cc1"),
+                    ("Sulfanilamide", "Nc1ccc(S(=O)(=O)N)cc1"),
+                ] {
+                    if ui.small_button(name).clicked() {
+                        act = ProSuiteAction::LoadExampleTarget(name, smi);
+                    }
+                }
             });
+            ui.small(
+                "Detects 9 strategic disconnections: Amide, Ester, Sulfonamide, Suzuki biaryl, Buchwald–Hartwig C–N, Williamson ether, Reductive amination, Friedel–Crafts, and Wittig.",
+            );
             ui.separator();
-            if state.retro_hits.is_empty() {
-                ui.weak("No acyclic strategic disconnections analyzed yet (click Analyze Target Structure).");
+            if active_mol.map(|m| m.atoms.is_empty()).unwrap_or(true) {
+                ui.weak("Draw a target structure on canvas or click an example above — disconnections update automatically.");
+            } else if state.retro_hits.is_empty() {
+                ui.weak("No acyclic strategic disconnections found in the current target (try an amide, ester, biaryl, ether, sulfonamide, or click an example above).");
             } else {
+                ui.small(format!(
+                    "Found {} strategic disconnection(s). Click one to highlight the bond on canvas:",
+                    state.retro_hits.len()
+                ));
                 egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
                     for hit in &state.retro_hits {
                         let is_hl = state.highlighted_retro_bond == Some(hit.bond_idx);
@@ -620,7 +675,7 @@ pub fn show_retrosynthesis_window(
                                     state.highlighted_retro_bond = Some(hit.bond_idx);
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("Stamp Retrosynthesis (=>)").clicked() {
+                                    if ui.small_button("Stamp Scheme (=>)").clicked() {
                                         act = ProSuiteAction::StampRetrosynthesis(hit.clone());
                                     }
                                     ui.label(RichText::new(format!("Score {}", hit.score)).small().weak());
@@ -652,8 +707,9 @@ pub fn show_publication_composer_window(
 
     egui::Window::new("Publication TOC & Scheme Composer")
         .open(&mut open)
-        .default_pos([780.0, 260.0])
+        .default_pos([400.0, 110.0])
         .default_width(390.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.strong("Journal TOC Graphic Frame");

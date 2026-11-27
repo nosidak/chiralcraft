@@ -2,6 +2,17 @@
 
 All notable changes to **ChiralCraft** are documented in this file.
 
+## [1.1.1] - 2026-11-27
+
+### Added
+- **Cross-Platform Native OS File Dialogs**: Zero-dependency native Open/Save dialogs (`zenity`/`kdialog` on Linux/FreeBSD, `osascript` on macOS, PowerShell `System.Windows.Forms` on Windows) across Open, Insert File, Save As, Quantum Deck export/import, FT-IR SVG/`.jdx`/`.csv`/QC/experimental overlays, LaTeX `.tex`, Virtual Screening `.sdf`, Stoichiometry `.csv`, and JCAMP-DX NMR overlays — removing all hardcoded `/tmp/chiralcraft-*` UI export buttons/paths.
+- **Retrosynthesis Discoverability & Starter Examples**: Promoted Retrosynthesis, Multi-Spectroscopy, MedChem Scorecard, and Quantum Chemistry to top-level `Structure` menu entries; kept Quick Studio buttons visible in the Right Studio Dock `Props` tab even on a blank canvas; added automatic disconnection analysis on open/edit and 1-click starter targets (`Acetanilide`, `Aspirin`, `Biphenyl`, `Sulfanilamide`), plus a Quick Start guide and step-by-step Retrosynthesis documentation in `README.md` and `docs/FEATURES.md`.
+
+### Fixed
+- **Window & Studio Dock Layout Polish**: Rendered the Right Studio Dock before `CentralPanel` and constrained all floating studio windows (`3D Viewer`, `Multi-Spectroscopy`, `Retrosynthesis`, `Quantum`, `MedChem`, `HRMS`, `Markush`, `Isomers`, `Organometallic`, `Energy Profile`, `ELN/GHS`, `LaTeX`, `Screening`, `Object Inspector`, `Compare Documents`) to the workspace area so floating windows never overlap the right dock; new document tabs now start maximized with a clean full-bleed canvas.
+- **Non-Overlapping On-Canvas NMR `δ` Badges & Retrosynthesis Schemes**: Replaced fixed-offset NMR shift labels with outward radial placement and 2D atom/badge collision repulsion, and sized retrosynthesis `⇒` arrows dynamically to fit reaction titles without overlapping synthons.
+- **Bridged-Cage & Macrocycle IUPAC Naming**: Added exact graph-topology recognition for `adamantane`, `norbornane`, `cubane`, `bicyclo[2.2.2]octane`, `decahydronaphthalene (decalin)`, `18-crown-6`, and `porphine`.
+
 ## [1.1.0] - 2026-11-27
 
 ### Added

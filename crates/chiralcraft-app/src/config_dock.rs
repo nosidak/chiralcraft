@@ -254,7 +254,11 @@ fn quantum_preview_cache_key(mol: &ChemMolecule, spec: &QuantumJobSpec) -> Strin
 pub enum DockQuantumAction {
     None,
     CopyText(String, String),
-    ExportFile { path: String, content: String },
+    SaveExportFile {
+        title: &'static str,
+        suggested_name: String,
+        content: String,
+    },
     StampOptimized3d(ChemMolecule),
     PlotQuantumIr(IrPrediction),
     RunLocalQc(QcRunBackend),
@@ -345,9 +349,10 @@ pub fn render_quantum_panel_contents(
             QuantumProgram::Gaussian => "gjf",
             QuantumProgram::Xtb => "xyz",
         };
-        if ui.small_button(format!("Save /tmp/chiralcraft.{ext}")).clicked() {
-            act = DockQuantumAction::ExportFile {
-                path: format!("/tmp/chiralcraft.{ext}"),
+        if ui.small_button(format!("Save .{ext}...")).clicked() {
+            act = DockQuantumAction::SaveExportFile {
+                title: "Save Quantum Input Deck",
+                suggested_name: format!("chiralcraft-job.{ext}"),
                 content: preview,
             };
         }
@@ -356,8 +361,21 @@ pub fn render_quantum_panel_contents(
     ui.separator();
     ui.strong("Import ORCA (.out) / Gaussian (.log) / xTB / Molden");
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut qstate.import_path).desired_width(145.0).hint_text("job.out / .log / g98.out / .molden"));
-        if ui.small_button("Parse").clicked() && !qstate.import_path.trim().is_empty() {
+        ui.add(egui::TextEdit::singleline(&mut qstate.import_path).desired_width(120.0).hint_text("job.out / .log / .molden"));
+        let mut do_parse = false;
+        if ui.small_button("Browse...").clicked() {
+            if let Some(p) = crate::native_dialogs::pick_open_file(
+                "Import Quantum Output",
+                &["out", "log", "molden", "input", "txt"],
+            ) {
+                qstate.import_path = p;
+                do_parse = true;
+            }
+        }
+        if ui.small_button("Parse").clicked() {
+            do_parse = true;
+        }
+        if do_parse && !qstate.import_path.trim().is_empty() {
             match fs::read_to_string(qstate.import_path.trim())
                 .map_err(|e| e.to_string())
                 .and_then(|s| parse_quantum_output(&s))
@@ -475,8 +493,9 @@ pub fn show_quantum_window(
     let mut open = qstate.show_window;
     egui::Window::new("Computational Chemistry Bridge (ORCA / Gaussian / xTB)")
         .open(&mut open)
-        .default_pos([310.0, 100.0])
+        .default_pos([240.0, 76.0])
         .default_width(430.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             act = render_quantum_panel_contents(ui, qstate, active_mol, user_cfg, qc_bins);
@@ -547,39 +566,51 @@ pub fn show_right_studio_dock(
 
             egui::ScrollArea::vertical().show(ui, |ui| match *tab {
                 DockTab::Analysis => {
-                    let Some(mol) = active_mol.filter(|m| !m.atoms.is_empty()) else {
-                        ui.weak("Draw or import a structure to see live chemistry analysis.");
-                        return;
-                    };
-                    let rep = compute_analysis_report(mol);
-                    let props = estimate_chemical_properties(mol);
-                    if let Some(nm) = live_name {
-                        ui.label(RichText::new(nm).strong());
-                    }
-                    ui.label(format!("Formula: {}", rep.formula));
-                    ui.label(format!("Exact Mass: {:.4}", rep.exact_mass));
-                    ui.label(format!("Mol. Wt.: {:.2}", rep.mol_weight));
-                    ui.small(format!("Elem. Anal.: {}", rep.elem_analysis));
-                    ui.separator();
-                    ui.label(format!("LogP: {:.2}  |  tPSA: {:.1} Å²", props.log_p, props.tpsa));
-                    ui.label(format!("LogS: {:.2}  |  MR: {:.1}", props.log_s, props.molar_refractivity));
-                    if let Some(pka) = props.pka {
-                        ui.label(format!("Est. pKa: {pka:.2}"));
-                    }
-                    let metals = analyze_organometallic_complexes(mol);
-                    if !metals.is_empty() {
-                        ui.separator();
-                        ui.strong("Organometallic 18e-");
-                        for r in metals {
-                            ui.small(format!("{}: {}e- (ox {:+}, d^{}) — {}", r.metal_symbol, r.total_valence_electrons, r.oxidation_state, r.d_electrons, r.predicted_geometry));
+                    if let Some(mol) = active_mol.filter(|m| !m.atoms.is_empty()) {
+                        let rep = compute_analysis_report(mol);
+                        let props = estimate_chemical_properties(mol);
+                        if let Some(nm) = live_name {
+                            ui.label(RichText::new(nm).strong());
                         }
+                        ui.label(format!("Formula: {}", rep.formula));
+                        ui.label(format!("Exact Mass: {:.4}", rep.exact_mass));
+                        ui.label(format!("Mol. Wt.: {:.2}", rep.mol_weight));
+                        ui.small(format!("Elem. Anal.: {}", rep.elem_analysis));
+                        ui.separator();
+                        ui.label(format!("LogP: {:.2}  |  tPSA: {:.1} Å²", props.log_p, props.tpsa));
+                        ui.label(format!("LogS: {:.2}  |  MR: {:.1}", props.log_s, props.molar_refractivity));
+                        if let Some(pka) = props.pka {
+                            ui.label(format!("Est. pKa: {pka:.2}"));
+                        }
+                        let metals = analyze_organometallic_complexes(mol);
+                        if !metals.is_empty() {
+                            ui.separator();
+                            ui.strong("Organometallic 18e-");
+                            for r in metals {
+                                ui.small(format!("{}: {}e- (ox {:+}, d^{}) — {}", r.metal_symbol, r.total_valence_electrons, r.oxidation_state, r.d_electrons, r.predicted_geometry));
+                            }
+                        }
+                    } else {
+                        ui.weak("Draw or import a structure to see live chemistry analysis — or launch a studio below.");
                     }
                     ui.separator();
+                    ui.strong("Quick Studios");
                     ui.horizontal_wrapped(|ui| {
-                        if ui.small_button("3D Viewer").clicked() { act = DockQuantumAction::OpenFloatingStudio("3d"); }
-                        if ui.small_button("pH / Isomers").clicked() { act = DockQuantumAction::OpenFloatingStudio("isomers"); }
-                        if ui.small_button("Retrosynthesis").clicked() { act = DockQuantumAction::OpenFloatingStudio("retro"); }
-                        if ui.small_button("LaTeX").clicked() { act = DockQuantumAction::OpenFloatingStudio("latex"); }
+                        if ui.small_button("Retrosynthesis").on_hover_text("Open Retrosynthetic Disconnection Advisor").clicked() {
+                            act = DockQuantumAction::OpenFloatingStudio("retro");
+                        }
+                        if ui.small_button("FT-IR / Spectra").on_hover_text("Open Multi-Spectroscopy Studio (FT-IR / UV-Vis / 2D NMR)").clicked() {
+                            act = DockQuantumAction::OpenFloatingStudio("spec");
+                        }
+                        if ui.small_button("3D Viewer").clicked() {
+                            act = DockQuantumAction::OpenFloatingStudio("3d");
+                        }
+                        if ui.small_button("pH / Isomers").clicked() {
+                            act = DockQuantumAction::OpenFloatingStudio("isomers");
+                        }
+                        if ui.small_button("LaTeX").clicked() {
+                            act = DockQuantumAction::OpenFloatingStudio("latex");
+                        }
                     });
                 }
                 DockTab::MedChem => {

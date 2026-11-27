@@ -59,8 +59,10 @@ pub fn show_nmr_window(
 
     egui::Window::new(title)
         .open(open)
+        .default_pos([260.0, 74.0])
         .default_width(540.0)
         .default_height(360.0)
+        .constrain_to(ctx.available_rect())
         .frame(egui::Frame::window(&ctx.style()).fill(CD_WINDOW_BG))
         .show(ctx, |ui| {
             // 1. Reversed-axis IUPAC NMR spectrum plot (max_ppm on LEFT -> 0 ppm on RIGHT!)
@@ -170,7 +172,16 @@ pub fn show_nmr_window(
             });
             ui.horizontal(|ui| {
                 ui.label("JCAMP-DX (.jdx):");
-                ui.add(egui::TextEdit::singleline(jcamp_path_buf).desired_width(210.0).hint_text("path/to/experimental.jdx"));
+                ui.add(egui::TextEdit::singleline(jcamp_path_buf).desired_width(175.0).hint_text("experimental.jdx"));
+                if ui.button("Browse...").clicked() {
+                    if let Some(p) = crate::native_dialogs::pick_open_file(
+                        "Open Experimental NMR JCAMP-DX",
+                        &["jdx", "dx", "jcamp"],
+                    ) {
+                        *jcamp_path_buf = p.clone();
+                        act = ProPanelAction::LoadJcampOverlay(p);
+                    }
+                }
                 if ui.button("Overlay").clicked() && !jcamp_path_buf.trim().is_empty() {
                     act = ProPanelAction::LoadJcampOverlay(jcamp_path_buf.trim().to_string());
                 }
@@ -438,8 +449,9 @@ pub fn show_object_inspector_window(
     let mut modified = false;
     egui::Window::new("Object Inspector (TLC / Tables / 3D / Export)")
         .open(open)
-        .default_pos([880.0, 220.0])
+        .default_pos([420.0, 120.0])
         .default_width(370.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             egui::CollapsingHeader::new("Rendering & 3D Depth")
@@ -649,8 +661,9 @@ pub fn show_diff_compare_window(
     let mut action = DiffCompareAction::None;
     egui::Window::new("Compare Documents (Chemistry-Aware Diff)")
         .open(open)
-        .default_pos([240.0, 120.0])
+        .default_pos([240.0, 95.0])
         .default_width(540.0)
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {

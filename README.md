@@ -16,7 +16,7 @@
   <img alt="Linux · macOS · Windows · FreeBSD" src="https://img.shields.io/badge/Linux%20%C2%B7%20macOS%20%C2%B7%20Windows%20%C2%B7%20FreeBSD-native-2f7bf5?style=flat-square">
   <img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-3a3a3a?style=flat-square">
   <img alt="Formats: 22+" src="https://img.shields.io/badge/formats-22%2B-2ea043?style=flat-square">
-  <img alt="MCP Tools: 17" src="https://img.shields.io/badge/MCP%20tools-17-6f42c1?style=flat-square">
+  <img alt="MCP Tools: 19" src="https://img.shields.io/badge/MCP%20tools-19-6f42c1?style=flat-square">
 </p>
 
 <br>
@@ -56,10 +56,24 @@
     </td>
     <td width="25%" valign="top">
       <h3>🤖 Agent-ready</h3>
-      The same pure-Rust engine drives the desktop GUI, a full scientific CLI, and a zero-dependency 17-tool stdio MCP server (<code>chiralcraft --mcp</code>) for AI research agents.
+      The same pure-Rust engine drives the desktop GUI, a full scientific CLI, and a zero-dependency 19-tool stdio MCP server (<code>chiralcraft --mcp</code>) for AI research agents.
     </td>
   </tr>
 </table>
+
+<br>
+
+## Quick Start: Where to Find Key Tools
+
+| Tool / Workflow | How to Open in GUI | Keyboard / Command Palette |
+|---|---|---|
+| **Retrosynthetic Disconnection Advisor** | `Structure › Retrosynthetic Disconnection Advisor...` or **Right Dock → Props → Retrosynthesis** (works even on a blank canvas with 1-click examples: *Acetanilide*, *Aspirin*, *Biphenyl*, *Sulfanilamide*) | Press `:` or `F4`, type `retro` |
+| **Multi-Spectroscopy Studio (FT-IR / UV–Vis / 2D NMR)** | `Structure › Multi-Spectroscopy Studio...` or **Right Dock → Props → FT-IR / Spectra** | Press `:` or `F4`, type `ir` or `spec` |
+| **¹H / ¹³C NMR & On-Canvas `δ` Badges** | `Structure › Predict 1H-NMR / 13C-NMR` or `Structure › NMR Shift Labels` | `nmr stamp` in Command Palette |
+| **MedChem, ADMET & PAINS Scorecard** | `Structure › MedChem, ADMET & PAINS Scorecard...` or **Right Dock → MedChem** | Live in Right Studio Dock |
+| **Interactive 3D Viewer & UFF Optimizer** | `Structure › View Active Structure in 3D` or **Right Dock → Props → 3D Viewer** | `3d` or `opt3d` in Command Palette |
+| **Quantum Chemistry (ORCA / Gaussian / xTB)** | `Structure › Quantum Chemistry Bridge...` or **Right Dock → DFT** | Generate `.inp`/`.gjf`/`.xyz` or run local `xtb` |
+| **Draw Structure from Name / SMILES** | `Structure › Convert Name to Structure` or `Edit › Paste Special › SMILES` | `Shift+Ctrl+N` / `Alt+Ctrl+P` |
 
 <br>
 

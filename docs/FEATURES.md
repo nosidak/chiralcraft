@@ -67,17 +67,46 @@ Apply any stylesheet to a new document (`File › Open Style Sheets`), existing 
 
 ## 4. Multi-Spectroscopy Studio
 
-- **¹H-NMR (400 MHz) & ¹³C-NMR (100 MHz)**: Interactive Lorentzian spectrum viewer with reversed chemical-shift axis, multiplicity & coupling estimates, clickable peak ↔ atom canvas highlighting, and one-click on-canvas `δ (ppm)` shift badges.
-- **Experimental JCAMP-DX (`.jdx`) Overlay**: Load real `.jdx`/`.dx` files (`XYDATA` & `PEAK TABLE`) overlaid directly behind predicted NMR traces.
-- **FT-IR Transmittance (`4000–400 cm⁻¹`)**: Simulated `%T` spectrum with clickable functional-group bands that highlight vibrating atoms/bonds on canvas and paste publication IR strings.
+Open via **`Structure › Multi-Spectroscopy Studio (FT-IR / UV–Vis / 2D NMR)...`** or **Right Studio Dock → `Props` / `Spectra` → `FT-IR / Spectra`**.
+
+- **¹H-NMR (400 MHz) & ¹³C-NMR (100 MHz)**: Interactive Lorentzian spectrum viewer with reversed chemical-shift axis, multiplicity & coupling estimates, clickable peak ↔ atom canvas highlighting, and collision-free radial on-canvas `δ (ppm)` shift badges (`Structure › NMR Shift Labels`).
+- **Experimental JCAMP-DX (`.jdx`) & CSV Overlay**: Browse and load real spectrometer `.jdx`/`.dx`/`.csv`/`.dpt` files (`XYDATA`, IUPAC ASDF/SQZ/DIF/DUP, `PEAK TABLE`) — or fetch directly from **NIST Chemistry WebBook** — with live **Hit Quality Index (HQI %)** and Pearson `r` match scoring.
+- **Multi-Backend FT-IR Studio (`4000–400 cm⁻¹`)**:
+  - **Instant Rules Engine**: Ring-strain, conjugation, H-bonding, and substitution-aware vibrational band prediction with per-band FWHM broadening.
+  - **Local Quantum Harmonic IR (`GFN2-xTB` / `GFN-FF` / `ORCA` / `Gaussian`)**: Run local `xtb --ohess` or import `.out`, `.log`, `g98.out`, `vibspectrum`, or `.molden` outputs with anharmonic scaling presets (`0.967 B3LYP`, `0.970 GFN2-xTB`, `0.975 r²SCAN-3c`, `0.950 ωB97X-D`), Lorentzian/Gaussian/Pseudo-Voigt lineshapes, scroll-wheel zoom, and **3D normal-mode vibration animation** (`Play 3D`).
+  - **Publication Export**: Save vector `.svg`, `.jdx`, or `.csv` spectra via native OS file dialogs, or paste formatted ACS IR strings onto the canvas.
 - **UV–Vis Chromophore Predictor**: Conjugation-aware `λmax` (nm), molar absorptivity `ε`, electronic transition type (`π→π*`, `n→π*`), and perceived solution color swatch.
 - **2D NMR Contour Maps (`COSY`, `HSQC`, `HMBC`)**: Interactive 2D correlation plots where clicking any cross-peak highlights both coupled atoms on the canvas.
 
 ---
 
-## 5. Synthesis Planning, Isomers, Kinetics & ELN Safety
+## 5. Synthesis Planning, Retrosynthesis, Isomers, Kinetics & ELN Safety
 
-- **Retrosynthetic Disconnection Advisor**: Evaluates targets for Amide Coupling, Esterification, Suzuki–Miyaura, Buchwald–Hartwig, Sulfonamide, Williamson Ether, Reductive Amination, Friedel–Crafts, and Wittig disconnections; highlights target bonds on canvas and stamps complete `⇒` retrosynthesis schemes with forward reagents.
+### How to Use the Retrosynthetic Disconnection Advisor
+
+1. **Open the Advisor** using any of three quick paths:
+   - Top menu: **`Structure › Retrosynthetic Disconnection Advisor...`**
+   - Right Studio Dock: **`Props` tab → `Retrosynthesis`** (always visible, even on a blank canvas)
+   - Command Palette: press **`:`** or **`F4`**, type **`retro`**, and press `Enter`
+2. **Choose or Draw a Target Molecule**:
+   - Draw any molecule on the canvas (or paste a SMILES/name via `Shift+Ctrl+N` / `Alt+Ctrl+P`) — disconnections run **automatically** when you open the advisor or edit the molecule.
+   - Want to test it right away on a blank canvas? Click one of the built-in **1-click examples** inside the advisor window: **`Acetanilide`**, **`Aspirin`**, **`Biphenyl`**, or **`Sulfanilamide`**.
+3. **Inspect & Stamp a Synthetic Route**:
+   - Click any ranked disconnection row to highlight the **strategic target bond in dashed red** directly on the canvas and inspect the suggested **forward reagents** and **synthons**.
+   - Click **`Stamp Scheme (⇒)`** to place a publication-ready retrosynthesis scheme (`Target ⇒ Precursor 1 + Precursor 2` with forward reagents) onto the canvas.
+4. **Supported Strategic Disconnection Classes (9 Built-In Transforms)**:
+   - **Amide Coupling** (HATU / EDC·HCl, DIPEA)
+   - **Esterification** (EDC/DMAP or Fischer)
+   - **Suzuki–Miyaura Biaryl Cross-Coupling** (`Pd(PPh₃)₄`, `K₂CO₃`)
+   - **Buchwald–Hartwig C–N Amination** (`Pd₂(dba)₃`, XPhos, `NaOtBu`)
+   - **Sulfonamide Coupling** (`Et₃N`, DCM)
+   - **Williamson Ether Synthesis** (`K₂CO₃` or `NaH`)
+   - **Reductive Amination** (`NaBH(OAc)₃`, AcOH)
+   - **Friedel–Crafts Acylation** (`AlCl₃`, DCM)
+   - **Wittig Olefination** (`Ph₃P=CHR`, THF)
+5. **CLI & MCP Access**: Run `chiralcraft retro target.mol` (or `chiralcraft retro "CC(=O)Nc1ccccc1"`) from the terminal, or call `retrosynthesis` via `chiralcraft --mcp`.
+
+### Additional Synthesis & ELN Tools
 - **Markush R-Group Enumerator & SAR Grid**: Enumerate `R1`/`R2` substituent combinations onto any scaffold, sort the generated SAR library by MW/LogP/MPO/QED/Alerts, stamp visual grids onto the canvas, or export to `.sdf`/`.csv`.
 - **pH Microspecies, Tautomers, Stereoisomers & Resonance**:
   - Live `pH 1.0–14.0` protonation state explorer with calculated isoelectric point (`pI`).

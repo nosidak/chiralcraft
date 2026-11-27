@@ -487,12 +487,39 @@ pub fn stamp_retrosynthesis_scheme(
         }
     };
 
+    let bbox_w = |m: &ChemMolecule| -> f64 {
+        if m.atoms.is_empty() {
+            return 28.0;
+        }
+        let mut x1 = f64::INFINITY;
+        let mut x2 = f64::NEG_INFINITY;
+        for a in &m.atoms {
+            x1 = x1.min(a.x);
+            x2 = x2.max(a.x);
+        }
+        (x2 - x1).max(20.0) + 18.0
+    };
+
     let mut t = target.clone();
     let mut sa = hit.synthon_a.clone();
     let mut sb = hit.synthon_b.clone();
-    shift_center(&mut t, origin_x, origin_y);
-    shift_center(&mut sa, origin_x + 150.0, origin_y);
-    shift_center(&mut sb, origin_x + 255.0, origin_y);
+    let tw = bbox_w(&t);
+    let saw = bbox_w(&sa);
+    let sbw = bbox_w(&sb);
+    let label_chars = hit.reaction_name.chars().count().max(hit.reagents.chars().count());
+    let arrow_span = ((label_chars as f64) * 5.2 + 16.0).clamp(62.0, 155.0);
+
+    let t_cx = origin_x;
+    let arrow_tail = t_cx + tw * 0.5 + 16.0;
+    let arrow_head = arrow_tail + arrow_span;
+    let arrow_mid = 0.5 * (arrow_tail + arrow_head);
+    let sa_cx = arrow_head + 18.0 + saw * 0.5;
+    let plus_x = sa_cx + saw * 0.5 + 18.0;
+    let sb_cx = plus_x + 18.0 + sbw * 0.5;
+
+    shift_center(&mut t, t_cx, origin_y);
+    shift_center(&mut sa, sa_cx, origin_y);
+    shift_center(&mut sb, sb_cx, origin_y);
 
     scene.molecules.push(t);
     scene.molecules.push(sa);
@@ -501,8 +528,8 @@ pub fn stamp_retrosynthesis_scheme(
     let aid = *next_id; *next_id += 1;
     scene.arrows.push(SceneArrow {
         id: aid,
-        tail: (origin_x + 52.0, origin_y),
-        head: (origin_x + 102.0, origin_y),
+        tail: (arrow_tail, origin_y),
+        head: (arrow_head, origin_y),
         arrowhead_head: "Retrosynthetic".to_string(),
         arrowhead_tail: None,
         no_go: None,
@@ -512,7 +539,7 @@ pub fn stamp_retrosynthesis_scheme(
     scene.captions.push(CaptionNode {
         id: cid_plus,
         text: "+".to_string(),
-        x: origin_x + 202.0,
+        x: plus_x,
         y: origin_y,
         element: None,
         generic_nickname: None,
@@ -523,8 +550,8 @@ pub fn stamp_retrosynthesis_scheme(
     scene.captions.push(CaptionNode {
         id: cid_top,
         text: hit.reaction_name.to_string(),
-        x: origin_x + 77.0,
-        y: origin_y - 16.0,
+        x: arrow_mid,
+        y: origin_y - 20.0,
         element: None,
         generic_nickname: None,
         warning: None,
@@ -534,8 +561,8 @@ pub fn stamp_retrosynthesis_scheme(
     scene.captions.push(CaptionNode {
         id: cid_bot,
         text: hit.reagents.to_string(),
-        x: origin_x + 77.0,
-        y: origin_y + 18.0,
+        x: arrow_mid,
+        y: origin_y + 20.0,
         element: None,
         generic_nickname: None,
         warning: None,

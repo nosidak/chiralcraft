@@ -164,8 +164,9 @@ pub fn show_3d_viewer_window(
 
     egui::Window::new("3D Molecular & Crystal Viewer")
         .open(&mut open)
-        .default_pos([640.0, 90.0])
-        .default_size([460.0, 420.0])
+        .default_pos([340.0, 74.0])
+        .default_size([450.0, 415.0])
+        .constrain_to(ctx.available_rect())
         .resizable(true)
         .show(ctx, |ui| {
             // Top controls

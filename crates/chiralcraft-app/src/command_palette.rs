@@ -177,7 +177,7 @@ pub fn parse_direct_palette_command(input: &str) -> Option<PaletteCommandAction>
         "markush" | "rgroup" | "sar" => Some(PaletteCommandAction::OpenMarkush),
         "retro" | "retrosynthesis" => Some(PaletteCommandAction::OpenRetro),
         "toc" | "scheme" | "composer" => Some(PaletteCommandAction::OpenPubComposer),
-        "ir" | "ftir" => Some(PaletteCommandAction::OpenSpectroscopy("ir")),
+        "ir" | "ftir" | "spec" | "spectra" => Some(PaletteCommandAction::OpenSpectroscopy("ir")),
         "uv" | "uvvis" => Some(PaletteCommandAction::OpenSpectroscopy("uv")),
         "cosy" | "hsqc" | "hmbc" | "2dnmr" => Some(PaletteCommandAction::OpenSpectroscopy("2d")),
         "18e" | "metal" | "organometallic" => Some(PaletteCommandAction::OpenInoPoly("metal")),
