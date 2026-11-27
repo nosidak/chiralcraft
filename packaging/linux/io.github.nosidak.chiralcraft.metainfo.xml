@@ -42,6 +42,11 @@
   </categories>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.1.0" date="2026-11-27">
+      <description>
+        <p>Major 2D drawing UX fixes (ring drag/previews, ring-closing auto-merge, zig-zag bond clicks, chain attachment, stereobond flip, single-atom drag, eraser stroke) and full multi-backend FT-IR studio with xTB/ORCA/Gaussian/Molden normal modes, JCAMP-DX ASDF/CSV/NIST overlay, and 3D vibration animation.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-11-27">
       <description>
         <p>Initial public release of ChiralCraft 1.0.0 under GNU AGPL-3.0-or-later.</p>

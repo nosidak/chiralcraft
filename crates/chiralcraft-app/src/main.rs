@@ -2850,6 +2850,7 @@ impl ChiralCraftApp {
         p
     }
 
+    #[cfg(test)]
     fn build_polygon_ring(n_sides: usize, aromatic: bool, cpd: bool, cx: f64, cy: f64, blen: f64) -> ChemMolecule {
         Self::build_polygon_ring_angled(n_sides, aromatic, cpd, cx, cy, blen, -std::f64::consts::FRAC_PI_2)
     }
@@ -9890,12 +9891,12 @@ impl ChiralCraftApp {
 
 fn print_cli_help() {
     println!(
-        "ChiralCraft 1.0.0 — Pure-Rust Chemical Structure & Cheminformatics Studio\n\
+        "ChiralCraft {} — Pure-Rust Chemical Structure & Cheminformatics Studio\n\
          \n\
          USAGE:\n\
            chiralcraft [FILE]                       Launch desktop GUI (optionally opening FILE)\n\
            chiralcraft --edit-svg <FILE.svg>        Edit an embedded ChiralCraft SVG round-trip\n\
-           chiralcraft --mcp                        Run stdio JSON-RPC 2.0 MCP server (17 tools)\n\
+           chiralcraft --mcp                        Run stdio JSON-RPC 2.0 MCP server (19 tools)\n\
            chiralcraft --help | -h | --version | -V Show help or version\n\
          \n\
          CLI SUBCOMMANDS (accept any supported file OR raw SMILES):\n\
@@ -9913,7 +9914,8 @@ fn print_cli_help() {
            quantum-in <IN> [--engine orca|gaussian|xtb]\n\
                                                     Generate ORCA, Gaussian, or GFN2-xTB input deck\n\
            quantum-parse <OUT|LOG>                  Parse ORCA .out or Gaussian .log energies & IR\n\
-           inspect-svg | inspect-media <FILE>       Verify embedded editable ChiralCraft payload"
+           inspect-svg | inspect-media <FILE>       Verify embedded editable ChiralCraft payload",
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -9931,7 +9933,7 @@ fn main() -> eframe::Result<()> {
             Ok(())
         }
         Some("--version") | Some("-V") | Some("version") => {
-            println!("chiralcraft 1.0.0");
+            println!("chiralcraft {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("convert") if args.len() >= 4 => {

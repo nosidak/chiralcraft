@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "chiralcraft-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chiralcraft-chem",
  "chiralcraft-doc",
@@ -616,14 +616,14 @@ dependencies = [
 
 [[package]]
 name = "chiralcraft-chem"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chiralcraft-tables",
 ]
 
 [[package]]
 name = "chiralcraft-doc"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chiralcraft-chem",
  "chiralcraft-formats",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "chiralcraft-formats"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chiralcraft-chem",
  "png",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "chiralcraft-tables"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "clipboard-win"

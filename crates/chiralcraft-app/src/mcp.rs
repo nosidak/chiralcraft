@@ -125,7 +125,11 @@ pub fn handle_mcp_request(line: &str) -> Option<String> {
         "notifications/initialized" | "notifications/cancelled" => None,
         "initialize" => Some(rpc_ok(
             id,
-            r#"{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"chiralcraft","version":"1.0.0"}}"#,
+            concat!(
+                r#"{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"chiralcraft","version":""#,
+                env!("CARGO_PKG_VERSION"),
+                r#""}}"#
+            ),
         )),
         "ping" => Some(rpc_ok(id, "{}")),
         "tools/list" => Some(rpc_ok(id, tools_list_json())),
