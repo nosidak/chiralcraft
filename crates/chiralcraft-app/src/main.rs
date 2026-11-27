@@ -305,10 +305,12 @@ struct ChiralCraftApp {
     drag_start_canvas: Option<(f64, f64)>,
     drag_cur_canvas: Option<(f64, f64)>,
     drag_start_atom: Option<(usize, usize)>,
+    dragging_single_atom: Option<(usize, usize)>,
     dragging_selected_move: bool,
     dragging_caption: Option<usize>,
     drag_ctrl_copy: bool,
     lasso_pts: Vec<(f64, f64)>,
+    eraser_pts: Vec<(f64, f64)>,
     inline_atom_edit: Option<(usize, usize)>,
     inline_label_buf: String,
     inline_just_opened: bool,
@@ -487,10 +489,12 @@ impl ChiralCraftApp {
             drag_start_canvas: None,
             drag_cur_canvas: None,
             drag_start_atom: None,
+            dragging_single_atom: None,
             dragging_selected_move: false,
             dragging_caption: None,
             drag_ctrl_copy: false,
             lasso_pts: Vec::new(),
+            eraser_pts: Vec::new(),
             inline_atom_edit: None,
             inline_label_buf: String::new(),
             inline_just_opened: false,
@@ -1756,6 +1760,8 @@ impl ChiralCraftApp {
         self.hovered_atom = None;
         self.hovered_bond = None;
         self.drag_start_atom = None;
+        self.dragging_single_atom = None;
+        self.eraser_pts.clear();
     }
 
     /// Guarantees all cached indices (`active_tab`, `hovered_atom`, `hovered_bond`,
@@ -1786,6 +1792,9 @@ impl ChiralCraftApp {
         }
         if let Some(p) = self.drag_start_atom {
             if !valid_atom(p) { self.drag_start_atom = None; }
+        }
+        if let Some(p) = self.dragging_single_atom {
+            if !valid_atom(p) { self.dragging_single_atom = None; }
         }
         if let Some(p) = self.inline_atom_edit {
             if !valid_atom(p) { self.inline_atom_edit = None; }
@@ -2617,6 +2626,16 @@ impl ChiralCraftApp {
         )
     }
 
+    /// Zoom-aware hit radius for atom vertices (~10 screen px, clamped to sensible doc-pt bounds).
+    fn atom_hit_tol(&self) -> f64 {
+        (10.0 / (self.zoom as f64).max(0.4)).clamp(4.5, 16.0)
+    }
+
+    /// Zoom-aware hit radius for bond segments (~8.5 screen px, clamped to sensible doc-pt bounds).
+    fn bond_hit_tol(&self) -> f64 {
+        (8.5 / (self.zoom as f64).max(0.4)).clamp(4.0, 14.0)
+    }
+
     fn hit_atom(&self, dx: f64, dy: f64, tol: f64) -> Option<(usize, usize)> {
         let mut best: Option<((usize, usize), f64)> = None;
         for (mi, mol) in self.doc().scene.molecules.iter().enumerate() {
@@ -2792,11 +2811,19 @@ impl ChiralCraftApp {
         }
     }
 
-    fn build_polygon_ring(n_sides: usize, aromatic: bool, cpd: bool, cx: f64, cy: f64, blen: f64) -> ChemMolecule {
+    fn build_polygon_ring_angled(
+        n_sides: usize,
+        aromatic: bool,
+        cpd: bool,
+        cx: f64,
+        cy: f64,
+        blen: f64,
+        rot_ang: f64,
+    ) -> ChemMolecule {
         let mut p = ChemMolecule::default();
         let r = blen / (2.0 * (std::f64::consts::PI / (n_sides as f64)).sin());
         for i in 0..n_sides {
-            let ang = (i as f64) * std::f64::consts::TAU / (n_sides as f64) - std::f64::consts::FRAC_PI_2;
+            let ang = (i as f64) * std::f64::consts::TAU / (n_sides as f64) + rot_ang;
             let mut a = ChemAtom::new((i + 1) as u32, 6);
             a.x = cx + r * ang.cos();
             a.y = cy + r * ang.sin();
@@ -2821,6 +2848,364 @@ impl ChiralCraftApp {
             });
         }
         p
+    }
+
+    fn build_polygon_ring(n_sides: usize, aromatic: bool, cpd: bool, cx: f64, cy: f64, blen: f64) -> ChemMolecule {
+        Self::build_polygon_ring_angled(n_sides, aromatic, cpd, cx, cy, blen, -std::f64::consts::FRAC_PI_2)
+    }
+
+    /// Computes the ideal next bond angle off atom `ai` in `mol`:
+    /// - `deg == 0`: standard ACS -30 deg
+    /// - `deg == 1`: linear 180 deg for alkynes/nitriles, otherwise proper alternating zig-zag
+    /// - `deg >= 2`: exact midpoint of the largest angular gap between existing bonds (never overlaps!)
+    fn best_new_bond_angle(mol: &ChemMolecule, ai: usize, ord: i32, chain_rad: f64) -> f64 {
+        let ax = mol.atoms[ai].x;
+        let ay = mol.atoms[ai].y;
+        let mut nbrs: Vec<(usize, f64, i32)> = Vec::new();
+        for b in &mol.bonds {
+            let nb = if b.begin_atom == ai {
+                Some(b.end_atom)
+            } else if b.end_atom == ai {
+                Some(b.begin_atom)
+            } else {
+                None
+            };
+            if let Some(n_i) = nb {
+                if n_i < mol.atoms.len() {
+                    let ang = (mol.atoms[n_i].y - ay).atan2(mol.atoms[n_i].x - ax);
+                    nbrs.push((n_i, ang, b.order));
+                }
+            }
+        }
+        if nbrs.is_empty() {
+            return -std::f64::consts::FRAC_PI_6;
+        }
+        if nbrs.len() == 1 {
+            let (nb, ang_nb, b_ord) = nbrs[0];
+            if b_ord == 3 || ord == 3 {
+                return ang_nb + std::f64::consts::PI;
+            }
+            // Check neighbor's own neighbors to alternate zig-zag properly along chains!
+            let mut nb_other: Option<(f64, f64)> = None;
+            for b in &mol.bonds {
+                let o = if b.begin_atom == nb && b.end_atom != ai {
+                    Some(b.end_atom)
+                } else if b.end_atom == nb && b.begin_atom != ai {
+                    Some(b.begin_atom)
+                } else {
+                    None
+                };
+                if let Some(oi) = o {
+                    if oi < mol.atoms.len() {
+                        nb_other = Some((mol.atoms[oi].x, mol.atoms[oi].y));
+                        break;
+                    }
+                }
+            }
+            let cand_plus = ang_nb + chain_rad;
+            let cand_minus = ang_nb - chain_rad;
+            if let Some((ox, oy)) = nb_other {
+                // Vector from nb -> ai and vector from nb -> nb_other
+                let ux = ax - mol.atoms[nb].x;
+                let uy = ay - mol.atoms[nb].y;
+                let vx = ox - mol.atoms[nb].x;
+                let vy = oy - mol.atoms[nb].y;
+                let cross_prev = ux * vy - uy * vx;
+                let c1 = ux * cand_plus.sin() - uy * cand_plus.cos();
+                // Want new bond on the SAME side as nb_other for trans zig-zag (opposite cross sign to incoming)
+                // Wait: in trans zig-zag (A-B-C-D), B->A and C->D point to OPPOSITE sides of B->C!
+                // Here ux,uy = B->C, vx,vy = B->A. Cross(B->C, B->A) and Cross(B->C, C->D) should have OPPOSITE signs!
+                // Note: Cross(u, d) = ux * dy - uy * dx = ux * sin(cand) - uy * cos(cand).
+                if cross_prev.abs() > 1e-4 {
+                    return if (c1 * cross_prev) < 0.0 { cand_plus } else { cand_minus };
+                }
+            }
+            // No grandparent (2-atom ethane): pick whichever candidate stays closer to horizontal (+0 / PI)
+            if cand_plus.cos().abs() >= cand_minus.cos().abs() {
+                cand_plus
+            } else {
+                cand_minus
+            }
+        } else {
+            // 2+ neighbors: find largest angular gap in [0, 2*PI) and bisect it!
+            let tau = std::f64::consts::TAU;
+            let mut angles: Vec<f64> = nbrs
+                .iter()
+                .map(|&(_, a, _)| a.rem_euclid(tau))
+                .collect();
+            angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut best_gap = -1.0_f64;
+            let mut best_mid = 0.0_f64;
+            for i in 0..angles.len() {
+                let a0 = angles[i];
+                let a1 = if i + 1 < angles.len() {
+                    angles[i + 1]
+                } else {
+                    angles[0] + tau
+                };
+                let gap = a1 - a0;
+                if gap > best_gap {
+                    best_gap = gap;
+                    best_mid = (a0 + 0.5 * gap).rem_euclid(tau);
+                }
+            }
+            best_mid
+        }
+    }
+
+    /// Computes vertices for a spiro ring fused at atom `(mi, ai)` with optional directional target `(tx, ty)`.
+    fn compute_spiro_ring_vertices(
+        mol: &ChemMolecule,
+        ai: usize,
+        n_sides: usize,
+        blen: f64,
+        dir_target: Option<(f64, f64)>,
+    ) -> Vec<(f64, f64)> {
+        let ax = mol.atoms[ai].x;
+        let ay = mol.atoms[ai].y;
+        let dir_ang = if let Some((tx, ty)) = dir_target.filter(|&(tx, ty)| (tx - ax).hypot(ty - ay) > 3.0) {
+            (ty - ay).atan2(tx - ax)
+        } else {
+            Self::best_new_bond_angle(mol, ai, 1, 120.0_f64.to_radians())
+        };
+        let r = blen / (2.0 * (std::f64::consts::PI / (n_sides as f64)).sin());
+        let rcx = ax + r * dir_ang.cos();
+        let rcy = ay + r * dir_ang.sin();
+        let start_ang = (ay - rcy).atan2(ax - rcx);
+        let step = std::f64::consts::TAU / (n_sides as f64);
+        (0..n_sides)
+            .map(|k| {
+                let ang = start_ang + (k as f64) * step;
+                (rcx + r * ang.cos(), rcy + r * ang.sin())
+            })
+            .collect()
+    }
+
+    /// Computes vertices for an edge-fused ring across bond `(mi, bi)` with optional side hint `(hx, hy)`.
+    fn compute_edge_fused_ring_vertices(
+        mol: &ChemMolecule,
+        bi: usize,
+        n_sides: usize,
+        blen: f64,
+        side_hint: Option<(f64, f64)>,
+    ) -> Vec<(f64, f64)> {
+        let b = &mol.bonds[bi];
+        let p1 = (mol.atoms[b.begin_atom].x, mol.atoms[b.begin_atom].y);
+        let p2 = (mol.atoms[b.end_atom].x, mol.atoms[b.end_atom].y);
+        let mx = 0.5 * (p1.0 + p2.0);
+        let my = 0.5 * (p1.1 + p2.1);
+        let edge_len = (p2.0 - p1.0).hypot(p2.1 - p1.1).max(blen);
+        let ex = (p2.0 - p1.0) / edge_len;
+        let ey = (p2.1 - p1.1) / edge_len;
+        let mut nx = -ey;
+        let mut ny = ex;
+
+        if let Some((hx, hy)) = side_hint {
+            let dot = (hx - mx) * nx + (hy - my) * ny;
+            if dot < -0.5 {
+                nx = -nx;
+                ny = -ny;
+            }
+        } else {
+            // Default: place on the side away from the molecule centroid
+            let cx = mol.atoms.iter().map(|a| a.x).sum::<f64>() / (mol.atoms.len().max(1) as f64);
+            let cy = mol.atoms.iter().map(|a| a.y).sum::<f64>() / (mol.atoms.len().max(1) as f64);
+            if (mx + nx - cx).hypot(my + ny - cy) < (mx - nx - cx).hypot(my - ny - cy) {
+                nx = -nx;
+                ny = -ny;
+            }
+        }
+        let build_side = |sx_n: f64, sy_n: f64| -> Vec<(f64, f64)> {
+            let apothem = edge_len / (2.0 * (std::f64::consts::PI / (n_sides as f64)).tan());
+            let r = edge_len / (2.0 * (std::f64::consts::PI / (n_sides as f64)).sin());
+            let rcx = mx + sx_n * apothem;
+            let rcy = my + sy_n * apothem;
+            let a_start = (p2.1 - rcy).atan2(p2.0 - rcx);
+            let mut step = std::f64::consts::TAU / (n_sides as f64);
+            let test_ang = a_start + step;
+            if (rcx + r * test_ang.cos() - p1.0).hypot(rcy + r * test_ang.sin() - p1.1) < 1.0 {
+                step = -step;
+            }
+            let mut verts = Vec::with_capacity(n_sides);
+            verts.push(p2);
+            for k in 1..=(n_sides - 2) {
+                let ang = a_start + (k as f64) * step;
+                verts.push((rcx + r * ang.cos(), rcy + r * ang.sin()));
+            }
+            verts.push(p1);
+            verts
+        };
+
+        let overlap_tol = (blen * 0.35).max(4.0);
+        let count_overlaps = |vs: &[(f64, f64)]| -> usize {
+            vs.iter()
+                .skip(1)
+                .take(n_sides.saturating_sub(2))
+                .filter(|&&(vx, vy)| mol.atoms.iter().any(|a| (a.x - vx).hypot(a.y - vy) <= overlap_tol))
+                .count()
+        };
+
+        let cand = build_side(nx, ny);
+        if count_overlaps(&cand) >= n_sides.saturating_sub(2) {
+            let alt = build_side(-nx, -ny);
+            if count_overlaps(&alt) < count_overlaps(&cand) {
+                return alt;
+            }
+        }
+        cand
+    }
+
+    /// Commits a ring placement (spiro on atom, edge-fused on bond, or free polygon on canvas)
+    /// supporting both single-click and drag-to-orient / drag-to-pick-side!
+    fn place_ring_interaction(
+        &mut self,
+        n_sides: usize,
+        aromatic: bool,
+        cpd: bool,
+        sx: f64,
+        sy: f64,
+        drag_end: Option<(f64, f64)>,
+    ) {
+        let blen = self.doc().settings.bond_length_pt;
+        let atol = self.atom_hit_tol();
+        let btol = self.bond_hit_tol();
+
+        // 1. Atom-hit -> Spiro Fusion (oriented toward drag_end if dragged)
+        if let Some((mi, ai)) = self.hit_atom(sx, sy, atol) {
+            self.doc_mut().apply_scene_tx("Spiro Ring", |scene, next_id| {
+                if let Some(mol) = scene.molecules.get_mut(mi) {
+                    let verts = Self::compute_spiro_ring_vertices(mol, ai, n_sides, blen, drag_end);
+                    let mut prev_idx = ai;
+                    for (k, &(vx, vy)) in verts.iter().enumerate().skip(1) {
+                        let nid = *next_id;
+                        *next_id += 1;
+                        let mut na = ChemAtom::new(nid, 6);
+                        na.x = vx;
+                        na.y = vy;
+                        let new_idx = mol.atoms.len();
+                        mol.atoms.push(na);
+                        let bid = *next_id;
+                        *next_id += 1;
+                        let ord = if aromatic && k % 2 == 1 {
+                            2
+                        } else if cpd && (k == 2 || k == 4) {
+                            2
+                        } else {
+                            1
+                        };
+                        mol.bonds.push(ChemBond {
+                            id: bid,
+                            begin_atom: prev_idx,
+                            end_atom: new_idx,
+                            order: ord,
+                            display: BondDisplay::Solid,
+                            visible: true,
+                            ignore_warnings: false,
+                        });
+                        prev_idx = new_idx;
+                    }
+                    let bid = *next_id;
+                    *next_id += 1;
+                    mol.bonds.push(ChemBond {
+                        id: bid,
+                        begin_atom: prev_idx,
+                        end_atom: ai,
+                        order: 1,
+                        display: BondDisplay::Solid,
+                        visible: true,
+                        ignore_warnings: false,
+                    });
+                }
+            });
+            self.status_msg = format!("Fused spiro {n_sides}-membered ring");
+            return;
+        }
+
+        // 2. Bond-hit -> Edge Ring Fusion (on the side of drag_end if dragged!)
+        if let Some((mi, bi)) = self.hit_bond(sx, sy, btol) {
+            self.doc_mut().apply_scene_tx("Fuse Ring", |scene, next_id| {
+                if let Some(mol) = scene.molecules.get_mut(mi) {
+                    let b = mol.bonds[bi].clone();
+                    let verts = Self::compute_edge_fused_ring_vertices(mol, bi, n_sides, blen, drag_end);
+                    let merge_tol = (blen * 0.32).max(4.0);
+                    let mut prev_idx = b.end_atom;
+                    for (k, &(vx, vy)) in verts.iter().enumerate().skip(1).take(n_sides - 2) {
+                        // Auto-weld to an existing atom if fusing into a bay (e.g. phenanthrene/pyrene)!
+                        let existing = mol.atoms.iter().enumerate().find_map(|(idx, a)| {
+                            if idx != prev_idx && (a.x - vx).hypot(a.y - vy) <= merge_tol {
+                                Some(idx)
+                            } else {
+                                None
+                            }
+                        });
+                        let target_idx = if let Some(ei) = existing {
+                            ei
+                        } else {
+                            let nid = *next_id;
+                            *next_id += 1;
+                            let mut na = ChemAtom::new(nid, 6);
+                            na.x = vx;
+                            na.y = vy;
+                            let new_idx = mol.atoms.len();
+                            mol.atoms.push(na);
+                            new_idx
+                        };
+                        let already_bonded = mol.bonds.iter().any(|eb| {
+                            (eb.begin_atom == prev_idx && eb.end_atom == target_idx)
+                                || (eb.begin_atom == target_idx && eb.end_atom == prev_idx)
+                        });
+                        if !already_bonded {
+                            let bid = *next_id;
+                            *next_id += 1;
+                            let ord = if aromatic && (k % 2 == 0) {
+                                2
+                            } else if cpd && (k == 1 || k == 3) {
+                                2
+                            } else {
+                                1
+                            };
+                            mol.bonds.push(ChemBond {
+                                id: bid,
+                                begin_atom: prev_idx,
+                                end_atom: target_idx,
+                                order: ord,
+                                display: BondDisplay::Solid,
+                                visible: true,
+                                ignore_warnings: false,
+                            });
+                        }
+                        prev_idx = target_idx;
+                    }
+                    let already_closing = mol.bonds.iter().any(|eb| {
+                        (eb.begin_atom == prev_idx && eb.end_atom == b.begin_atom)
+                            || (eb.begin_atom == b.begin_atom && eb.end_atom == prev_idx)
+                    });
+                    if !already_closing && prev_idx != b.begin_atom {
+                        let bid = *next_id;
+                        *next_id += 1;
+                        mol.bonds.push(ChemBond {
+                            id: bid,
+                            begin_atom: prev_idx,
+                            end_atom: b.begin_atom,
+                            order: 1,
+                            display: BondDisplay::Solid,
+                            visible: true,
+                            ignore_warnings: false,
+                        });
+                    }
+                }
+            });
+            self.status_msg = format!("Fused {n_sides}-membered ring across bond");
+            return;
+        }
+
+        // 3. Empty canvas -> Free ring (rotated to drag angle if dragged!)
+        let rot_ang = drag_end
+            .filter(|&(ex, ey)| (ex - sx).hypot(ey - sy) > 4.0)
+            .map(|(ex, ey)| (ey - sy).atan2(ex - sx))
+            .unwrap_or(-std::f64::consts::FRAC_PI_2);
+        let ring = Self::build_polygon_ring_angled(n_sides, aromatic, cpd, sx, sy, blen, rot_ang);
+        self.doc_mut().stamp_molecule_tx(ring, "Ring");
     }
 
     fn build_acyclic_chain(sx: f64, sy: f64, ex: f64, ey: f64, blen: f64) -> ChemMolecule {
@@ -2974,8 +3359,10 @@ impl ChiralCraftApp {
 
     fn handle_canvas_click(&mut self, dx: f64, dy: f64, shift: bool) {
         let blen = self.doc().settings.bond_length_pt;
+        let atol = self.atom_hit_tol();
+        let btol = self.bond_hit_tol();
         if let Some(el_z) = self.active_element_z {
-            if let Some((mi, ai)) = self.hit_atom(dx, dy, 6.0) {
+            if let Some((mi, ai)) = self.hit_atom(dx, dy, atol) {
                 self.doc_mut().apply_scene_tx("Change Element", |scene, _| {
                     if let Some(a) = scene.molecules.get_mut(mi).and_then(|m| m.atoms.get_mut(ai)) {
                         a.z = el_z;
@@ -3021,143 +3408,13 @@ impl ChiralCraftApp {
         }
 
         if let Some((n_sides, aromatic, cpd)) = Self::ring_spec(self.tool) {
-            // 1. Atom-click -> Spiro Fusion (`P29`)
-            if let Some((mi, ai)) = self.hit_atom(dx, dy, 4.5) {
-                self.doc_mut().apply_scene_tx("Spiro Ring", |scene, next_id| {
-                    if let Some(mol) = scene.molecules.get_mut(mi) {
-                        let ax = mol.atoms[ai].x;
-                        let ay = mol.atoms[ai].y;
-                        let cx = mol.atoms.iter().map(|a| a.x).sum::<f64>() / (mol.atoms.len() as f64);
-                        let cy = mol.atoms.iter().map(|a| a.y).sum::<f64>() / (mol.atoms.len() as f64);
-                        let dir_ang = if (ax - cx).hypot(ay - cy) > 1e-3 {
-                            (ay - cy).atan2(ax - cx)
-                        } else {
-                            0.0
-                        };
-                        let r = blen / (2.0 * (std::f64::consts::PI / (n_sides as f64)).sin());
-                        let rcx = ax + r * dir_ang.cos();
-                        let rcy = ay + r * dir_ang.sin();
-                        let start_ang = (ay - rcy).atan2(ax - rcx);
-                        let step = std::f64::consts::TAU / (n_sides as f64);
-                        let mut prev_idx = ai;
-                        for k in 1..n_sides {
-                            let ang = start_ang + (k as f64) * step;
-                            let nid = *next_id;
-                            *next_id += 1;
-                            let mut na = ChemAtom::new(nid, 6);
-                            na.x = rcx + r * ang.cos();
-                            na.y = rcy + r * ang.sin();
-                            let new_idx = mol.atoms.len();
-                            mol.atoms.push(na);
-                            let bid = *next_id;
-                            *next_id += 1;
-                            let ord = if aromatic && k % 2 == 1 { 2 } else { 1 };
-                            mol.bonds.push(ChemBond {
-                                id: bid,
-                                begin_atom: prev_idx,
-                                end_atom: new_idx,
-                                order: ord,
-                                display: BondDisplay::Solid,
-                                visible: true,
-                                ignore_warnings: false,
-                            });
-                            prev_idx = new_idx;
-                        }
-                        let bid = *next_id;
-                        *next_id += 1;
-                        mol.bonds.push(ChemBond {
-                            id: bid,
-                            begin_atom: prev_idx,
-                            end_atom: ai,
-                            order: 1,
-                            display: BondDisplay::Solid,
-                            visible: true,
-                            ignore_warnings: false,
-                        });
-                    }
-                });
-                self.status_msg = format!("Fused spiro {n_sides}-membered ring");
-                return;
-            }
-            // 2. Bond-midpoint click -> Edge Ring Fusion (`P15`)
-            if let Some((mi, bi)) = self.hit_bond(dx, dy, 4.5) {
-                self.doc_mut().apply_scene_tx("Fuse Ring", |scene, next_id| {
-                    if let Some(mol) = scene.molecules.get_mut(mi) {
-                        let b = mol.bonds[bi].clone();
-                        let p1 = (mol.atoms[b.begin_atom].x, mol.atoms[b.begin_atom].y);
-                        let p2 = (mol.atoms[b.end_atom].x, mol.atoms[b.end_atom].y);
-                        let mx = 0.5 * (p1.0 + p2.0);
-                        let my = 0.5 * (p1.1 + p2.1);
-                        let edge_len = (p2.0 - p1.0).hypot(p2.1 - p1.1).max(blen);
-                        let cx = mol.atoms.iter().map(|a| a.x).sum::<f64>() / (mol.atoms.len() as f64);
-                        let cy = mol.atoms.iter().map(|a| a.y).sum::<f64>() / (mol.atoms.len() as f64);
-                        let ex = (p2.0 - p1.0) / edge_len;
-                        let ey = (p2.1 - p1.1) / edge_len;
-                        let mut nx = -ey;
-                        let mut ny = ex;
-                        if (mx + nx - cx).hypot(my + ny - cy) < (mx - nx - cx).hypot(my - ny - cy) {
-                            nx = -nx;
-                            ny = -ny;
-                        }
-                        let apothem = edge_len / (2.0 * (std::f64::consts::PI / (n_sides as f64)).tan());
-                        let r = edge_len / (2.0 * (std::f64::consts::PI / (n_sides as f64)).sin());
-                        let rcx = mx + nx * apothem;
-                        let rcy = my + ny * apothem;
-                        let a_start = (p2.1 - rcy).atan2(p2.0 - rcx);
-                        let mut step = std::f64::consts::TAU / (n_sides as f64);
-                        let test_ang = a_start + step;
-                        if (rcx + r * test_ang.cos() - p1.0).hypot(rcy + r * test_ang.sin() - p1.1) < 1.0 {
-                            step = -step;
-                        }
-                        let mut prev_idx = b.end_atom;
-                        for k in 1..=(n_sides - 2) {
-                            let ang = a_start + (k as f64) * step;
-                            let nid = *next_id;
-                            *next_id += 1;
-                            let mut na = ChemAtom::new(nid, 6);
-                            na.x = rcx + r * ang.cos();
-                            na.y = rcy + r * ang.sin();
-                            let new_idx = mol.atoms.len();
-                            mol.atoms.push(na);
-                            let bid = *next_id;
-                            *next_id += 1;
-                            let ord = if aromatic && (k % 2 == 0) { 2 } else { 1 };
-                            mol.bonds.push(ChemBond {
-                                id: bid,
-                                begin_atom: prev_idx,
-                                end_atom: new_idx,
-                                order: ord,
-                                display: BondDisplay::Solid,
-                                visible: true,
-                                ignore_warnings: false,
-                            });
-                            prev_idx = new_idx;
-                        }
-                        let bid = *next_id;
-                        *next_id += 1;
-                        mol.bonds.push(ChemBond {
-                            id: bid,
-                            begin_atom: prev_idx,
-                            end_atom: b.begin_atom,
-                            order: 1,
-                            display: BondDisplay::Solid,
-                            visible: true,
-                            ignore_warnings: false,
-                        });
-                    }
-                });
-                self.status_msg = format!("Fused {n_sides}-membered ring across bond");
-                return;
-            }
-            // 3. Empty canvas -> Stamp ring
-            let ring = Self::build_polygon_ring(n_sides, aromatic, cpd, dx, dy, blen);
-            self.doc_mut().stamp_molecule_tx(ring, "Ring");
+            self.place_ring_interaction(n_sides, aromatic, cpd, dx, dy, None);
             return;
         }
 
         match self.tool {
             Tool::TextLabel => {
-                if let Some((mi, ai)) = self.hit_atom(dx, dy, 6.0) {
+                if let Some((mi, ai)) = self.hit_atom(dx, dy, atol) {
                     self.open_inline_atom_edit(mi, ai);
                 } else if let Some(ci) = self.hit_caption(dx, dy) {
                     self.label_input = self.doc().scene.captions[ci].text.clone();
@@ -3353,10 +3610,44 @@ impl ChiralCraftApp {
                 }
             }
             Tool::AcyclicChain => {
-                let chain = Self::build_acyclic_chain(dx, dy, dx + blen * 3.2, dy, blen);
-                let nc = chain.atoms.len();
-                self.doc_mut().stamp_molecule_tx(chain, "Add Chain");
-                self.status_msg = format!("Added {nc}-carbon acyclic chain");
+                if let Some((mi, ai)) = self.hit_atom(dx, dy, atol) {
+                    let (ax, ay) = (self.doc().scene.molecules[mi].atoms[ai].x, self.doc().scene.molecules[mi].atoms[ai].y);
+                    let ang = Self::best_new_bond_angle(&self.doc().scene.molecules[mi], ai, 1, self.doc().settings.chain_angle_deg.to_radians());
+                    let chain = Self::build_acyclic_chain(ax, ay, ax + blen * 3.2 * ang.cos(), ay + blen * 3.2 * ang.sin(), blen);
+                    let added = chain.atoms.len().saturating_sub(1);
+                    self.doc_mut().apply_scene_tx("Attach Chain", |scene, next_id| {
+                        if let Some(mol) = scene.molecules.get_mut(mi) {
+                            let mut prev_idx = ai;
+                            for ca in chain.atoms.iter().skip(1) {
+                                let nid = *next_id;
+                                *next_id += 1;
+                                let mut na = ChemAtom::new(nid, 6);
+                                na.x = ca.x;
+                                na.y = ca.y;
+                                let new_idx = mol.atoms.len();
+                                mol.atoms.push(na);
+                                let bid = *next_id;
+                                *next_id += 1;
+                                mol.bonds.push(ChemBond {
+                                    id: bid,
+                                    begin_atom: prev_idx,
+                                    end_atom: new_idx,
+                                    order: 1,
+                                    display: BondDisplay::Solid,
+                                    visible: true,
+                                    ignore_warnings: false,
+                                });
+                                prev_idx = new_idx;
+                            }
+                        }
+                    });
+                    self.status_msg = format!("Attached {added}-carbon chain to atom");
+                } else {
+                    let chain = Self::build_acyclic_chain(dx, dy, dx + blen * 3.2, dy, blen);
+                    let nc = chain.atoms.len();
+                    self.doc_mut().stamp_molecule_tx(chain, "Add Chain");
+                    self.status_msg = format!("Added {nc}-carbon acyclic chain");
+                }
             }
             Tool::PenCurve => {
                 self.doc_mut().apply_scene_tx("Add Curve", |scene, next_id| {
@@ -3419,58 +3710,47 @@ impl ChiralCraftApp {
             t if self.is_bond_tool() => {
                 let (ord, disp) = self.current_bond_spec();
                 // ChiralCraft UX: atom vertices ALWAYS take hit priority over bond midpoints!
-                if let Some((mi, ai)) = self.hit_atom(dx, dy, 4.5) {
+                if let Some((mi, ai)) = self.hit_atom(dx, dy, atol) {
                     let chain_rad = self.doc().settings.chain_angle_deg.to_radians();
                     self.doc_mut().apply_scene_tx("Bond", |scene, next_id| {
                         if let Some(mol) = scene.molecules.get_mut(mi) {
                             let ax = mol.atoms[ai].x;
                             let ay = mol.atoms[ai].y;
-                            let mut sum_x = 0.0;
-                            let mut sum_y = 0.0;
-                            let mut deg = 0;
-                            let mut has_triple = false;
-                            for b in &mol.bonds {
-                                let nb = if b.begin_atom == ai {
-                                    Some(b.end_atom)
-                                } else if b.end_atom == ai {
-                                    Some(b.begin_atom)
+                            let ang = Self::best_new_bond_angle(mol, ai, ord, chain_rad);
+                            let nx = ax + blen * ang.cos();
+                            let ny = ay + blen * ang.sin();
+                            let merge_tol = (blen * 0.35).max(4.5);
+                            let existing_target = mol.atoms.iter().enumerate().find_map(|(idx, a)| {
+                                if idx != ai && (a.x - nx).hypot(a.y - ny) <= merge_tol {
+                                    Some(idx)
                                 } else {
                                     None
-                                };
-                                if let Some(n_i) = nb {
-                                    sum_x += mol.atoms[n_i].x - ax;
-                                    sum_y += mol.atoms[n_i].y - ay;
-                                    if b.order == 3 {
-                                        has_triple = true;
-                                    }
-                                    deg += 1;
                                 }
-                            }
-                            // IUPAC GR-1.6.2 / GR-3.4: 180° linear geometry for alkynes/nitriles, 120° chain angle otherwise
-                            let ang = if deg == 0 {
-                                -std::f64::consts::FRAC_PI_6
-                            } else if deg == 1 {
-                                if has_triple || ord == 3 {
-                                    sum_y.atan2(sum_x) + std::f64::consts::PI
-                                } else {
-                                    sum_y.atan2(sum_x) + chain_rad
+                            });
+                            let target_idx = if let Some(ei) = existing_target {
+                                if mol.bonds.iter().any(|b| {
+                                    (b.begin_atom == ai && b.end_atom == ei)
+                                        || (b.begin_atom == ei && b.end_atom == ai)
+                                }) {
+                                    return;
                                 }
+                                ei
                             } else {
-                                (-sum_y).atan2(-sum_x)
+                                let nid = *next_id;
+                                *next_id += 1;
+                                let mut na = ChemAtom::new(nid, 6);
+                                na.x = nx;
+                                na.y = ny;
+                                let new_idx = mol.atoms.len();
+                                mol.atoms.push(na);
+                                new_idx
                             };
-                            let nid = *next_id;
-                            *next_id += 1;
                             let bid = *next_id;
                             *next_id += 1;
-                            let mut na = ChemAtom::new(nid, 6);
-                            na.x = ax + blen * ang.cos();
-                            na.y = ay + blen * ang.sin();
-                            let new_idx = mol.atoms.len();
-                            mol.atoms.push(na);
                             mol.bonds.push(ChemBond {
                                 id: bid,
                                 begin_atom: ai,
-                                end_atom: new_idx,
+                                end_atom: target_idx,
                                 order: ord,
                                 display: disp,
                                 visible: true,
@@ -3478,22 +3758,71 @@ impl ChiralCraftApp {
                             });
                         }
                     });
-                } else if let Some((mi, bi)) = self.hit_bond(dx, dy, 4.5) {
-                    self.doc_mut().apply_scene_tx("Change Bond", |scene, _| {
-                        if let Some(b) = scene.molecules.get_mut(mi).and_then(|m| m.bonds.get_mut(bi)) {
-                            if t == Tool::SolidBond {
-                                b.order = match b.order {
-                                    1 => 2,
-                                    2 => 3,
-                                    _ => 1,
-                                };
-                                b.display = BondDisplay::Solid;
-                            } else {
-                                b.order = ord;
-                                b.display = disp;
+                } else if let Some((mi, bi)) = self.hit_bond(dx, dy, btol) {
+                    let cur_order = self.doc().scene.molecules.get(mi).and_then(|m| m.bonds.get(bi)).map(|b| b.order).unwrap_or(1);
+                    if matches!(t, Tool::DoubleBond | Tool::MultipleBond) && cur_order == 2 {
+                        // ChemDraw UX: clicking an existing double bond with Double Bond cycles its alignment!
+                        let cur = self.tab().double_bond_align.get(&(mi, bi)).copied().unwrap_or(DoubleBondAlign::Auto);
+                        let next = match cur {
+                            DoubleBondAlign::Auto => DoubleBondAlign::Center,
+                            DoubleBondAlign::Center => DoubleBondAlign::Left,
+                            DoubleBondAlign::Left => DoubleBondAlign::Right,
+                            DoubleBondAlign::Right => DoubleBondAlign::Auto,
+                        };
+                        self.tab_mut().double_bond_align.insert((mi, bi), next);
+                        self.status_msg = format!("Cycled double-bond alignment ({next:?})");
+                    } else {
+                        self.doc_mut().apply_scene_tx("Change Bond", |scene, _| {
+                            if let Some(b) = scene.molecules.get_mut(mi).and_then(|m| m.bonds.get_mut(bi)) {
+                                match t {
+                                    Tool::SolidBond => {
+                                        b.order = match b.order {
+                                            1 => 2,
+                                            2 => 3,
+                                            _ => 1,
+                                        };
+                                        b.display = BondDisplay::Solid;
+                                    }
+                                    Tool::WedgeBond => {
+                                        b.order = 1;
+                                        b.display = if b.display == BondDisplay::WedgeBegin {
+                                            BondDisplay::WedgeEnd
+                                        } else {
+                                            BondDisplay::WedgeBegin
+                                        };
+                                    }
+                                    Tool::HashWedgeBond => {
+                                        b.order = 1;
+                                        b.display = if b.display == BondDisplay::WedgedHashBegin {
+                                            BondDisplay::WedgedHashEnd
+                                        } else {
+                                            BondDisplay::WedgedHashBegin
+                                        };
+                                    }
+                                    Tool::HollowWedgeBond => {
+                                        b.order = 1;
+                                        b.display = if b.display == BondDisplay::HollowWedgeBegin {
+                                            BondDisplay::HollowWedgeEnd
+                                        } else {
+                                            BondDisplay::HollowWedgeBegin
+                                        };
+                                    }
+                                    Tool::DativeBond => {
+                                        if b.display == BondDisplay::Dative {
+                                            std::mem::swap(&mut b.begin_atom, &mut b.end_atom);
+                                        } else {
+                                            b.order = 1;
+                                            b.display = BondDisplay::Dative;
+                                        }
+                                    }
+                                    _ => {
+                                        b.order = ord;
+                                        b.display = disp;
+                                    }
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 } else {
                     let ang = -std::f64::consts::FRAC_PI_6;
                     let mut m = ChemMolecule::default();
@@ -3527,8 +3856,64 @@ impl ChiralCraftApp {
             return;
         }
         let blen = self.doc().settings.bond_length_pt;
+        let atol = self.atom_hit_tol();
+        let btol = self.bond_hit_tol();
+
+        // 0. Ring & Chair tools support drag-to-orient / drag-to-pick-fusion-side (never silently drop!)
+        if let Some((n_sides, aromatic, cpd)) = Self::ring_spec(self.tool) {
+            self.place_ring_interaction(n_sides, aromatic, cpd, sx, sy, Some((ex, ey)));
+            return;
+        }
+        if matches!(self.tool, Tool::Chair1 | Tool::Chair2) {
+            let mut m = stamp_template(BuiltinTemplate::CyclohexaneChair, sx, sy, blen);
+            if self.tool == Tool::Chair2 {
+                let all: Vec<usize> = (0..m.atoms.len()).collect();
+                flip_atoms_preserving_stereo(&mut m, &all, FlipAxis::Horizontal, false);
+            }
+            self.doc_mut().stamp_molecule_tx(m, "Cyclohexane Chair");
+            self.status_msg = "Stamped Cyclohexane Chair".to_string();
+            return;
+        }
+
         match self.tool {
             Tool::Marquee | Tool::Lasso => {
+                // Single-atom vertex drag (with auto-weld if dropped onto another atom in the same molecule!)
+                if let Some((mi, ai)) = self.dragging_single_atom {
+                    let drop_hit = self.hit_atom(ex, ey, atol);
+                    self.doc_mut().apply_scene_tx("Move Atom", |scene, _| {
+                        if let Some(mol) = scene.molecules.get_mut(mi) {
+                            if ai < mol.atoms.len() {
+                                if let Some((tmi, tai)) = drop_hit {
+                                    if tmi == mi && tai != ai && tai < mol.atoms.len() {
+                                        // Weld atom `ai` into `tai`!
+                                        for b in &mut mol.bonds {
+                                            if b.begin_atom == ai { b.begin_atom = tai; }
+                                            if b.end_atom == ai { b.end_atom = tai; }
+                                        }
+                                        // Remove self-loops and duplicate bonds
+                                        mol.bonds.retain(|b| b.begin_atom != b.end_atom);
+                                        let mut seen_pairs = std::collections::BTreeSet::new();
+                                        mol.bonds.retain(|b| {
+                                            let key = (b.begin_atom.min(b.end_atom), b.begin_atom.max(b.end_atom));
+                                            seen_pairs.insert(key)
+                                        });
+                                        mol.atoms.remove(ai);
+                                        for b in &mut mol.bonds {
+                                            if b.begin_atom > ai { b.begin_atom -= 1; }
+                                            if b.end_atom > ai { b.end_atom -= 1; }
+                                        }
+                                        return;
+                                    }
+                                }
+                                mol.atoms[ai].x = ex;
+                                mol.atoms[ai].y = ey;
+                            }
+                        }
+                    });
+                    self.sanitize_state();
+                    self.status_msg = "Moved atom vertex".to_string();
+                    return;
+                }
                 if let Some(ci) = self.dragging_caption {
                     let dx = ex - sx;
                     let dy = ey - sy;
@@ -3682,11 +4067,104 @@ impl ChiralCraftApp {
                     }
                 }
             }
+            Tool::Eraser => {
+                // Drag-to-erase: erase all atoms & bonds swept along the eraser stroke in one Undo transaction!
+                let mut stroke = self.eraser_pts.clone();
+                if stroke.is_empty() {
+                    stroke.push((sx, sy));
+                    stroke.push((ex, ey));
+                }
+                let mut hit_atoms: Vec<(usize, usize)> = Vec::new();
+                let mut hit_bonds: Vec<(usize, usize)> = Vec::new();
+                for &(px, py) in &stroke {
+                    if let Some(a) = self.hit_atom(px, py, atol) {
+                        if !hit_atoms.contains(&a) {
+                            hit_atoms.push(a);
+                        }
+                    } else if let Some(b) = self.hit_bond(px, py, btol) {
+                        if !hit_bonds.contains(&b) {
+                            hit_bonds.push(b);
+                        }
+                    }
+                }
+                if !hit_atoms.is_empty() || !hit_bonds.is_empty() {
+                    let erased_cnt = hit_atoms.len() + hit_bonds.len();
+                    self.doc_mut().apply_scene_tx("Erase Stroke", |scene, _| {
+                        // Erase bonds first (reverse index order per molecule)
+                        hit_bonds.sort_by(|a, b| b.cmp(a));
+                        for (mi, bi) in hit_bonds {
+                            if let Some(mol) = scene.molecules.get_mut(mi) {
+                                if bi < mol.bonds.len() {
+                                    mol.bonds.remove(bi);
+                                }
+                            }
+                        }
+                        // Erase atoms in reverse index order per molecule
+                        hit_atoms.sort_by(|a, b| b.cmp(a));
+                        for (mi, ai) in hit_atoms {
+                            if let Some(mol) = scene.molecules.get_mut(mi) {
+                                if ai < mol.atoms.len() {
+                                    mol.bonds.retain(|b| b.begin_atom != ai && b.end_atom != ai);
+                                    mol.atoms.remove(ai);
+                                    for b in &mut mol.bonds {
+                                        if b.begin_atom > ai { b.begin_atom -= 1; }
+                                        if b.end_atom > ai { b.end_atom -= 1; }
+                                    }
+                                }
+                            }
+                        }
+                        scene.molecules.retain(|m| !m.atoms.is_empty());
+                    });
+                    self.sanitize_state();
+                    self.status_msg = format!("Erased {erased_cnt} atom(s)/bond(s)");
+                }
+            }
             Tool::AcyclicChain => {
-                let chain = Self::build_acyclic_chain(sx, sy, ex, ey, blen);
-                let nc = chain.atoms.len();
-                self.doc_mut().stamp_molecule_tx(chain, "Add Chain");
-                self.status_msg = format!("Added {nc}-carbon acyclic chain");
+                let start_atom = self.drag_start_atom.or_else(|| self.hit_atom(sx, sy, atol));
+                if let Some((mi, ai)) = start_atom {
+                    let (ax, ay) = self
+                        .doc()
+                        .scene
+                        .molecules
+                        .get(mi)
+                        .and_then(|m| m.atoms.get(ai))
+                        .map(|a| (a.x, a.y))
+                        .unwrap_or((sx, sy));
+                    let chain = Self::build_acyclic_chain(ax, ay, ex, ey, blen);
+                    let added = chain.atoms.len().saturating_sub(1);
+                    self.doc_mut().apply_scene_tx("Attach Chain", |scene, next_id| {
+                        if let Some(mol) = scene.molecules.get_mut(mi) {
+                            let mut prev_idx = ai;
+                            for ca in chain.atoms.iter().skip(1) {
+                                let nid = *next_id;
+                                *next_id += 1;
+                                let mut na = ChemAtom::new(nid, 6);
+                                na.x = ca.x;
+                                na.y = ca.y;
+                                let new_idx = mol.atoms.len();
+                                mol.atoms.push(na);
+                                let bid = *next_id;
+                                *next_id += 1;
+                                mol.bonds.push(ChemBond {
+                                    id: bid,
+                                    begin_atom: prev_idx,
+                                    end_atom: new_idx,
+                                    order: 1,
+                                    display: BondDisplay::Solid,
+                                    visible: true,
+                                    ignore_warnings: false,
+                                });
+                                prev_idx = new_idx;
+                            }
+                        }
+                    });
+                    self.status_msg = format!("Attached {added}-carbon chain");
+                } else {
+                    let chain = Self::build_acyclic_chain(sx, sy, ex, ey, blen);
+                    let nc = chain.atoms.len();
+                    self.doc_mut().stamp_molecule_tx(chain, "Add Chain");
+                    self.status_msg = format!("Added {nc}-carbon acyclic chain");
+                }
             }
             Tool::PenCurve => {
                 self.doc_mut().apply_scene_tx("Add Curve", |scene, next_id| {
@@ -3749,7 +4227,7 @@ impl ChiralCraftApp {
                 let fixed_ang = self.doc().settings.fixed_angles;
                 let tool_now = self.tool;
                 if let Some((mi, ai)) = self.drag_start_atom {
-                    let end_hit = self.hit_atom(ex, ey, 6.5);
+                    let mut end_hit = self.hit_atom(ex, ey, atol.max(6.5));
                     let (ax, ay) = self
                         .doc()
                         .scene
@@ -3763,6 +4241,16 @@ impl ChiralCraftApp {
                     } else {
                         snap_bond_endpoint(ax, ay, ex, ey, fixed_len, fixed_ang, blen)
                     };
+                    // Critical ChemDraw UX: if the SNAPPED endpoint lands on an existing atom (e.g. closing a ring!),
+                    // automatically fuse/bond to that existing atom instead of creating a duplicate overlapping carbon!
+                    if end_hit.is_none() {
+                        let merge_tol = (blen * 0.38).max(5.5);
+                        if let Some(snapped_hit) = self.hit_atom(nex, ney, merge_tol) {
+                            if snapped_hit != (mi, ai) {
+                                end_hit = Some(snapped_hit);
+                            }
+                        }
+                    }
                     let mut merged_other = false;
                     self.doc_mut().apply_scene_tx("Bond", |scene, next_id| {
                         // Case A: Connecting atoms across TWO distinct molecules (e.g. drawn + imported!) -> merge!
@@ -6497,10 +6985,12 @@ impl ChiralCraftApp {
                     }
                     if view_rect.contains(pos) && self.mdi_drag == MdiDragMode::None {
                         let (dx, dy) = self.screen_to_doc(page_origin, pos);
+                        let atol = self.atom_hit_tol();
+                        let btol = self.bond_hit_tol();
                         self.cursor_doc_pos = Some((dx, dy));
-                        self.hovered_atom = self.hit_atom(dx, dy, 5.5);
+                        self.hovered_atom = self.hit_atom(dx, dy, atol);
                         self.hovered_bond = if self.hovered_atom.is_none() {
-                            self.hit_bond(dx, dy, 4.5)
+                            self.hit_bond(dx, dy, btol)
                         } else {
                             None
                         };
@@ -6662,10 +7152,22 @@ impl ChiralCraftApp {
                 };
 
                 let shift_held = ctx.input(|i| i.modifiers.shift);
+                let alt_held = ctx.input(|i| i.modifiers.alt);
+                let atol = self.atom_hit_tol();
+                let mut double_click_consumed = false;
                 if response.double_clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         if title_rect.contains(pos) && !close_r.contains(pos) && !max_r.contains(pos) && !min_r.contains(pos) {
                             self.tab_mut().maximized = !self.tab().maximized;
+                            double_click_consumed = true;
+                        } else if view_rect.contains(pos)
+                            && matches!(self.tool, Tool::Marquee | Tool::Lasso | Tool::TextLabel)
+                        {
+                            let (dx, dy) = self.screen_to_doc(page_origin, pos);
+                            if let Some((mi, ai)) = self.hit_atom(dx, dy, atol) {
+                                self.open_inline_atom_edit(mi, ai);
+                                double_click_consumed = true;
+                            }
                         }
                     }
                 }
@@ -6694,11 +7196,23 @@ impl ChiralCraftApp {
                                 let (dx, dy) = self.screen_to_doc(page_origin, pos);
                                 self.drag_start_canvas = Some((dx, dy));
                                 self.drag_cur_canvas = Some((dx, dy));
-                                self.drag_start_atom = self.hit_atom(dx, dy, 6.0);
+                                self.drag_start_atom = self.hit_atom(dx, dy, atol);
+                                self.dragging_single_atom = None;
                                 self.dragging_caption = None;
+                                self.eraser_pts.clear();
+                                if self.tool == Tool::Eraser {
+                                    self.eraser_pts.push((dx, dy));
+                                }
                                 if matches!(self.tool, Tool::Marquee | Tool::Lasso) {
-                                    if self.hit_selected_molecule(dx, dy) {
+                                    if alt_held && self.drag_start_atom.is_some() {
+                                        self.dragging_single_atom = self.drag_start_atom;
+                                        self.dragging_selected_move = false;
+                                    } else if self.hit_selected_molecule(dx, dy) {
                                         self.dragging_selected_move = true;
+                                    } else if let Some((mi, ai)) = self.drag_start_atom {
+                                        // Dragging an unselected atom vertex directly reshapes that vertex!
+                                        self.dragging_single_atom = Some((mi, ai));
+                                        self.dragging_selected_move = false;
                                     } else if let Some(mi) = self.hit_molecule_bbox(dx, dy) {
                                         if !shift_held {
                                             self.tab_mut().selected_mols = vec![mi];
@@ -6718,7 +7232,7 @@ impl ChiralCraftApp {
                                 }
                                 self.drag_ctrl_copy = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
                                 self.lasso_pts.clear();
-                                if self.tool == Tool::Lasso && !self.dragging_selected_move && self.dragging_caption.is_none() {
+                                if self.tool == Tool::Lasso && !self.dragging_selected_move && self.dragging_caption.is_none() && self.dragging_single_atom.is_none() {
                                     self.lasso_pts.push((dx, dy));
                                 }
                             }
@@ -6726,10 +7240,18 @@ impl ChiralCraftApp {
                             let (dx, dy) = self.screen_to_doc(page_origin, pos);
                             self.drag_start_canvas = Some((dx, dy));
                             self.drag_cur_canvas = Some((dx, dy));
-                            self.drag_start_atom = self.hit_atom(dx, dy, 6.0);
+                            self.drag_start_atom = self.hit_atom(dx, dy, atol);
+                            self.dragging_single_atom = None;
                             self.dragging_caption = None;
+                            self.eraser_pts.clear();
+                            if self.tool == Tool::Eraser {
+                                self.eraser_pts.push((dx, dy));
+                            }
                             if matches!(self.tool, Tool::Marquee | Tool::Lasso) {
-                                if let Some(mi) = self.hit_molecule_bbox(dx, dy) {
+                                if let Some((mi, ai)) = self.drag_start_atom {
+                                    self.dragging_single_atom = Some((mi, ai));
+                                    self.dragging_selected_move = false;
+                                } else if let Some(mi) = self.hit_molecule_bbox(dx, dy) {
                                     if !shift_held {
                                         self.tab_mut().selected_mols = vec![mi];
                                     } else if !self.tab().selected_mols.contains(&mi) {
@@ -6748,7 +7270,7 @@ impl ChiralCraftApp {
                             }
                             self.drag_ctrl_copy = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
                             self.lasso_pts.clear();
-                            if self.tool == Tool::Lasso && !self.dragging_selected_move && self.dragging_caption.is_none() {
+                            if self.tool == Tool::Lasso && !self.dragging_selected_move && self.dragging_caption.is_none() && self.dragging_single_atom.is_none() {
                                 self.lasso_pts.push((dx, dy));
                             }
                         }
@@ -6829,9 +7351,13 @@ impl ChiralCraftApp {
                                 if let Some(pos) = response.interact_pointer_pos() {
                                     let pt = self.screen_to_doc(page_origin, pos);
                                     self.drag_cur_canvas = Some(pt);
-                                    if self.tool == Tool::Lasso && !self.dragging_selected_move {
+                                    if self.tool == Tool::Lasso && !self.dragging_selected_move && self.dragging_single_atom.is_none() {
                                         if self.lasso_pts.last().map(|&(lx, ly)| (lx - pt.0).hypot(ly - pt.1) > 2.0).unwrap_or(true) {
                                             self.lasso_pts.push(pt);
+                                        }
+                                    } else if self.tool == Tool::Eraser {
+                                        if self.eraser_pts.last().map(|&(lx, ly)| (lx - pt.0).hypot(ly - pt.1) > 2.0).unwrap_or(true) {
+                                            self.eraser_pts.push(pt);
                                         }
                                     }
                                 }
@@ -6851,11 +7377,13 @@ impl ChiralCraftApp {
                     self.drag_start_canvas = None;
                     self.drag_cur_canvas = None;
                     self.drag_start_atom = None;
+                    self.dragging_single_atom = None;
+                    self.eraser_pts.clear();
                     self.dragging_selected_move = false;
                     self.dragging_caption = None;
                     self.drag_ctrl_copy = false;
                     self.lasso_pts.clear();
-                } else if response.clicked() {
+                } else if response.clicked() && !double_click_consumed {
                     if let Some(pos) = response.interact_pointer_pos() {
                         if close_r.contains(pos) {
                             self.close_active_tab();
@@ -7795,11 +8323,68 @@ impl ChiralCraftApp {
                     }
                 }
 
-                // Live marquee / freehand lasso / molecule & caption move ghost / cleavage / acyclic chain / snapped bond drag preview
+                // Live hover ghost preview (for Ring tools and Bond-tool atom hover before clicking!)
+                if self.drag_start_canvas.is_none() && self.mdi_drag == MdiDragMode::None {
+                    let blen = self.doc().settings.bond_length_pt;
+                    let ghost_col = Color32::from_rgba_unmultiplied(0, 120, 225, 115);
+                    if let Some((n_sides, _, _)) = Self::ring_spec(self.tool) {
+                        if let Some((mi, ai)) = self.hovered_atom {
+                            if let Some(mol) = self.doc().scene.molecules.get(mi) {
+                                let verts = Self::compute_spiro_ring_vertices(mol, ai, n_sides, blen, None);
+                                let spts: Vec<Pos2> = verts.iter().map(|&(x, y)| self.doc_to_screen(page_origin, x, y)).collect();
+                                for i in 0..spts.len() {
+                                    pp.line_segment([spts[i], spts[(i + 1) % spts.len()]], Stroke::new(1.3_f32, ghost_col));
+                                }
+                            }
+                        } else if let Some((mi, bi)) = self.hovered_bond {
+                            if let Some(mol) = self.doc().scene.molecules.get(mi) {
+                                let verts = Self::compute_edge_fused_ring_vertices(mol, bi, n_sides, blen, None);
+                                let spts: Vec<Pos2> = verts.iter().map(|&(x, y)| self.doc_to_screen(page_origin, x, y)).collect();
+                                for i in 0..spts.len() {
+                                    pp.line_segment([spts[i], spts[(i + 1) % spts.len()]], Stroke::new(1.3_f32, ghost_col));
+                                }
+                            }
+                        }
+                    } else if self.is_bond_tool() {
+                        if let Some((mi, ai)) = self.hovered_atom {
+                            if let Some(mol) = self.doc().scene.molecules.get(mi) {
+                                if let Some(a) = mol.atoms.get(ai) {
+                                    let (ord, _) = self.current_bond_spec();
+                                    let ang = Self::best_new_bond_angle(mol, ai, ord, self.doc().settings.chain_angle_deg.to_radians());
+                                    let sp1 = self.doc_to_screen(page_origin, a.x, a.y);
+                                    let sp2 = self.doc_to_screen(page_origin, a.x + blen * ang.cos(), a.y + blen * ang.sin());
+                                    pp.line_segment([sp1, sp2], Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(0, 120, 225, 95)));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Live marquee / freehand lasso / single-atom / molecule & caption move ghost / ring drag / eraser / acyclic chain / snapped bond drag preview
                 if let (Some((sx, sy)), Some((ex, ey))) = (self.drag_start_canvas, self.drag_cur_canvas) {
                     let p1 = self.doc_to_screen(page_origin, sx, sy);
                     let p2 = self.doc_to_screen(page_origin, ex, ey);
-                    if self.dragging_selected_move && !self.tab().selected_mols.is_empty() {
+                    let blen = self.doc().settings.bond_length_pt;
+                    let atol = self.atom_hit_tol();
+                    let btol = self.bond_hit_tol();
+                    if let Some((mi, ai)) = self.dragging_single_atom {
+                        let ghost = Color32::from_rgba_unmultiplied(0, 120, 225, 195);
+                        if let Some(mol) = self.doc().scene.molecules.get(mi) {
+                            for b in &mol.bonds {
+                                let other = if b.begin_atom == ai {
+                                    Some(b.end_atom)
+                                } else if b.end_atom == ai {
+                                    Some(b.begin_atom)
+                                } else {
+                                    None
+                                };
+                                if let Some(oi) = other.and_then(|o| mol.atoms.get(o)) {
+                                    pp.line_segment([self.doc_to_screen(page_origin, oi.x, oi.y), p2], Stroke::new(lw.max(1.5), ghost));
+                                }
+                            }
+                            pp.circle_stroke(p2, 5.0 * self.zoom, Stroke::new(1.4_f32, ghost));
+                        }
+                    } else if self.dragging_selected_move && !self.tab().selected_mols.is_empty() {
                         let ddx = ex - sx;
                         let ddy = ey - sy;
                         let ghost = Color32::from_rgba_unmultiplied(0, 110, 215, 165);
@@ -7855,8 +8440,35 @@ impl ChiralCraftApp {
                         pp.rect_stroke(Rect::from_two_pos(p1, p2), 0.0, Stroke::new(1.0_f32, Color32::from_rgb(0, 120, 215)), egui::StrokeKind::Outside);
                     } else if self.tool == Tool::Fragmentation {
                         pp.line_segment([p1, p2], Stroke::new(1.6_f32, Color32::RED));
+                    } else if self.tool == Tool::Eraser && self.eraser_pts.len() >= 2 {
+                        let spts: Vec<Pos2> = self.eraser_pts.iter().map(|&(x, y)| self.doc_to_screen(page_origin, x, y)).collect();
+                        for w in spts.windows(2) {
+                            pp.line_segment([w[0], w[1]], Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(220, 45, 45, 165)));
+                        }
+                    } else if let Some((n_sides, _, _)) = Self::ring_spec(self.tool) {
+                        let ring_col = Color32::from_rgb(0, 110, 220);
+                        let verts = if let Some((mi, ai)) = self.hit_atom(sx, sy, atol) {
+                            self.doc().scene.molecules.get(mi).map(|m| Self::compute_spiro_ring_vertices(m, ai, n_sides, blen, Some((ex, ey))))
+                        } else if let Some((mi, bi)) = self.hit_bond(sx, sy, btol) {
+                            self.doc().scene.molecules.get(mi).map(|m| Self::compute_edge_fused_ring_vertices(m, bi, n_sides, blen, Some((ex, ey))))
+                        } else {
+                            let rot = if (ex - sx).hypot(ey - sy) > 4.0 { (ey - sy).atan2(ex - sx) } else { -std::f64::consts::FRAC_PI_2 };
+                            let m = Self::build_polygon_ring_angled(n_sides, false, false, sx, sy, blen, rot);
+                            Some(m.atoms.iter().map(|a| (a.x, a.y)).collect())
+                        };
+                        if let Some(vs) = verts {
+                            let spts: Vec<Pos2> = vs.iter().map(|&(x, y)| self.doc_to_screen(page_origin, x, y)).collect();
+                            for i in 0..spts.len() {
+                                pp.line_segment([spts[i], spts[(i + 1) % spts.len()]], Stroke::new(1.5_f32, ring_col));
+                            }
+                        }
                     } else if self.tool == Tool::AcyclicChain {
-                        let prev = Self::build_acyclic_chain(sx, sy, ex, ey, self.doc().settings.bond_length_pt);
+                        let (ax, ay) = self
+                            .drag_start_atom
+                            .and_then(|(mi, ai)| self.doc().scene.molecules.get(mi).and_then(|m| m.atoms.get(ai)))
+                            .map(|a| (a.x, a.y))
+                            .unwrap_or((sx, sy));
+                        let prev = Self::build_acyclic_chain(ax, ay, ex, ey, blen);
                         for b in &prev.bonds {
                             let a1 = &prev.atoms[b.begin_atom];
                             let a2 = &prev.atoms[b.end_atom];
@@ -7869,8 +8481,8 @@ impl ChiralCraftApp {
                             .and_then(|(mi, ai)| self.doc().scene.molecules.get(mi).and_then(|m| m.atoms.get(ai)))
                             .map(|a| (a.x, a.y))
                             .unwrap_or((sx, sy));
-                        let end_snap = self.hit_atom(ex, ey, 6.5);
-                        let (nex, ney) = if let Some((emi, eai)) = end_snap {
+                        let mut end_snap = self.hit_atom(ex, ey, atol.max(6.5));
+                        let (mut nex, mut ney) = if let Some((emi, eai)) = end_snap {
                             self.doc()
                                 .scene
                                 .molecules
@@ -7883,9 +8495,20 @@ impl ChiralCraftApp {
                                 ax, ay, ex, ey,
                                 self.doc().settings.fixed_lengths,
                                 self.doc().settings.fixed_angles,
-                                self.doc().settings.bond_length_pt,
+                                blen,
                             )
                         };
+                        if end_snap.is_none() {
+                            if let Some((emi, eai)) = self.hit_atom(nex, ney, (blen * 0.38).max(5.5)) {
+                                if self.drag_start_atom != Some((emi, eai)) {
+                                    end_snap = Some((emi, eai));
+                                    if let Some(a) = self.doc().scene.molecules.get(emi).and_then(|m| m.atoms.get(eai)) {
+                                        nex = a.x;
+                                        ney = a.y;
+                                    }
+                                }
+                            }
+                        }
                         let sp1 = self.doc_to_screen(page_origin, ax, ay);
                         let sp2 = self.doc_to_screen(page_origin, nex, ney);
                         pp.line_segment([sp1, sp2], Stroke::new(1.5_f32, Color32::from_rgb(0, 100, 210)));
@@ -10616,5 +11239,125 @@ mod tests {
         let w_b = chiralcraft_doc::check_structure(&h0.synthon_b, &[]);
         assert!(w_a.is_empty(), "Synthon A must have zero overlap warnings: {w_a:?}");
         assert!(w_b.is_empty(), "Synthon B must have zero overlap warnings: {w_b:?}");
+    }
+
+    #[test]
+    fn test_chemdraw_drawing_ux_all_8_fixes() {
+        let mut app = ChiralCraftApp::new();
+        let bl = app.doc().settings.bond_length_pt;
+
+        // 1. Ring tool drag (>4pt) must NEVER silently drop the ring!
+        app.tool = Tool::Benzene;
+        app.handle_canvas_drag_release(120.0, 120.0, 145.0, 130.0, false);
+        assert_eq!(app.doc().scene.molecules.len(), 1, "Dragged Benzene ring must be placed");
+        assert_eq!(app.doc().scene.molecules[0].atoms.len(), 6);
+
+        // Edge-fuse a second ring via drag across bond 0 (choosing side)
+        let b0 = app.doc().scene.molecules[0].bonds[0].clone();
+        let p1 = (app.doc().scene.molecules[0].atoms[b0.begin_atom].x, app.doc().scene.molecules[0].atoms[b0.begin_atom].y);
+        let p2 = (app.doc().scene.molecules[0].atoms[b0.end_atom].x, app.doc().scene.molecules[0].atoms[b0.end_atom].y);
+        let mx = 0.5 * (p1.0 + p2.0);
+        let my = 0.5 * (p1.1 + p2.1);
+        app.handle_canvas_drag_release(mx, my, mx + 25.0, my - 20.0, false);
+        assert_eq!(app.doc().scene.molecules.len(), 1, "Fused ring stays in same molecule");
+        assert_eq!(app.doc().scene.molecules[0].atoms.len(), 10, "Naphthalene has 10 carbons");
+
+        // 2. SolidBond click-chain alternates zig-zag (does NOT curl into a triangle!) & quaternary carbon has zero overlap!
+        app.doc_mut().apply_scene_tx("Clear", |s, _| { s.molecules.clear(); });
+        app.tool = Tool::SolidBond;
+        app.handle_canvas_click(100.0, 100.0, false); // 2 atoms
+        for _ in 0..3 {
+            let last = app.doc().scene.molecules[0].atoms.last().unwrap().clone();
+            app.handle_canvas_click(last.x, last.y, false);
+        }
+        let m_chain = &app.doc().scene.molecules[0];
+        assert_eq!(m_chain.atoms.len(), 5, "Pentane chain should have 5 carbons");
+        // Verify chain extends horizontally (zig-zag), NOT curled back to atom 0!
+        let end_dist = (m_chain.atoms[4].x - m_chain.atoms[0].x).hypot(m_chain.atoms[4].y - m_chain.atoms[0].y);
+        assert!(end_dist > bl * 2.5, "Zig-zag pentane must extend >2.5 bond lengths, got {end_dist:.1}");
+
+        // Click central atom twice more to make quaternary carbon -> no two neighbors overlap!
+        let c2 = (m_chain.atoms[2].x, m_chain.atoms[2].y);
+        app.handle_canvas_click(c2.0, c2.1, false);
+        app.handle_canvas_click(c2.0, c2.1, false);
+        let m_quat = &app.doc().scene.molecules[0];
+        let mut min_pair = f64::INFINITY;
+        for i in 0..m_quat.atoms.len() {
+            for j in (i + 1)..m_quat.atoms.len() {
+                min_pair = min_pair.min((m_quat.atoms[i].x - m_quat.atoms[j].x).hypot(m_quat.atoms[i].y - m_quat.atoms[j].y));
+            }
+        }
+        assert!(min_pair > bl * 0.65, "Quaternary substituents must not overlap (min dist {min_pair:.2})");
+
+        // 3. Closing a ring bond-by-bond via snapped endpoint auto-fuses into 6 atoms / 6 bonds (not 7 atoms!)
+        app.doc_mut().apply_scene_tx("Clear", |s, _| { s.molecules.clear(); });
+        // Build 5 edges of a regular hexagon, then drag the 6th bond from atom 5 toward atom 0 (slightly overshooting so raw cursor != atom 0, but snapped endpoint lands on atom 0!)
+        let mut open_hex = ChiralCraftApp::build_polygon_ring(6, false, false, 200.0, 200.0, bl);
+        open_hex.bonds.pop(); // remove closing bond (5 -> 0)
+        app.doc_mut().stamp_molecule_tx(open_hex, "Open Hex");
+        let a5 = (app.doc().scene.molecules[0].atoms[5].x, app.doc().scene.molecules[0].atoms[5].y);
+        let a0 = (app.doc().scene.molecules[0].atoms[0].x, app.doc().scene.molecules[0].atoms[0].y);
+        // Drag past a0 by 1.8x bond length along the a5->a0 direction so raw cursor misses a0,
+        // while fixed-length snapped endpoint lands dead-on a0!
+        let over_x = a5.0 + (a0.0 - a5.0) * 1.85;
+        let over_y = a5.1 + (a0.1 - a5.1) * 1.85;
+        app.tool = Tool::SolidBond;
+        app.drag_start_atom = Some((0, 5));
+        app.handle_canvas_drag_release(a5.0, a5.1, over_x, over_y, false);
+        app.drag_start_atom = None;
+        assert_eq!(app.doc().scene.molecules[0].atoms.len(), 6, "Closing 6th bond must auto-fuse into 6 atoms (not 7!)");
+        assert_eq!(app.doc().scene.molecules[0].bonds.len(), 6, "Ring must now have 6 bonds");
+
+        // 4. AcyclicChain dragged off an existing atom attaches directly into that molecule!
+        let before_atoms = app.doc().scene.molecules[0].atoms.len();
+        app.tool = Tool::AcyclicChain;
+        app.drag_start_atom = Some((0, 0));
+        app.handle_canvas_drag_release(a0.0, a0.1, a0.0 + bl * 3.0, a0.1, false);
+        app.drag_start_atom = None;
+        assert_eq!(app.doc().scene.molecules.len(), 1, "Chain attached to atom must stay 1 molecule");
+        assert!(app.doc().scene.molecules[0].atoms.len() > before_atoms + 1);
+
+        // 5. Clicking a bond repeatedly with Wedge / Hash flips direction (Begin <-> End)!
+        let wb = app.doc().scene.molecules[0].bonds[0].clone();
+        let wm_x = 0.5 * (app.doc().scene.molecules[0].atoms[wb.begin_atom].x + app.doc().scene.molecules[0].atoms[wb.end_atom].x);
+        let wm_y = 0.5 * (app.doc().scene.molecules[0].atoms[wb.begin_atom].y + app.doc().scene.molecules[0].atoms[wb.end_atom].y);
+        app.tool = Tool::WedgeBond;
+        app.handle_canvas_click(wm_x, wm_y, false);
+        assert_eq!(app.doc().scene.molecules[0].bonds[0].display, BondDisplay::WedgeBegin);
+        app.handle_canvas_click(wm_x, wm_y, false);
+        assert_eq!(app.doc().scene.molecules[0].bonds[0].display, BondDisplay::WedgeEnd, "Second click must flip wedge direction");
+        app.tool = Tool::HashWedgeBond;
+        app.handle_canvas_click(wm_x, wm_y, false);
+        assert_eq!(app.doc().scene.molecules[0].bonds[0].display, BondDisplay::WedgedHashBegin);
+        app.handle_canvas_click(wm_x, wm_y, false);
+        assert_eq!(app.doc().scene.molecules[0].bonds[0].display, BondDisplay::WedgedHashEnd, "Second click must flip hash direction");
+
+        // 6. Single-atom drag moves ONLY that atom vertex!
+        let old_a1 = (app.doc().scene.molecules[0].atoms[1].x, app.doc().scene.molecules[0].atoms[1].y);
+        let old_a2 = (app.doc().scene.molecules[0].atoms[2].x, app.doc().scene.molecules[0].atoms[2].y);
+        app.tool = Tool::Marquee;
+        app.dragging_single_atom = Some((0, 1));
+        app.handle_canvas_drag_release(old_a1.0, old_a1.1, old_a1.0 + 10.0, old_a1.1 + 8.0, false);
+        app.dragging_single_atom = None;
+        assert!((app.doc().scene.molecules[0].atoms[1].x - (old_a1.0 + 10.0)).abs() < 1e-6);
+        assert!((app.doc().scene.molecules[0].atoms[2].x - old_a2.0).abs() < 1e-6, "Other atoms must remain fixed");
+
+        // 7. Eraser drag-to-erase sweeps out atoms in one Undo step!
+        let atoms_before_erase = app.doc().scene.molecules[0].atoms.len();
+        let last_a = (app.doc().scene.molecules[0].atoms.last().unwrap().x, app.doc().scene.molecules[0].atoms.last().unwrap().y);
+        app.tool = Tool::Eraser;
+        app.eraser_pts = vec![(last_a.0 - 8.0, last_a.1), (last_a.0, last_a.1), (last_a.0 + 8.0, last_a.1)];
+        app.handle_canvas_drag_release(last_a.0 - 8.0, last_a.1, last_a.0 + 8.0, last_a.1, false);
+        app.eraser_pts.clear();
+        assert_eq!(app.doc().scene.molecules[0].atoms.len(), atoms_before_erase - 1);
+        assert!(app.doc_mut().undo());
+        assert_eq!(app.doc().scene.molecules[0].atoms.len(), atoms_before_erase);
+
+        // 8. Pixel-scaled hit tolerance adapts cleanly to low vs high zoom!
+        app.zoom = 0.75;
+        let low_z_tol = app.atom_hit_tol();
+        app.zoom = 2.0;
+        let hi_z_tol = app.atom_hit_tol();
+        assert!(low_z_tol > hi_z_tol * 2.0, "Low zoom must expand doc-space hit radius ({low_z_tol} vs {hi_z_tol})");
     }
 }
