@@ -62,7 +62,13 @@ fn config_file_path() -> Option<PathBuf> {
             return Some(PathBuf::from(xdg).join("chiralcraft").join("config.json"));
         }
     }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.trim().is_empty() {
+            return Some(PathBuf::from(appdata).join("chiralcraft").join("config.json"));
+        }
+    }
     std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(|h| PathBuf::from(h).join(".config").join("chiralcraft").join("config.json"))
 }
@@ -75,6 +81,8 @@ fn json_esc(s: &str) -> String {
             '\\' => o.push_str("\\\\"),
             '\n' => o.push_str("\\n"),
             '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
             c => o.push(c),
         }
     }
@@ -97,19 +105,27 @@ impl UserConfig {
             cfg.theme = s.to_string();
         }
         if let Some(JsonValue::Number(n)) = root.get("png_dpi") {
-            cfg.png_dpi = (*n as u32).clamp(72, 1200);
+            if n.is_finite() {
+                cfg.png_dpi = (n.clamp(72.0, 1200.0)) as u32;
+            }
         }
         if let Some(JsonValue::Number(n)) = root.get("svg_padding_pt") {
-            cfg.svg_padding_pt = n.clamp(4.0, 80.0);
+            if n.is_finite() {
+                cfg.svg_padding_pt = n.clamp(4.0, 80.0);
+            }
         }
         if let Some(s) = root.get("copy_bg").and_then(|v| v.as_str()) {
             cfg.copy_bg = s.to_string();
         }
         if let Some(JsonValue::Number(n)) = root.get("rear_opacity") {
-            cfg.rear_opacity = (*n as f32).clamp(0.15, 1.0);
+            if n.is_finite() {
+                cfg.rear_opacity = (*n as f32).clamp(0.15, 1.0);
+            }
         }
         if let Some(JsonValue::Number(n)) = root.get("crossing_clearance_pt") {
-            cfg.crossing_clearance_pt = n.clamp(0.0, 8.0);
+            if n.is_finite() {
+                cfg.crossing_clearance_pt = n.clamp(0.0, 8.0);
+            }
         }
         if let Some(JsonValue::Bool(b)) = root.get("show_right_dock") {
             cfg.show_right_dock = *b;
@@ -160,7 +176,7 @@ impl UserConfig {
             json_esc(&self.gaussian_path),
             recents.join(", ")
         );
-        let _ = fs::write(path, json);
+        let _ = crate::io_bridge::atomic_write_text(&path.to_string_lossy(), &json);
     }
 
     pub fn push_recent(&mut self, path: &str) {
@@ -327,7 +343,7 @@ pub fn render_quantum_panel_contents(
         ui.end_row();
     });
 
-    let mut preview = if let Some(m) = active_mol.filter(|m| !m.atoms.is_empty()) {
+    let preview = if let Some(m) = active_mol.filter(|m| !m.atoms.is_empty()) {
         let key = quantum_preview_cache_key(m, &qstate.spec);
         if qstate.cached_preview_key != key {
             qstate.cached_preview_text = export_quantum_input(m, &qstate.spec);
@@ -338,7 +354,8 @@ pub fn render_quantum_panel_contents(
         "# Draw a molecule to generate an ORCA / Gaussian / xTB input deck".into()
     };
     egui::ScrollArea::vertical().id_salt("q_prev_scroll").max_height(125.0).show(ui, |ui| {
-        ui.add(egui::TextEdit::multiline(&mut preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(6));
+        let mut prev_view = preview.as_str();
+        ui.add(egui::TextEdit::multiline(&mut prev_view).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(6));
     });
     ui.horizontal(|ui| {
         if ui.small_button("Copy Deck").clicked() {
@@ -449,8 +466,10 @@ pub fn render_quantum_panel_contents(
             } else {
                 "Not found"
             };
+            let gauss_st = qc_bins.gaussian_path.as_deref().unwrap_or("Not found");
             ui.small(format!("xTB: {xtb_st}"));
             ui.small(format!("ORCA: {orca_st}"));
+            ui.small(format!("Gaussian: {gauss_st}"));
             let mut path_changed = false;
             ui.horizontal(|ui| {
                 ui.small("xtb:");
@@ -468,7 +487,8 @@ pub fn render_quantum_panel_contents(
                 if ui.small_button("Re-detect Binaries").clicked() {
                     act = DockQuantumAction::RedetectQcBinaries;
                 }
-                if qc_bins.xtb_path.is_some() && active_mol.is_some() && ui.small_button("Run GFN2-xTB IR").clicked() {
+                let has_mol = active_mol.map(|m| !m.atoms.is_empty()).unwrap_or(false);
+                if qc_bins.xtb_path.is_some() && has_mol && ui.small_button("Run GFN2-xTB IR").clicked() {
                     act = DockQuantumAction::RunLocalQc(QcRunBackend::XtbGfn2);
                 }
             });

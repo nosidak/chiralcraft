@@ -51,6 +51,15 @@ fn find_on_path(bin_name: &str) -> Option<PathBuf> {
         if cand.is_file() {
             return Some(cand);
         }
+        #[cfg(windows)]
+        {
+            if !bin_name.to_ascii_lowercase().ends_with(".exe") {
+                let cand_exe = dir.join(format!("{bin_name}.exe"));
+                if cand_exe.is_file() {
+                    return Some(cand_exe);
+                }
+            }
+        }
     }
     None
 }
@@ -62,12 +71,18 @@ pub fn is_valid_quantum_orca_binary(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
-    // Quick header inspection: reject Python scripts (GNOME screen reader starts with #!/usr/bin/python)
-    if let Ok(head) = fs::read(path).map(|b| b.into_iter().take(256).collect::<Vec<u8>>()) {
-        if let Ok(txt) = std::str::from_utf8(&head) {
-            let low = txt.to_ascii_lowercase();
-            if low.starts_with("#!") && (low.contains("python") || low.contains("gnome") || low.contains("orca.main")) {
-                return false;
+    // Quick 256-byte header inspection (without loading a huge binary into memory)
+    if let Ok(mut f) = fs::File::open(path) {
+        use std::io::Read;
+        let mut head = [0u8; 256];
+        if let Ok(n) = f.read(&mut head) {
+            if let Ok(txt) = std::str::from_utf8(&head[..n]) {
+                let low = txt.to_ascii_lowercase();
+                if low.starts_with("#!")
+                    && (low.contains("python") || low.contains("gnome") || low.contains("orca.main"))
+                {
+                    return false;
+                }
             }
         }
     }
@@ -337,11 +352,11 @@ impl QuantumRunnerState {
     }
 }
 
-fn wait_child_cancellable(
+fn wait_child_status_cancellable(
     mut child: std::process::Child,
     cancel: &AtomicBool,
     timeout: Duration,
-) -> Result<std::process::Output, String> {
+) -> Result<std::process::ExitStatus, String> {
     let start = Instant::now();
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -355,15 +370,83 @@ fn wait_child_cancellable(
             return Err(format!("Quantum job timed out after {} s", timeout.as_secs()));
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| format!("Failed reading process output: {e}"));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(80)),
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(format!("Process wait error: {e}")),
         }
     }
+}
+
+fn create_private_qc_workdir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..32u32 {
+        let seq = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let cand = base.join(format!(
+            "chiralcraft-qc-{}-{nanos}-{seq}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&cand) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&cand, fs::Permissions::from_mode(0o700));
+                }
+                return Ok(cand);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Failed creating scratch dir: {e}")),
+        }
+    }
+    Err("Failed creating unique quantum scratch dir".to_string())
+}
+
+fn normalize_xtb_solvent(raw: &str) -> Result<Option<String>, String> {
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let low = t.to_ascii_lowercase();
+    let mapped = match low.as_str() {
+        "dcm" => "ch2cl2",
+        "mecn" => "acetonitrile",
+        other => other,
+    };
+    if mapped.starts_with('-')
+        || !mapped
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!("Invalid xTB solvent name: '{raw}'"));
+    }
+    Ok(Some(mapped.to_string()))
+}
+
+fn run_command_logged(
+    mut cmd: Command,
+    workdir: &Path,
+    cancel: &AtomicBool,
+    timeout: Duration,
+    label: &str,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    let out_path = workdir.join("stdout.log");
+    let err_path = workdir.join("stderr.log");
+    let out_file = fs::File::create(&out_path).map_err(|e| format!("Create stdout.log: {e}"))?;
+    let err_file = fs::File::create(&err_path).map_err(|e| format!("Create stderr.log: {e}"))?;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file))
+        .spawn()
+        .map_err(|e| format!("Failed to spawn {label}: {e}"))?;
+    let status = wait_child_status_cancellable(child, cancel, timeout)?;
+    let stdout_s = fs::read_to_string(&out_path).unwrap_or_default();
+    let stderr_s = fs::read_to_string(&err_path).unwrap_or_default();
+    Ok((status, stdout_s, stderr_s))
 }
 
 /// Runs a local quantum IR job in an isolated temporary directory and parses the resulting harmonic spectrum.
@@ -384,9 +467,7 @@ pub fn run_qc_job_blocking(
     };
     let uhf = spec.multiplicity.saturating_sub(1);
 
-    let seq = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let workdir = std::env::temp_dir().join(format!("chiralcraft-qc-{}-{seq}", std::process::id()));
-    fs::create_dir_all(&workdir).map_err(|e| format!("Failed creating scratch dir: {e}"))?;
+    let workdir = create_private_qc_workdir()?;
 
     // Guard cleanup on drop
     struct CleanupDir(PathBuf);
@@ -405,6 +486,7 @@ pub fn run_qc_job_blocking(
 
     let report = match backend {
         QcRunBackend::XtbGfn2 | QcRunBackend::XtbGfnFf => {
+            let xtb_solvent = normalize_xtb_solvent(&spec.solvent)?;
             let xyz = export_xtb_input(&prep.molecule, &clean_spec);
             fs::write(workdir.join("input.xyz"), xyz).map_err(|e| format!("Write input.xyz: {e}"))?;
             let mut cmd = Command::new(bin_path);
@@ -415,20 +497,17 @@ pub fn run_qc_job_blocking(
                 cmd.arg("2");
             }
             cmd.args(["--ohess", "--chrg", &charge.to_string(), "--uhf", &uhf.to_string()]);
-            if !spec.solvent.eq_ignore_ascii_case("none") && !spec.solvent.trim().is_empty() {
-                cmd.args(["--alpb", &spec.solvent.to_ascii_lowercase()]);
+            if let Some(solv) = xtb_solvent {
+                cmd.args(["--alpb", &solv]);
             }
             if spec.nprocs > 1 {
                 cmd.args(["--parallel", &spec.nprocs.to_string()]);
             }
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            let child = cmd.spawn().map_err(|e| format!("Failed to spawn {bin_path}: {e}"))?;
-            let out = wait_child_cancellable(child, cancel, Duration::from_secs(600))?;
-            let stdout_s = String::from_utf8_lossy(&out.stdout).to_string();
-            if !out.status.success() {
-                let stderr_s = String::from_utf8_lossy(&out.stderr);
+            let (status, stdout_s, stderr_s) =
+                run_command_logged(cmd, &workdir, cancel, Duration::from_secs(600), bin_path)?;
+            if !status.success() {
                 let tail: String = stdout_s.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-                return Err(format!("xTB exited with {}: {}\n{}", out.status, stderr_s.trim(), tail));
+                return Err(format!("xTB exited with {status}: {}\n{}", stderr_s.trim(), tail));
             }
             parse_xtb_workdir(&workdir, &stdout_s, backend == QcRunBackend::XtbGfnFf)?
         }
@@ -436,37 +515,35 @@ pub fn run_qc_job_blocking(
             let inp = export_orca_input(&prep.molecule, &clean_spec);
             let inp_path = workdir.join("job.inp");
             fs::write(&inp_path, inp).map_err(|e| format!("Write job.inp: {e}"))?;
-            let child = Command::new(bin_path)
-                .current_dir(&workdir)
-                .arg("job.inp")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn ORCA ({bin_path}): {e}"))?;
-            let out = wait_child_cancellable(child, cancel, Duration::from_secs(1800))?;
-            let stdout_s = String::from_utf8_lossy(&out.stdout).to_string();
-            if !out.status.success() {
-                return Err(format!("ORCA exited with {}", out.status));
+            let mut cmd = Command::new(bin_path);
+            cmd.current_dir(&workdir).arg("job.inp");
+            let (status, stdout_s, _) = run_command_logged(
+                cmd,
+                &workdir,
+                cancel,
+                Duration::from_secs(1800),
+                &format!("ORCA ({bin_path})"),
+            )?;
+            if !status.success() {
+                return Err(format!("ORCA exited with {status}"));
             }
             parse_quantum_output(&stdout_s)?
         }
         QcRunBackend::GaussianDft => {
             let gjf = export_gaussian_input(&prep.molecule, &clean_spec);
             fs::write(workdir.join("job.gjf"), gjf).map_err(|e| format!("Write job.gjf: {e}"))?;
-            let child = Command::new(bin_path)
-                .current_dir(&workdir)
-                .arg("job.gjf")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn Gaussian ({bin_path}): {e}"))?;
-            let out = wait_child_cancellable(child, cancel, Duration::from_secs(1800))?;
-            let log_s = fs::read_to_string(workdir.join("job.log"))
-                .unwrap_or_else(|_| String::from_utf8_lossy(&out.stdout).to_string());
-            if !out.status.success() && !log_s.contains("Normal termination") {
-                return Err(format!("Gaussian exited with {}", out.status));
+            let mut cmd = Command::new(bin_path);
+            cmd.current_dir(&workdir).arg("job.gjf");
+            let (status, stdout_s, _) = run_command_logged(
+                cmd,
+                &workdir,
+                cancel,
+                Duration::from_secs(1800),
+                &format!("Gaussian ({bin_path})"),
+            )?;
+            let log_s = fs::read_to_string(workdir.join("job.log")).unwrap_or(stdout_s);
+            if !status.success() && !log_s.contains("Normal termination") {
+                return Err(format!("Gaussian exited with {status}"));
             }
             parse_quantum_output(&log_s)?
         }
@@ -519,7 +596,20 @@ fn url_encode_query(s: &str) -> String {
 
 fn curl_get_text(url: &str) -> Result<String, String> {
     let out = Command::new("curl")
-        .args(["-fsSL", "--max-time", "15", "-A", "ChiralCraft/1.0", url])
+        .args([
+            "-fsSL",
+            "--globoff",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-time",
+            "15",
+            "-A",
+            "ChiralCraft/1.0",
+            "--",
+            url,
+        ])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("Failed to invoke curl: {e}"))?;
@@ -531,6 +621,10 @@ fn curl_get_text(url: &str) -> Result<String, String> {
 
 /// Extracts `(nist_id, index)` for an IR JCAMP link from a NIST Chemistry WebBook HTML page.
 pub fn extract_nist_ir_jcamp_params(html: &str) -> Option<(String, String)> {
+    let valid_cid = |s: &str| {
+        s.starts_with('C') && s.len() >= 4 && s[1..].bytes().all(|b| b.is_ascii_digit())
+    };
+    let valid_idx = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     // Look for direct JCAMP download link: JCAMP=C67641&amp;Index=0&amp;Type=IR or JCAMP=C67641&Index=0&Type=IR
     for marker in ["JCAMP=", "jcamp="] {
         let mut rest = html;
@@ -542,13 +636,13 @@ pub fn extract_nist_ir_jcamp_params(html: &str) -> Option<(String, String)> {
             let frag = after[..end].replace("&amp;", "&");
             let id = frag.split('&').next().unwrap_or("").trim().to_string();
             let is_ir = frag.to_ascii_uppercase().contains("TYPE=IR") || !frag.to_ascii_uppercase().contains("TYPE=");
-            if id.starts_with('C') && id.len() >= 4 && is_ir {
+            if valid_cid(&id) && is_ir {
                 let idx = frag
                     .split('&')
                     .find_map(|kv| {
                         let (k, v) = kv.split_once('=')?;
-                        if k.eq_ignore_ascii_case("Index") {
-                            Some(v.to_string())
+                        if k.eq_ignore_ascii_case("Index") && valid_idx(v.trim()) {
+                            Some(v.trim().to_string())
                         } else {
                             None
                         }
@@ -563,7 +657,7 @@ pub fn extract_nist_ir_jcamp_params(html: &str) -> Option<(String, String)> {
     if let Some(pos) = html.find("ID=C") {
         let after = &html[pos + 3..];
         let id: String = after.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-        if id.len() >= 4 {
+        if valid_cid(&id) {
             return Some((id, "0".to_string()));
         }
     }
@@ -585,28 +679,29 @@ pub fn fetch_nist_ir_blocking(query: &str, inchi_fallback: Option<&str>) -> Resu
         urls.push(format!("https://webbook.nist.gov/cgi/cbook.cgi?JCAMP={cid}&Index=0&Type=IR"));
         urls.push(format!("https://webbook.nist.gov/cgi/cbook.cgi?ID={cid}&Units=SI&Mask=80"));
     } else if !q.is_empty() {
-        // Handle ChiralCraft's "IUPAC name (common name)" format by trying both cleanly!
-        if let Some((before, rest)) = q.split_once('(') {
-            let common = rest.trim_end_matches(')').trim();
-            if !common.is_empty() {
-                urls.push(format!(
-                    "https://webbook.nist.gov/cgi/cbook.cgi?Name={}&Units=SI&cIR=on",
-                    url_encode_query(common)
-                ));
+        // Handle ChiralCraft's "IUPAC name (common name)" suffix cleanly without mangling "(R)-..." or "2-(acetoxy)..."
+        if q.ends_with(')') {
+            if let Some((before, rest)) = q.rsplit_once(" (") {
+                let common = rest.trim_end_matches(')').trim();
+                if !common.is_empty() {
+                    urls.push(format!(
+                        "https://webbook.nist.gov/cgi/cbook.cgi?Name={}&Units=SI&cIR=on",
+                        url_encode_query(common)
+                    ));
+                }
+                let iupac = before.trim();
+                if !iupac.is_empty() {
+                    urls.push(format!(
+                        "https://webbook.nist.gov/cgi/cbook.cgi?Name={}&Units=SI&cIR=on",
+                        url_encode_query(iupac)
+                    ));
+                }
             }
-            let iupac = before.trim();
-            if !iupac.is_empty() {
-                urls.push(format!(
-                    "https://webbook.nist.gov/cgi/cbook.cgi?Name={}&Units=SI&cIR=on",
-                    url_encode_query(iupac)
-                ));
-            }
-        } else {
-            urls.push(format!(
-                "https://webbook.nist.gov/cgi/cbook.cgi?Name={}&Units=SI&cIR=on",
-                url_encode_query(q)
-            ));
         }
+        urls.push(format!(
+            "https://webbook.nist.gov/cgi/cbook.cgi?Name={}&Units=SI&cIR=on",
+            url_encode_query(q)
+        ));
     }
     if let Some(inchi) = inchi_fallback.filter(|s| !s.trim().is_empty()) {
         urls.push(format!(

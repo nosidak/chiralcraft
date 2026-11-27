@@ -154,7 +154,7 @@ pub fn fragment_molecule_by_line(
     let n = mol.atoms.len();
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (bi, b) in mol.bonds.iter().enumerate() {
-        if cut_bonds.contains(&bi) {
+        if cut_bonds.contains(&bi) || b.begin_atom >= n || b.end_atom >= n {
             continue;
         }
         adj[b.begin_atom].push(b.end_atom);
@@ -180,18 +180,19 @@ pub fn fragment_molecule_by_line(
                 }
             }
         }
-        // Build sub-molecule with radical=1 on cleaved atoms (homolytic cleavage, no extra H gained!)
+        // Build sub-molecule with radical on cleaved atoms (homolytic cleavage, no extra H gained!)
         let mut idx_map = HashMap::new();
         let mut sub = ChemMolecule::default();
         for (new_i, &old_i) in comp.iter().enumerate() {
             idx_map.insert(old_i, new_i);
             let mut a: ChemAtom = mol.atoms[old_i].clone();
-            let cuts_here = cut_bonds
+            let cleaved_orders: i32 = cut_bonds
                 .iter()
                 .filter(|&&bi| mol.bonds[bi].begin_atom == old_i || mol.bonds[bi].end_atom == old_i)
-                .count() as i32;
-            if cuts_here > 0 {
-                a.radical = a.radical.max(cuts_here.min(2));
+                .map(|&bi| mol.bonds[bi].order.clamp(1, 3))
+                .sum();
+            if cleaved_orders > 0 {
+                a.radical = a.radical.saturating_add(cleaved_orders).min(2);
             }
             sub.atoms.push(a);
         }
@@ -261,20 +262,22 @@ pub fn clean_up_reaction(scene: &mut DocumentScene) -> bool {
         (mid_x, mid_y)
     } else {
         // Auto-place reaction arrow between first and second half of molecules
-        let all_cx: f64 = scene
+        let non_empty: Vec<&ChemMolecule> = scene
             .molecules
             .iter()
             .filter(|m| !m.atoms.is_empty())
+            .collect();
+        let denom = non_empty.len().max(1) as f64;
+        let all_cx: f64 = non_empty
+            .iter()
             .map(|m| m.atoms.iter().map(|a| a.x).sum::<f64>() / (m.atoms.len() as f64))
             .sum::<f64>()
-            / (scene.molecules.len().max(1) as f64);
-        let all_cy: f64 = scene
-            .molecules
+            / denom;
+        let all_cy: f64 = non_empty
             .iter()
-            .filter(|m| !m.atoms.is_empty())
             .map(|m| m.atoms.iter().map(|a| a.y).sum::<f64>() / (m.atoms.len() as f64))
             .sum::<f64>()
-            / (scene.molecules.len().max(1) as f64);
+            / denom;
         (all_cx, all_cy)
     };
 
@@ -513,33 +516,64 @@ pub fn inchi_to_molecule(inchi: &str) -> Result<ChemMolecule, String> {
         return Err("Missing formula layer in InChI".to_string());
     }
     let formula = layers[1];
-    // Parse heavy atoms from Hill formula layer (e.g., C9H8O4 -> 9 C + 4 O)
+    // Parse heavy atoms from Hill formula layer (supporting multi-component `.`-separated fragments)
+    const MAX_INCHI_ATOMS: usize = 10_000;
     let mut heavy_zs: Vec<i32> = Vec::new();
-    let chars: Vec<char> = formula.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i].is_ascii_uppercase() {
-            let mut sym = String::new();
-            sym.push(chars[i]);
-            i += 1;
-            while i < chars.len() && chars[i].is_ascii_lowercase() {
+    let mut comp_offsets: Vec<usize> = Vec::new();
+    for raw_comp in formula.split('.') {
+        let mut comp_mult = 1usize;
+        let mut rest = raw_comp;
+        let lead_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !lead_digits.is_empty() {
+            comp_mult = lead_digits.parse::<usize>().unwrap_or(1).clamp(1, 200);
+            rest = &rest[lead_digits.len()..];
+        }
+        let mut comp_zs: Vec<i32> = Vec::new();
+        let chars: Vec<char> = rest.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i].is_ascii_uppercase() {
+                let mut sym = String::new();
                 sym.push(chars[i]);
                 i += 1;
-            }
-            let mut num_s = String::new();
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                num_s.push(chars[i]);
+                while i < chars.len() && chars[i].is_ascii_lowercase() {
+                    sym.push(chars[i]);
+                    i += 1;
+                }
+                let mut num_s = String::new();
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    num_s.push(chars[i]);
+                    i += 1;
+                }
+                let cnt: usize = if num_s.is_empty() {
+                    1
+                } else {
+                    num_s.parse::<usize>().map_err(|_| format!("Invalid atom count '{num_s}' in InChI formula"))?
+                };
+                if cnt > MAX_INCHI_ATOMS {
+                    return Err(format!("InChI atom count exceeds maximum ({MAX_INCHI_ATOMS})"));
+                }
+                if sym != "H" {
+                    let z = chiralcraft_chem::get_element_by_symbol(&sym)
+                        .map(|e| e.z)
+                        .ok_or_else(|| format!("Unknown element '{sym}' in InChI formula"))?;
+                    if comp_zs.len().saturating_add(cnt) > MAX_INCHI_ATOMS {
+                        return Err(format!("InChI atom count exceeds maximum ({MAX_INCHI_ATOMS})"));
+                    }
+                    for _ in 0..cnt {
+                        comp_zs.push(z);
+                    }
+                }
+            } else {
                 i += 1;
             }
-            let cnt: usize = if num_s.is_empty() { 1 } else { num_s.parse().unwrap_or(1) };
-            if sym != "H" {
-                let z = chiralcraft_chem::get_element_by_symbol(&sym).map(|e| e.z).unwrap_or(6);
-                for _ in 0..cnt {
-                    heavy_zs.push(z);
-                }
+        }
+        for _ in 0..comp_mult {
+            if heavy_zs.len().saturating_add(comp_zs.len()) > MAX_INCHI_ATOMS {
+                return Err(format!("InChI atom count exceeds maximum ({MAX_INCHI_ATOMS})"));
             }
-        } else {
-            i += 1;
+            comp_offsets.push(heavy_zs.len());
+            heavy_zs.extend_from_slice(&comp_zs);
         }
     }
     if heavy_zs.is_empty() {
@@ -552,13 +586,8 @@ pub fn inchi_to_molecule(inchi: &str) -> Result<ChemMolecule, String> {
         a.y = ((idx % 2) as f64) * 10.0;
         mol.atoms.push(a);
     }
-    // Parse `/c` connectivity layer (e.g. `c1-2-3(4)5-1`)
+    // Parse `/c` connectivity layer (e.g. `c1-2-3(4)5-1;1-2`)
     if let Some(c_layer) = layers.iter().find(|l| l.starts_with('c')) {
-        let body = &c_layer[1..];
-        let bchars: Vec<char> = body.chars().collect();
-        let mut pos = 0usize;
-        let mut stack: Vec<usize> = Vec::new();
-        let mut prev: Option<usize> = None;
         let mut next_bid = (mol.atoms.len() + 1) as u32;
         let mut add_bond = |m: &mut ChemMolecule, u: usize, v: usize| {
             if u < m.atoms.len() && v < m.atoms.len() && u != v
@@ -576,38 +605,47 @@ pub fn inchi_to_molecule(inchi: &str) -> Result<ChemMolecule, String> {
                 next_bid += 1;
             }
         };
-        while pos < bchars.len() {
-            match bchars[pos] {
-                '0'..='9' => {
-                    let mut ns = String::new();
-                    while pos < bchars.len() && bchars[pos].is_ascii_digit() {
-                        ns.push(bchars[pos]);
+        for (comp_i, seg) in c_layer[1..].split(';').enumerate() {
+            let offset = comp_offsets.get(comp_i).copied().unwrap_or(0);
+            let bchars: Vec<char> = seg.chars().collect();
+            let mut pos = 0usize;
+            let mut stack: Vec<usize> = Vec::new();
+            let mut prev: Option<usize> = None;
+            while pos < bchars.len() {
+                match bchars[pos] {
+                    '0'..='9' => {
+                        let mut ns = String::new();
+                        while pos < bchars.len() && bchars[pos].is_ascii_digit() {
+                            ns.push(bchars[pos]);
+                            pos += 1;
+                        }
+                        if let Ok(n1) = ns.parse::<usize>() {
+                            if n1 > 0 {
+                                let idx = offset + (n1 - 1);
+                                if let Some(p) = prev {
+                                    add_bond(&mut mol, p, idx);
+                                }
+                                prev = Some(idx);
+                            }
+                        }
+                    }
+                    '-' => { pos += 1; }
+                    '(' => {
+                        if let Some(p) = prev {
+                            stack.push(p);
+                        }
                         pos += 1;
                     }
-                    if let Ok(n1) = ns.parse::<usize>() {
-                        let idx = n1.saturating_sub(1);
-                        if let Some(p) = prev {
-                            add_bond(&mut mol, p, idx);
-                        }
-                        prev = Some(idx);
+                    ',' => {
+                        prev = stack.last().copied();
+                        pos += 1;
                     }
-                }
-                '-' => { pos += 1; }
-                '(' => {
-                    if let Some(p) = prev {
-                        stack.push(p);
+                    ')' => {
+                        prev = stack.pop();
+                        pos += 1;
                     }
-                    pos += 1;
+                    _ => { pos += 1; }
                 }
-                ',' => {
-                    prev = stack.last().copied();
-                    pos += 1;
-                }
-                ')' => {
-                    prev = stack.pop();
-                    pos += 1;
-                }
-                _ => { pos += 1; }
             }
         }
     }

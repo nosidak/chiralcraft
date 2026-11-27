@@ -7,7 +7,7 @@
 <p align="center">
   <b>Publication-grade chemical structure drawing, spectroscopy, medicinal chemistry, 3D &amp; quantum studio — built in pure Rust.</b><br>
   IUPAC 2008 2D vector drawing, real-time cheminformatics, multi-spectroscopy, retrosynthesis, 3D UFF optimization,<br>
-  lossless editable SVG/PNG/PDF publishing, and a 17-tool MCP server. Open source, native, offline-first, and yours.
+  lossless editable SVG/PNG/PDF publishing, and a 19-tool MCP server. Open source, native, offline-first, and yours.
 </p>
 
 <p align="center">
@@ -200,7 +200,7 @@ ChiralCraft includes an all-in-one suite of capabilities that are typically spli
 - **Lossless Editable SVG, PNG & Native Vector PDF 1.4**: Every exported SVG (`<chiralcraft:document>`), PNG (`tEXt` chunk `ChiralCraftDocument`), and PDF (`%CHIRALCRAFT_CDXML_B64:`) embeds the full lossless chemical graph — including Energy Profiles, Tables, and TLC plates — for true reopen-and-edit round-tripping.
 - **Wayland/X11 Editable SVG Clipboard & Host-App Round-Trip (`--edit-svg`)**: `Ctrl+C` pushes transparent `image/svg+xml` to the OS clipboard for direct pasting into WordCraft/DeckCraft/office suites; double-click editing via `chiralcraft --edit-svg <file.svg>` atomically writes updates back on save/close.
 - **Native LaTeX (`\chemfig` / `\schemestart`) & TikZ Vector Export**: Export single molecules (including disconnected salts & multivalent charges) or full multi-step reaction schemes directly to compilable LaTeX and `tikzpicture` code.
-- **Zero-Dependency 17-Tool MCP Server & Batch CLI**: Script every analysis, conversion, diff, NMR/IR/MedChem/HRMS/retrosynthesis/18e⁻/quantum calculation, or editable SVG render from the terminal or directly from AI agents over JSON-RPC 2.0 stdio.
+- **Zero-Dependency 19-Tool MCP Server & Batch CLI**: Script every analysis, conversion, diff, NMR/IR/MedChem/HRMS/retrosynthesis/18e⁻/quantum calculation, or editable SVG render from the terminal or directly from AI agents over JSON-RPC 2.0 stdio.
 
 <br>
 
@@ -293,11 +293,11 @@ chiralcraft inspect-media figure.png
 chiralcraft --edit-svg /tmp/embedded-diagram.svg
 chiralcraft --screenshot hero docs/images/chiralcraft-hero.png
 
-# Zero-dependency stdio JSON-RPC 2.0 MCP server (17 tools)
+# Zero-dependency stdio JSON-RPC 2.0 MCP server (19 tools)
 chiralcraft --mcp
 ```
 
-Full CLI flags and all 17 MCP tool definitions are documented in [docs/CLI_AND_MCP.md](docs/CLI_AND_MCP.md).
+Full CLI flags and all 19 MCP tool definitions are documented in [docs/CLI_AND_MCP.md](docs/CLI_AND_MCP.md).
 
 <br>
 
@@ -311,7 +311,7 @@ ChiralCraft is structured as a clean, layered 5-crate Rust workspace with zero e
 | `chiralcraft-chem` | Valence & aromaticity perception, CIP `(R)/(S)/(E)/(Z)` stereochemistry, physicochemical properties, ¹H/¹³C/2D NMR, FT-IR, UV–Vis, MedChem/ADMET/PAINS, HRMS isotope convolution, pH/tautomers/isomers/resonance, 18e⁻ Green CBC, polymers, UFF-lite 3D force field, IUPAC Structure ↔ Name |
 | `chiralcraft-formats` | CDX binary & CDXML XML parsers/writers, MOL/SDF/RXN (V2000/V3000), SMILES, SLN, InChI, CML, CT, TGF, SKC, XYZ, CIF, PDB, VASP POSCAR/CONTCAR, JCAMP-DX, ORCA/Gaussian/xTB, HELM/FASTA/3MF, Editable PNG & Native Vector PDF 1.4 |
 | `chiralcraft-doc` | Interactive document scene graph, Undo/Redo transaction log, 16 journal stylesheets, 11 template libraries, 2D layout cleanup, crossing-bond clearance, Markush SAR, retrosynthesis, reaction energy profiles, ELN SI & GHS safety, LaTeX/TikZ, Editable SVG, chemical diff |
-| `chiralcraft-app` | Native `eframe`/`egui` desktop GUI, 53 tools, 98 hotkeys, Command Palette, Right-Side Studio Dock, Interactive 3D Viewer, live PubChem/ChEMBL client, Wayland/X11 clipboard bridge, CLI, and 17-tool MCP server |
+| `chiralcraft-app` | Native `eframe`/`egui` desktop GUI, 53 tools, 98 hotkeys, Command Palette, Right-Side Studio Dock, Interactive 3D Viewer, live PubChem/ChEMBL client, Wayland/X11 clipboard bridge, CLI, and 19-tool MCP server |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full architectural details.
 
@@ -348,7 +348,7 @@ chiralcraft
 cargo test --workspace
 ```
 
-The workspace ships with **76 unit, integration, format round-trip, MCP protocol, and headless full-frame `egui` GUI tests** covering all 53 tools, all 11 template libraries, all 29 floating windows/studios, and all 40 dialogs.
+The workspace ships with **94 unit, integration, format round-trip, MCP protocol, and headless full-frame `egui` GUI tests** covering all 53 tools, all 11 template libraries, all 29 floating windows/studios, and all 40 dialogs.
 
 <br>
 
@@ -359,7 +359,7 @@ The workspace ships with **76 unit, integration, format round-trip, MCP protocol
 | [docs/README.md](docs/README.md) | Documentation hub & quick orientation |
 | [docs/FEATURES.md](docs/FEATURES.md) | Complete deep-dive catalog of all GUI, cheminformatics, spectroscopy, 3D & quantum features |
 | [docs/FORMATS.md](docs/FORMATS.md) | Full 22+ chemical, crystallographic, quantum, spectral & editable vector/raster format matrix |
-| [docs/CLI_AND_MCP.md](docs/CLI_AND_MCP.md) | Every CLI subcommand, flag, and all 17 MCP JSON-RPC 2.0 tool schemas |
+| [docs/CLI_AND_MCP.md](docs/CLI_AND_MCP.md) | Every CLI subcommand, flag, and all 19 MCP JSON-RPC 2.0 tool schemas |
 | [docs/SHORTCUTS_AND_UI.md](docs/SHORTCUTS_AND_UI.md) | Keyboard shortcuts, 98 context-sensitive hotkeys, smart reversed typing & Command Palette guide |
 | [docs/WORDCRAFT_DECKCRAFT_INTEGRATION.md](docs/WORDCRAFT_DECKCRAFT_INTEGRATION.md) | Editable SVG clipboard & `--edit-svg` round-trip protocol for office suites |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 5-crate architecture, scene graph, transaction model, and contributor guide |

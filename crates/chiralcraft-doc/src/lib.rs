@@ -378,29 +378,47 @@ impl InteractiveDocument {
     pub fn expand_label_tx(&mut self, mol_idx: usize, atom_idx: usize, label: &str) -> bool {
         let nicks = self.nicknames.clone();
         let blen = self.settings.bond_length_pt;
-        let mut ok = false;
-        self.apply_scene_tx("Expand Label", |scene, next_id| {
-            if let Some(mol) = scene.molecules.get_mut(mol_idx) {
-                if let Some(res) = nicks.expand_label_at_atom(mol, atom_idx, label, blen, next_id) {
-                    scene.expanded_residues.push(res);
-                    ok = true;
-                }
+        let mut trial_scene = self.scene.clone();
+        let mut trial_next_id = self.next_id;
+        let ok = if let Some(mol) = trial_scene.molecules.get_mut(mol_idx) {
+            if let Some(res) = nicks.expand_label_at_atom(mol, atom_idx, label, blen, &mut trial_next_id) {
+                trial_scene.expanded_residues.push(res);
+                true
+            } else {
+                false
             }
-        });
+        } else {
+            false
+        };
+        if ok {
+            self.apply_scene_tx("Expand Label", |scene, next_id| {
+                *scene = trial_scene;
+                *next_id = trial_next_id;
+            });
+        }
         ok
     }
 
     /// Symmetrically contract the most recent expanded residue on `mol_idx` (`Structure > Contract Label`).
     pub fn contract_last_residue_tx(&mut self, mol_idx: usize) -> bool {
+        let mut trial_scene = self.scene.clone();
         let mut ok = false;
-        self.apply_scene_tx("Contract Label", |scene, _| {
-            if let (Some(mol), Some(res)) = (
-                scene.molecules.get_mut(mol_idx),
-                scene.expanded_residues.pop(),
-            ) {
+        if let Some(mol) = trial_scene.molecules.get_mut(mol_idx) {
+            // Only pop an ExpandedResidue whose atoms actually belong to `mol`
+            if let Some(pos) = trial_scene.expanded_residues.iter().rposition(|r| {
+                mol.atoms
+                    .iter()
+                    .any(|a| a.id == r.parent_atom_id || r.expanded_atom_ids.contains(&a.id))
+            }) {
+                let res = trial_scene.expanded_residues.remove(pos);
                 ok = NicknameTable::contract_residue_group(mol, &res);
             }
-        });
+        }
+        if ok {
+            self.apply_scene_tx("Contract Label", |scene, _| {
+                *scene = trial_scene;
+            });
+        }
         ok
     }
 
@@ -607,38 +625,41 @@ impl InteractiveDocument {
                 if child_nodes.len() == 1 && bond_count == 0 {
                     let node_occ = child_nodes[0];
                     let node_el = &cdxml.elements[node_occ];
-                    let t_occ = node_el.children.iter().find_map(|c| {
-                        if let CdxmlNodeChild::Element(cid) = c {
-                            (cdxml.elements[*cid].tag == "t").then_some(*cid)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(t_occ) = t_occ {
-                        let text = collect_text(t_occ);
-                        if !text.is_empty() {
-                            caption_frag_occs.insert(occ);
-                            let (x, y) = parse_xy_attr(node_el.attr("p"));
-                            let id = node_el
-                                .attr("id")
-                                .and_then(|v| v.parse::<u32>().ok())
-                                .unwrap_or(max_id);
-                            let just = cdxml.elements[t_occ]
-                                .attr("LabelJustification")
-                                .map(LabelJustification::from_cdxml_str)
-                                .unwrap_or(LabelJustification::Left);
-                            captions.push(CaptionNode {
-                                id,
-                                x,
-                                y,
-                                text,
-                                element: node_el.attr("Element").and_then(|v| v.parse::<i32>().ok()),
-                                generic_nickname: node_el
-                                    .attr("GenericNickname")
-                                    .map(str::to_string),
-                                warning: node_el.attr("Warning").map(str::to_string),
-                                justification: just,
-                            });
+                    // Single-atom molecules serialized with CustomLabel (e.g. catalytic cycle Pd species) must stay molecules!
+                    if node_el.attr("CustomLabel").is_none() {
+                        let t_occ = node_el.children.iter().find_map(|c| {
+                            if let CdxmlNodeChild::Element(cid) = c {
+                                (cdxml.elements[*cid].tag == "t").then_some(*cid)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(t_occ) = t_occ {
+                            let text = collect_text(t_occ);
+                            if !text.is_empty() {
+                                caption_frag_occs.insert(occ);
+                                let (x, y) = parse_xy_attr(node_el.attr("p"));
+                                let id = node_el
+                                    .attr("id")
+                                    .and_then(|v| v.parse::<u32>().ok())
+                                    .unwrap_or(max_id);
+                                let just = cdxml.elements[t_occ]
+                                    .attr("LabelJustification")
+                                    .map(LabelJustification::from_cdxml_str)
+                                    .unwrap_or(LabelJustification::Left);
+                                captions.push(CaptionNode {
+                                    id,
+                                    x,
+                                    y,
+                                    text,
+                                    element: node_el.attr("Element").and_then(|v| v.parse::<i32>().ok()),
+                                    generic_nickname: node_el
+                                        .attr("GenericNickname")
+                                        .map(str::to_string),
+                                    warning: node_el.attr("Warning").map(str::to_string),
+                                    justification: just,
+                                });
+                            }
                         }
                     }
                 }
@@ -804,12 +825,18 @@ impl InteractiveDocument {
             let mut atom_xml_ids = Vec::with_capacity(mol.atoms.len());
             for a in &mol.atoms {
                 let aid = if a.id != 0 { a.id } else { next_xml_id };
-                next_xml_id = next_xml_id.max(aid + 1);
+                next_xml_id = next_xml_id.max(aid.saturating_add(1));
                 atom_xml_ids.push(aid);
                 out.push_str(&format!(
                     "<n id=\"{aid}\" p=\"{:.2} {:.2}\" Element=\"{}\"",
                     a.x, a.y, a.z
                 ));
+                if mol.has_3d_coords || a.z_coord.abs() > 1e-6 {
+                    out.push_str(&format!(" xyz=\"{:.4} {:.4} {:.4}\"", a.x, a.y, a.z_coord));
+                }
+                if let Some(nh) = a.explicit_num_hydrogens {
+                    out.push_str(&format!(" NumHydrogens=\"{nh}\""));
+                }
                 if a.charge != 0 {
                     out.push_str(&format!(" Charge=\"{}\"", a.charge));
                 }
@@ -830,6 +857,8 @@ impl InteractiveDocument {
                 }
                 if a.is_unspecified_label {
                     out.push_str(" NodeType=\"Unspecified\"");
+                } else if a.is_query {
+                    out.push_str(" NodeType=\"GenericNickname\"");
                 }
                 if !a.visible {
                     out.push_str(" Visible=\"no\"");
@@ -853,8 +882,11 @@ impl InteractiveDocument {
                 }
             }
             for b in &mol.bonds {
+                if b.begin_atom >= atom_xml_ids.len() || b.end_atom >= atom_xml_ids.len() {
+                    continue;
+                }
                 let bid = if b.id != 0 { b.id } else { next_xml_id };
-                next_xml_id = next_xml_id.max(bid + 1);
+                next_xml_id = next_xml_id.max(bid.saturating_add(1));
                 let ba = atom_xml_ids[b.begin_atom];
                 let ea = atom_xml_ids[b.end_atom];
                 out.push_str(&format!("<b id=\"{bid}\" B=\"{ba}\" E=\"{ea}\""));
@@ -989,8 +1021,8 @@ fn atom_has_valence_warning(mol: &ChemMolecule, val: &CcVal, idx: usize) -> bool
     if atom.is_query || z <= 0 {
         return false;
     }
-    if atom.explicit_num_hydrogens.is_none() && mol.bonds.is_empty() {
-        // Bare atom caption without bonds (`NumHydrogens="0"` in ChiralCraft when !can_infer_implicit_hydrogen, e.g. B)
+    if atom.explicit_num_hydrogens.is_none() && mol.bonds.is_empty() && atom.charge == 0 && atom.radical == 0 {
+        // Bare neutral atom caption without bonds (`NumHydrogens="0"` in ChiralCraft when !can_infer_implicit_hydrogen, e.g. B)
         return !chiralcraft_chem::can_infer_implicit_hydrogen(z)
             && chiralcraft_chem::default_valence(z) > 0;
     }
@@ -1657,8 +1689,10 @@ pub fn flip_atoms_preserving_stereo(
                     BondDisplay::WedgedHashBegin => BondDisplay::WedgeBegin,
                     BondDisplay::WedgeEnd => BondDisplay::WedgedHashEnd,
                     BondDisplay::WedgedHashEnd => BondDisplay::WedgeEnd,
-                    BondDisplay::HollowWedgeBegin => BondDisplay::Hash,
-                    BondDisplay::Hash => BondDisplay::HollowWedgeBegin,
+                    BondDisplay::HollowWedgeBegin => BondDisplay::WedgedHashBegin,
+                    BondDisplay::HollowWedgeEnd => BondDisplay::WedgedHashEnd,
+                    BondDisplay::Bold => BondDisplay::Hash,
+                    BondDisplay::Hash => BondDisplay::Bold,
                     other => other,
                 };
             }
@@ -1877,18 +1911,21 @@ impl InteractiveDocument {
             return self.to_svg_styled(transparent_bg, dark_ink, rear_opacity, crossing_clearance_pt);
         }
         let mut sub = InteractiveDocument::new_saved_seed(&self.name, self.settings.clone());
+        let mut idx_map: HashMap<usize, usize> = HashMap::new();
         for &mi in selected_mols {
             if let Some(m) = self.scene.molecules.get(mi) {
+                let new_idx = sub.scene.molecules.len();
+                idx_map.insert(mi, new_idx);
                 sub.scene.molecules.push(m.clone());
             }
         }
         for circ in &self.scene.aromatic_circles {
-            if circ
-                .molecule_idx
-                .map(|mi| selected_mols.contains(&mi))
-                .unwrap_or(false)
-            {
-                sub.scene.aromatic_circles.push(circ.clone());
+            if let Some(old_mi) = circ.molecule_idx {
+                if let Some(&new_mi) = idx_map.get(&old_mi) {
+                    let mut c = circ.clone();
+                    c.molecule_idx = Some(new_mi);
+                    sub.scene.aromatic_circles.push(c);
+                }
             }
         }
         sub.to_svg_styled(transparent_bg, dark_ink, rear_opacity, crossing_clearance_pt)
@@ -2410,7 +2447,7 @@ pub fn collapse_bond_reducing_ring(mol: &mut ChemMolecule, bond_idx: usize) -> b
     }
     let keep = mol.bonds[bond_idx].begin_atom;
     let drop = mol.bonds[bond_idx].end_atom;
-    if keep == drop {
+    if keep == drop || keep >= mol.atoms.len() || drop >= mol.atoms.len() {
         return false;
     }
     mol.bonds.remove(bond_idx);
@@ -2423,6 +2460,20 @@ pub fn collapse_bond_reducing_ring(mol: &mut ChemMolecule, bond_idx: usize) -> b
         }
     }
     mol.bonds.retain(|b| b.begin_atom != b.end_atom);
+    mol.atoms.remove(drop);
+    for b in &mut mol.bonds {
+        if b.begin_atom > drop {
+            b.begin_atom -= 1;
+        }
+        if b.end_atom > drop {
+            b.end_atom -= 1;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    mol.bonds.retain(|b| {
+        let pair = (b.begin_atom.min(b.end_atom), b.begin_atom.max(b.end_atom));
+        seen.insert(pair)
+    });
     true
 }
 
@@ -4063,14 +4114,22 @@ pub fn clean_up_structure_preserving_stereo(
     }
 
     let stereo_after = perceive_stereochemistry(mol);
-    debug_assert_eq!(
-        stereo_before.atom_stereo, stereo_after.atom_stereo,
-        "Tetrahedral stereochemistry inverted during cleanup"
-    );
-    debug_assert_eq!(
-        stereo_before.bond_stereo, stereo_after.bond_stereo,
-        "Double-bond E/Z stereochemistry inverted during cleanup"
-    );
+    // Only assert preservation for stereocenters/double bonds that already had defined stereo BEFORE cleanup
+    // (newly laid-out collapsed `(0,0)` SMILES alkenes legitimately gain E/Z descriptors once 2D coords exist).
+    for (ai, before_code) in &stereo_before.atom_stereo {
+        debug_assert_eq!(
+            stereo_after.atom_stereo.get(ai),
+            Some(before_code),
+            "Tetrahedral stereochemistry inverted during cleanup at atom {ai}"
+        );
+    }
+    for (bi, before_code) in &stereo_before.bond_stereo {
+        debug_assert_eq!(
+            stereo_after.bond_stereo.get(bi),
+            Some(before_code),
+            "Double-bond E/Z stereochemistry inverted during cleanup at bond {bi}"
+        );
+    }
     let _ = CcVal::compute(mol);
 }
 
@@ -6043,5 +6102,48 @@ mod tests {
             ),
             "RYYVLZVUVIJVGH-UHFFFAOYSA-N"
         );
+    }
+
+    #[test]
+    fn test_comprehensive_audit_doc_regressions() {
+        // 1. Porphine macrocycle is a chemically valid 18-pi C20H14N4 macrocycle with 0 structure warnings
+        let porph = build_porphine_core(14.40);
+        assert_eq!(porph.atoms.len(), 24);
+        assert_eq!(porph.bonds.iter().filter(|b| b.order == 2).count(), 11);
+        assert_eq!(porph.compute_formula_properties().get_formula(), "C20H14N4");
+        let pwarns = check_structure(&porph, &[]);
+        assert!(pwarns.is_empty(), "Porphine must have 0 structure warnings, got: {pwarns:?}");
+
+        // 2. collapse_bond_reducing_ring removes dropped atom and leaves no orphan atom
+        let mut benz = stamp_template(BuiltinTemplate::Benzene, 100.0, 100.0, 14.40);
+        assert_eq!(benz.atoms.len(), 6);
+        assert!(collapse_bond_reducing_ring(&mut benz, 0));
+        assert_eq!(benz.atoms.len(), 5, "Collapsing a bond must remove the merged atom");
+        assert_eq!(benz.bonds.len(), 5);
+
+        // 3. compare_documents detects (R) vs (S) enantiomer change even with identical stereobond count
+        let mut r_doc = InteractiveDocument::new_saved_seed("R", DocumentSettings::acs_document_1996());
+        let mut s_doc = InteractiveDocument::new_saved_seed("S", DocumentSettings::acs_document_1996());
+        let mut m_r = chiralcraft_formats::smiles_to_molecule("CC(F)Cl").unwrap();
+        clean_up_structure_preserving_stereo(&mut m_r, &[], 14.40);
+        // Set bond from chiral C(1) to F(2) as Wedge in R-doc vs WedgedHash in S-doc (identical stereobond count = 1!)
+        let b_cf = m_r.bonds.iter().position(|b| (b.begin_atom == 1 && b.end_atom == 2) || (b.begin_atom == 2 && b.end_atom == 1)).unwrap();
+        m_r.bonds[b_cf].begin_atom = 1;
+        m_r.bonds[b_cf].end_atom = 2;
+        m_r.bonds[b_cf].display = BondDisplay::WedgeBegin;
+        let mut m_s = m_r.clone();
+        m_s.bonds[b_cf].display = BondDisplay::WedgedHashBegin;
+        r_doc.stamp_molecule_tx(m_r, "R");
+        s_doc.stamp_molecule_tx(m_s, "S");
+        let diff = compare_documents(&r_doc, &s_doc);
+        assert!(diff.has_changes(), "Enantiomers with inverted wedge/hash must be detected as changed by compare_documents");
+
+        // 4. Retrosynthesis Suzuki produces explicit -B(OH)2 boronic acid synthon (contains B and 2 O)
+        let mut biph = chiralcraft_formats::smiles_to_molecule("c1ccc(-c2ccccc2)cc1").unwrap();
+        clean_up_structure_preserving_stereo(&mut biph, &[], 14.40);
+        let hits = suggest_disconnections(&biph, 14.40);
+        let suz = hits.iter().find(|h| h.reaction_name.contains("Suzuki")).expect("Suzuki hit");
+        assert!(suz.synthon_b.atoms.iter().any(|a| a.z == 5), "Suzuki synthon_b must contain Boron");
+        assert!(suz.synthon_b.atoms.iter().filter(|a| a.z == 8).count() >= 2, "Suzuki synthon_b must contain -B(OH)2");
     }
 }

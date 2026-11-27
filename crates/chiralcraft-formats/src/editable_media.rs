@@ -76,11 +76,19 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         return Err("Invalid base64 length".to_string());
     }
     let mut out = Vec::with_capacity((clean.len() / 4) * 3);
-    for chunk in clean.chunks(4) {
+    let num_chunks = clean.len() / 4;
+    for (ci, chunk) in clean.chunks(4).enumerate() {
+        let is_last = ci + 1 == num_chunks;
         let v0 = val(chunk[0]).ok_or_else(|| "Bad base64 char".to_string())?;
         let v1 = val(chunk[1]).ok_or_else(|| "Bad base64 char".to_string())?;
         let pad2 = chunk[2] == b'=';
         let pad3 = chunk[3] == b'=';
+        if (pad2 || pad3) && !is_last {
+            return Err("Invalid base64 mid-stream padding".to_string());
+        }
+        if pad2 && !pad3 {
+            return Err("Invalid base64 padding".to_string());
+        }
         let v2 = if pad2 { 0 } else { val(chunk[2]).ok_or_else(|| "Bad base64 char".to_string())? };
         let v3 = if pad3 { 0 } else { val(chunk[3]).ok_or_else(|| "Bad base64 char".to_string())? };
         let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
@@ -119,7 +127,7 @@ pub fn embed_chiralcraft_cdxml_in_png(png_bytes: &[u8], cdxml_xml: &str) -> Vec<
     out.extend_from_slice(&PNG_SIG);
     let mut pos = 8usize;
     let mut inserted = false;
-    while pos + 12 <= png_bytes.len() {
+    while pos.checked_add(12).is_some_and(|e| e <= png_bytes.len()) {
         let len = u32::from_be_bytes([
             png_bytes[pos],
             png_bytes[pos + 1],
@@ -127,20 +135,25 @@ pub fn embed_chiralcraft_cdxml_in_png(png_bytes: &[u8], cdxml_xml: &str) -> Vec<
             png_bytes[pos + 3],
         ]) as usize;
         let ctype = &png_bytes[pos + 4..pos + 8];
-        let total = 12 + len;
-        if pos + total > png_bytes.len() {
+        let Some(total) = len.checked_add(12) else { break; };
+        let Some(end) = pos.checked_add(total) else { break; };
+        if end > png_bytes.len() {
             break;
         }
-        if ctype == b"tEXt" && png_bytes[pos + 8..pos + 8 + len].starts_with(PNG_TEXT_KEYWORD) {
-            pos += total;
+        let chunk_data = &png_bytes[pos + 8..pos + 8 + len];
+        if ctype == b"tEXt"
+            && chunk_data.starts_with(PNG_TEXT_KEYWORD)
+            && chunk_data.get(PNG_TEXT_KEYWORD.len()) == Some(&0)
+        {
+            pos = end;
             continue;
         }
         if ctype == b"IEND" && !inserted {
             out.extend_from_slice(&text_chunk);
             inserted = true;
         }
-        out.extend_from_slice(&png_bytes[pos..pos + total]);
-        pos += total;
+        out.extend_from_slice(&png_bytes[pos..end]);
+        pos = end;
     }
     if !inserted {
         out.extend_from_slice(&text_chunk);
@@ -154,7 +167,7 @@ pub fn extract_chiralcraft_cdxml_from_png(png_bytes: &[u8]) -> Option<String> {
         return None;
     }
     let mut pos = 8usize;
-    while pos + 12 <= png_bytes.len() {
+    while pos.checked_add(12).is_some_and(|e| e <= png_bytes.len()) {
         let len = u32::from_be_bytes([
             png_bytes[pos],
             png_bytes[pos + 1],
@@ -162,21 +175,31 @@ pub fn extract_chiralcraft_cdxml_from_png(png_bytes: &[u8]) -> Option<String> {
             png_bytes[pos + 3],
         ]) as usize;
         let ctype = &png_bytes[pos + 4..pos + 8];
-        let total = 12 + len;
-        if pos + total > png_bytes.len() {
+        let total = len.checked_add(12)?;
+        let end = pos.checked_add(total)?;
+        if end > png_bytes.len() {
             break;
         }
         if ctype == b"tEXt" {
-            let data = &png_bytes[pos + 8..pos + 8 + len];
-            if let Some(nul) = data.iter().position(|&b| b == 0) {
-                if &data[..nul] == PNG_TEXT_KEYWORD {
-                    let b64 = std::str::from_utf8(&data[nul + 1..]).ok()?;
-                    let decoded = base64_decode(b64).ok()?;
-                    return String::from_utf8(decoded).ok();
+            let expected_crc = u32::from_be_bytes([
+                png_bytes[end - 4],
+                png_bytes[end - 3],
+                png_bytes[end - 2],
+                png_bytes[end - 1],
+            ]);
+            let actual_crc = crc32(&png_bytes[pos + 4..pos + 8 + len]);
+            if actual_crc == expected_crc {
+                let data = &png_bytes[pos + 8..pos + 8 + len];
+                if let Some(nul) = data.iter().position(|&b| b == 0) {
+                    if &data[..nul] == PNG_TEXT_KEYWORD {
+                        let b64 = std::str::from_utf8(&data[nul + 1..]).ok()?;
+                        let decoded = base64_decode(b64).ok()?;
+                        return String::from_utf8(decoded).ok();
+                    }
                 }
             }
         }
-        pos += total;
+        pos = end;
     }
     None
 }
@@ -242,10 +265,12 @@ pub fn scene_to_editable_pdf(
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
     let mut expand = |x: f64, y: f64| {
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
+        if x.is_finite() && y.is_finite() {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
     };
     for m in molecules {
         for a in &m.atoms {
@@ -311,6 +336,39 @@ pub fn scene_to_editable_pdf(
                         ex + nx * hw, ey + ny * hw, ex - nx * hw, ey - ny * hw
                     ));
                 }
+                BondDisplay::WedgedHashBegin | BondDisplay::WedgedHashEnd => {
+                    let (sx, sy, ex, ey) = if b.display == BondDisplay::WedgedHashBegin {
+                        (x1, y1, x2, y2)
+                    } else {
+                        (x2, y2, x1, y1)
+                    };
+                    let steps = ((len / 2.5).round() as usize).clamp(4, 64);
+                    for s in 1..=steps {
+                        let t = s as f64 / steps as f64;
+                        let cx = sx + (ex - sx) * t;
+                        let cy = sy + (ey - sy) * t;
+                        let hw = 2.0 * t;
+                        content.push_str(&format!(
+                            "{:.2} {:.2} m {:.2} {:.2} l S\n",
+                            cx + nx * hw, cy + ny * hw, cx - nx * hw, cy - ny * hw
+                        ));
+                    }
+                }
+                BondDisplay::Hash | BondDisplay::Dash => {
+                    content.push_str(&format!("[2.2 1.8] 0 d {x1:.2} {y1:.2} m {x2:.2} {y2:.2} l S [] 0 d\n"));
+                }
+                BondDisplay::Wavy => {
+                    let steps = ((len / 2.2).round() as usize).clamp(6, 64);
+                    content.push_str(&format!("{x1:.2} {y1:.2} m "));
+                    for s in 1..=steps {
+                        let t = s as f64 / steps as f64;
+                        let wave = (t * std::f64::consts::PI * (steps as f64 * 0.5)).sin() * 1.4;
+                        let wx = x1 + dx * t + nx * wave;
+                        let wy = y1 + dy * t + ny * wave;
+                        content.push_str(&format!("{wx:.2} {wy:.2} l "));
+                    }
+                    content.push_str("S\n");
+                }
                 BondDisplay::Bold => {
                     content.push_str(&format!("2.1 w {x1:.2} {y1:.2} m {x2:.2} {y2:.2} l S 0.85 w\n"));
                 }
@@ -346,7 +404,15 @@ pub fn scene_to_editable_pdf(
                 let h = val.implicit_h_counts.get(ai).copied().unwrap_or(0);
                 let mut s = sym.to_string();
                 if h == 1 { s.push('H'); } else if h > 1 { s.push_str(&format!("H{h}")); }
-                if a.charge > 0 { s.push('+'); } else if a.charge < 0 { s.push('-'); }
+                if a.charge > 1 {
+                    s.push_str(&format!("{}+", a.charge));
+                } else if a.charge == 1 {
+                    s.push('+');
+                } else if a.charge == -1 {
+                    s.push('-');
+                } else if a.charge < -1 {
+                    s.push_str(&format!("{}-", a.charge.unsigned_abs()));
+                }
                 Some(s)
             } else {
                 None
@@ -441,6 +507,9 @@ pub fn scene_to_editable_pdf(
         ),
     );
 
+    // Embed the ChiralCraft CDXML payload comment BEFORE xref so %%EOF is always the final bytes
+    // (satisfying ISO 32000-1 / PDF 1.4 §7.5.5 1024-byte %%EOF tail window regardless of diagram size!).
+    pdf.extend_from_slice(format!("{PDF_B64_PREFIX}{cdxml_b64}\n").as_bytes());
     let xref_pos = pdf.len();
     pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
     for &off in offsets.iter().skip(1) {
@@ -448,7 +517,7 @@ pub fn scene_to_editable_pdf(
     }
     pdf.extend_from_slice(
         format!(
-            "trailer\n<< /Size {} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n{PDF_B64_PREFIX}{cdxml_b64}\n",
+            "trailer\n<< /Size {} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
             offsets.len()
         )
         .as_bytes(),

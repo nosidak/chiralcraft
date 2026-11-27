@@ -219,11 +219,23 @@ fn parse_cif_float(s: &str) -> Option<f64> {
 }
 
 fn extract_cif_element(raw: &str) -> i32 {
-    let letters: String = raw
-        .trim()
+    let trimmed = raw.trim();
+    if let Ok(z) = trimmed.parse::<i32>() {
+        if (1..=118).contains(&z) {
+            return z;
+        }
+    }
+    let letters: String = trimmed
         .chars()
+        .skip_while(|c| !c.is_ascii_alphabetic())
         .take_while(|c| c.is_ascii_alphabetic())
         .collect();
+    if letters.eq_ignore_ascii_case("D") {
+        return 225;
+    }
+    if letters.eq_ignore_ascii_case("T") {
+        return 226;
+    }
     if letters.len() >= 2 {
         let two = format!(
             "{}{}",
@@ -241,6 +253,40 @@ fn extract_cif_element(raw: &str) -> i32 {
         }
     }
     6
+}
+
+/// Extracts atomic number from PDB columns 76..78 (explicit element) or 12..16 (atom name),
+/// avoiding false matches of standard organic/protein atom names (`CA`, `CD`, `NE`, `HG`, `1HB`) as metals/noble gases!
+fn extract_pdb_element(line: &str) -> i32 {
+    if let Some(elem_col) = line.get(76..78).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return extract_cif_element(elem_col);
+    }
+    let name_col = line.get(12..16).unwrap_or(" C  ");
+    // In PDB format, columns 12-13 (first two chars of 12..16) hold the right-justified element symbol
+    // unless col 12 is a digit (e.g. "1HB ", "2HG1" -> hydrogen!)
+    let c0 = name_col.as_bytes().first().copied().unwrap_or(b' ');
+    if c0.is_ascii_digit() {
+        let second = name_col.as_bytes().get(1).copied().unwrap_or(b'H') as char;
+        if second.eq_ignore_ascii_case(&'H') {
+            return 1;
+        }
+        if second.eq_ignore_ascii_case(&'D') {
+            return 225;
+        }
+    }
+    let trimmed = name_col.trim();
+    // Standard protein/nucleic organic atom names: CA/CB/CG/CD/CE/CZ, NA/NB/ND/NE/NZ, OA/OD/OE/OG/OH/OP, HA/HB/HD/HE/HG/HH/HZ, SD/SG
+    if c0 == b' ' {
+        if let Some(first_alpha) = trimmed.chars().find(|c| c.is_ascii_alphabetic()) {
+            let one = first_alpha.to_ascii_uppercase().to_string();
+            if matches!(one.as_str(), "C" | "N" | "O" | "H" | "S" | "P" | "F" | "I" | "B") {
+                if let Some(el) = get_element_by_symbol(&one) {
+                    return el.z;
+                }
+            }
+        }
+    }
+    extract_cif_element(trimmed)
 }
 
 /// Parses a `.cif` (Crystallographic Information File) asymmetric unit into a 3D `ChemMolecule`
@@ -379,7 +425,15 @@ pub fn pdb_to_molecule(pdb: &str) -> Result<ChemMolecule, String> {
     let mut serial_to_idx: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
     let mut conect_pairs: Vec<(i32, i32)> = Vec::new();
 
+    let mut in_first_model = true;
     for line in pdb.lines() {
+        if line.starts_with("ENDMDL") && !mol.atoms.is_empty() {
+            in_first_model = false;
+            continue;
+        }
+        if !in_first_model && (line.starts_with("ATOM  ") || line.starts_with("HETATM")) {
+            continue;
+        }
         if line.starts_with("ATOM  ") || line.starts_with("HETATM") {
             let serial: i32 = line
                 .get(6..11)
@@ -391,21 +445,27 @@ pub fn pdb_to_molecule(pdb: &str) -> Result<ChemMolecule, String> {
             let (Some(x), Some(y), Some(zc)) = (x, y, zc) else {
                 continue;
             };
-            let elem_raw = line
-                .get(76..78)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| line.get(12..16).map(|s| s.trim()).unwrap_or("C"));
-            let z = extract_cif_element(elem_raw);
+            if !x.is_finite() || !y.is_finite() || !zc.is_finite() {
+                continue;
+            }
+            let z = extract_pdb_element(line);
             let idx = mol.atoms.len();
             serial_to_idx.insert(serial, idx);
             mol.add_atom(ChemAtom::new((idx + 1) as u32, z));
             coords.push((x, y, zc));
         } else if line.starts_with("CONECT") {
-            let toks: Vec<i32> = line[6..]
-                .split_whitespace()
-                .filter_map(|t| t.parse::<i32>().ok())
-                .collect();
+            // Fixed-width 5-column PDB CONECT fields (handles >= 10,000 atoms where fields touch)
+            let mut toks: Vec<i32> = Vec::new();
+            let mut pos = 6usize;
+            while pos < line.len() {
+                let end = (pos + 5).min(line.len());
+                if let Some(chunk) = line.get(pos..end) {
+                    if let Ok(v) = chunk.trim().parse::<i32>() {
+                        toks.push(v);
+                    }
+                }
+                pos = end;
+            }
             if toks.len() >= 2 {
                 let a = toks[0];
                 for &b in &toks[1..] {
@@ -442,25 +502,43 @@ pub fn poscar_to_molecule_with_cell(poscar: &str) -> Result<(ChemMolecule, Cryst
     if lines.len() < 8 {
         return Err("POSCAR/CONTCAR file too short".to_string());
     }
-    let scale_factor: f64 = lines[1]
+    let raw_scale: f64 = lines[1]
         .split_whitespace()
         .next()
         .and_then(|s| s.parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v != 0.0)
         .ok_or_else(|| "Invalid scale factor on line 2 of POSCAR".to_string())?;
-    let parse_vec3 = |line: &str| -> Result<(f64, f64, f64), String> {
+    let parse_raw_vec3 = |line: &str| -> Result<(f64, f64, f64), String> {
         let vals: Vec<f64> = line
             .split_whitespace()
             .take(3)
             .filter_map(|t| t.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
             .collect();
         if vals.len() < 3 {
             return Err(format!("Expected 3 lattice vector components in POSCAR line: {line}"));
         }
-        Ok((vals[0] * scale_factor, vals[1] * scale_factor, vals[2] * scale_factor))
+        Ok((vals[0], vals[1], vals[2]))
     };
-    let va_ang = parse_vec3(lines[2])?;
-    let vb_ang = parse_vec3(lines[3])?;
-    let vc_ang = parse_vec3(lines[4])?;
+    let va_raw = parse_raw_vec3(lines[2])?;
+    let vb_raw = parse_raw_vec3(lines[3])?;
+    let vc_raw = parse_raw_vec3(lines[4])?;
+    // Per VASP spec: negative scale_factor is target unit-cell volume (Å³), not linear scale!
+    let scale_factor = if raw_scale < 0.0 {
+        let det = (va_raw.0 * (vb_raw.1 * vc_raw.2 - vb_raw.2 * vc_raw.1)
+            - va_raw.1 * (vb_raw.0 * vc_raw.2 - vb_raw.2 * vc_raw.0)
+            + va_raw.2 * (vb_raw.0 * vc_raw.1 - vb_raw.1 * vc_raw.0))
+            .abs();
+        if det < 1e-12 {
+            return Err("Degenerate POSCAR lattice vectors for volume scaling".to_string());
+        }
+        ((-raw_scale) / det).cbrt()
+    } else {
+        raw_scale
+    };
+    let va_ang = (va_raw.0 * scale_factor, va_raw.1 * scale_factor, va_raw.2 * scale_factor);
+    let vb_ang = (vb_raw.0 * scale_factor, vb_raw.1 * scale_factor, vb_raw.2 * scale_factor);
+    let vc_ang = (vc_raw.0 * scale_factor, vc_raw.1 * scale_factor, vc_raw.2 * scale_factor);
 
     // Line 6 may be element symbols (VASP 5+) or counts (VASP 4)
     let tok5: Vec<&str> = lines[5].split_whitespace().collect();
@@ -493,7 +571,17 @@ pub fn poscar_to_molecule_with_cell(poscar: &str) -> Result<(ChemMolecule, Cryst
     let is_direct = !mode_line.to_ascii_lowercase().starts_with('c')
         && !mode_line.to_ascii_lowercase().starts_with('k');
 
-    let mut atom_zs = Vec::new();
+    let avail_lines = lines.len().saturating_sub(mode_idx + 1);
+    let total_atoms = counts
+        .iter()
+        .try_fold(0usize, |acc, &c| acc.checked_add(c))
+        .ok_or_else(|| "POSCAR atom count overflow".to_string())?;
+    if total_atoms > avail_lines || total_atoms > 200_000 {
+        return Err(format!(
+            "POSCAR atom count ({total_atoms}) exceeds available coordinate lines ({avail_lines})"
+        ));
+    }
+    let mut atom_zs = Vec::with_capacity(total_atoms);
     for (si, &cnt) in counts.iter().enumerate() {
         let z = species.get(si).copied().unwrap_or(6);
         for _ in 0..cnt {

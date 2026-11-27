@@ -206,13 +206,32 @@ pub fn sequence_to_biopolymer_molecule(
     kind: PolymerKind,
     bond_length_pt: f64,
 ) -> Result<ChemMolecule, String> {
-    let letters: Vec<String> = seq_input
+    let body: String = seq_input
         .lines()
         .filter(|l| !l.trim().starts_with('>'))
-        .flat_map(|l| l.chars())
-        .filter(|c| c.is_ascii_alphabetic())
-        .map(|c| c.to_ascii_uppercase().to_string())
-        .collect();
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = body.trim();
+    let letters: Vec<String> = if trimmed.contains('-') || trimmed.contains('.') {
+        trimmed
+            .split(|c: char| c == '-' || c == '.' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.chars().any(|c| c.is_ascii_alphanumeric()))
+            .map(|s| {
+                if s.len() == 1 {
+                    s.to_ascii_uppercase()
+                } else {
+                    s.to_string()
+                }
+            })
+            .collect()
+    } else {
+        trimmed
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .collect()
+    };
     if letters.is_empty() {
         return Err("No valid monomer letters found in sequence".to_string());
     }
@@ -225,52 +244,112 @@ pub fn helm_to_molecule(helm: &str, bond_length_pt: f64) -> Result<ChemMolecule,
     let trimmed = helm.trim();
     let sections: Vec<&str> = trimmed.split('$').collect();
     let poly_part = sections.first().copied().unwrap_or(trimmed);
-    let first_poly = poly_part.split('|').next().unwrap_or(poly_part);
-    let brace_start = first_poly
-        .find('{')
-        .ok_or_else(|| "HELM string must contain `{monomers}`".to_string())?;
-    let brace_end = first_poly
-        .rfind('}')
-        .ok_or_else(|| "HELM string missing closing `}`".to_string())?;
-    let header = first_poly[..brace_start].to_ascii_uppercase();
-    let kind = if header.starts_with("RNA") {
-        PolymerKind::Rna
-    } else if header.starts_with("DNA") {
-        PolymerKind::Dna
-    } else {
-        PolymerKind::Peptide
-    };
-    let body = &first_poly[brace_start + 1..brace_end];
-    let monomers: Vec<String> = body
-        .split('.')
-        .map(|m| m.trim().trim_matches(['[', ']']).to_string())
-        .filter(|m| !m.is_empty())
-        .collect();
-    if monomers.is_empty() {
-        return Err("No monomers found inside HELM `{...}`".to_string());
+
+    let mut mol = ChemMolecule::default();
+    let mut poly_atom_map: HashMap<(String, usize), usize> = HashMap::new();
+    let mut next_aid = 1u32;
+    let mut next_bid = 1000u32;
+    let step = (bond_length_pt * 1.65).max(20.0);
+    let per_row = 12usize;
+    let mut chain_y_offset = 0.0_f64;
+
+    for poly_str in poly_part.split('|').filter(|s| !s.trim().is_empty()) {
+        let brace_start = poly_str
+            .find('{')
+            .ok_or_else(|| "HELM string must contain `{monomers}`".to_string())?;
+        let brace_end = poly_str
+            .rfind('}')
+            .ok_or_else(|| "HELM string missing closing `}`".to_string())?;
+        if brace_end <= brace_start {
+            return Err("Malformed HELM braces".to_string());
+        }
+        let poly_id = poly_str[..brace_start].trim().to_ascii_uppercase();
+        let kind = if poly_id.starts_with("RNA") {
+            PolymerKind::Rna
+        } else if poly_id.starts_with("DNA") {
+            PolymerKind::Dna
+        } else {
+            PolymerKind::Peptide
+        };
+        let body = &poly_str[brace_start + 1..brace_end];
+        let monomers: Vec<String> = body
+            .split('.')
+            .map(|m| m.trim().trim_matches(['[', ']']).to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if monomers.is_empty() {
+            return Err("No monomers found inside HELM `{...}`".to_string());
+        }
+        let mut prev_idx: Option<usize> = None;
+        for (i, sym) in monomers.iter().enumerate() {
+            let row = i / per_row;
+            let col = i % per_row;
+            let eff_col = if row % 2 == 0 { col } else { per_row - 1 - col };
+            let mut a = ChemAtom::new(next_aid, 6);
+            next_aid = next_aid.saturating_add(1);
+            a.x = 120.0 + (eff_col as f64) * step;
+            a.y = 140.0 + chain_y_offset + (row as f64) * (step * 1.4);
+            a.label = Some(match kind {
+                PolymerKind::Peptide => {
+                    if sym.len() == 1 {
+                        one_to_three_aa(sym).unwrap_or(sym).to_string()
+                    } else {
+                        sym.clone()
+                    }
+                }
+                PolymerKind::Dna => {
+                    if sym.len() == 1 { format!("d{sym}") } else { sym.clone() }
+                }
+                PolymerKind::Rna => sym.clone(),
+            });
+            let idx = mol.add_atom(a);
+            poly_atom_map.insert((poly_id.clone(), i + 1), idx);
+            if let Some(p) = prev_idx {
+                mol.bonds.push(ChemBond {
+                    id: next_bid,
+                    begin_atom: p,
+                    end_atom: idx,
+                    order: 1,
+                    display: BondDisplay::Solid,
+                    visible: true,
+                    ignore_warnings: false,
+                });
+                next_bid = next_bid.saturating_add(1);
+            }
+            prev_idx = Some(idx);
+        }
+        let rows = monomers.len().div_ceil(per_row).max(1);
+        chain_y_offset += (rows as f64 + 0.8) * (step * 1.4);
     }
-    let mut mol = build_monomer_chain(&monomers, kind, bond_length_pt)?;
+    if mol.atoms.is_empty() {
+        return Err("No polymers found in HELM string".to_string());
+    }
     // Parse optional HELM connection section (e.g. `PEPTIDE1,PEPTIDE1,1:R3-5:R3`)
     if let Some(conn_sec) = sections.get(1) {
-        let mut next_bid = (mol.atoms.len() + mol.bonds.len() + 10) as u32;
         for conn in conn_sec.split('|').filter(|c| !c.trim().is_empty()) {
             let cols: Vec<&str> = conn.split(',').collect();
             if cols.len() >= 3 {
+                let p1 = cols[0].trim().to_ascii_uppercase();
+                let p2 = cols[1].trim().to_ascii_uppercase();
                 if let Some((lhs, rhs)) = cols[2].split_once('-') {
-                    let i1 = lhs.split(':').next().and_then(|s| s.parse::<usize>().ok());
-                    let i2 = rhs.split(':').next().and_then(|s| s.parse::<usize>().ok());
-                    if let (Some(a), Some(b)) = (i1, i2) {
-                        if a >= 1 && b >= 1 && a <= mol.atoms.len() && b <= mol.atoms.len() && a != b {
-                            mol.bonds.push(ChemBond {
-                                id: next_bid,
-                                begin_atom: a - 1,
-                                end_atom: b - 1,
-                                order: 1,
-                                display: BondDisplay::Solid,
-                                visible: true,
-                                ignore_warnings: false,
-                            });
-                            next_bid += 1;
+                    let i1 = lhs.split(':').next().and_then(|s| s.trim().parse::<usize>().ok());
+                    let i2 = rhs.split(':').next().and_then(|s| s.trim().parse::<usize>().ok());
+                    if let (Some(a1), Some(b1)) = (i1, i2) {
+                        let idx_a = poly_atom_map.get(&(p1, a1)).copied();
+                        let idx_b = poly_atom_map.get(&(p2, b1)).copied();
+                        if let (Some(ia), Some(ib)) = (idx_a, idx_b) {
+                            if ia != ib {
+                                mol.bonds.push(ChemBond {
+                                    id: next_bid,
+                                    begin_atom: ia,
+                                    end_atom: ib,
+                                    order: 1,
+                                    display: BondDisplay::Solid,
+                                    visible: true,
+                                    ignore_warnings: false,
+                                });
+                                next_bid = next_bid.saturating_add(1);
+                            }
                         }
                     }
                 }
@@ -342,31 +421,46 @@ pub fn monomer_to_all_atom_molecule(lib: &MonomerLibrary, polymer_type: &str, sy
 /// Serializes a biopolymer or peptide molecule into **HELM v2.0** notation (`PEPTIDE1{A.C.D}$$$$V2.0`).
 pub fn molecule_to_helm(mol: &ChemMolecule) -> String {
     let mut tokens: Vec<String> = Vec::new();
+    let mut atom_to_monomer: HashMap<usize, usize> = HashMap::new();
     let mut is_nucleic = false;
-    for a in &mol.atoms {
+    for (ai, a) in mol.atoms.iter().enumerate() {
         if let Some(lbl) = &a.label {
-            if let Some(one) = three_to_one_aa(lbl) {
-                tokens.push(one.to_string());
+            let tok = if let Some(one) = three_to_one_aa(lbl) {
+                one.to_string()
+            } else if lbl.starts_with("R(") || lbl.starts_with("[dR](") || lbl.starts_with("dR(") {
+                is_nucleic = true;
+                lbl.clone()
             } else if lbl.starts_with('d') && lbl.len() == 2 && matches!(&lbl[1..], "A" | "C" | "G" | "T") {
                 is_nucleic = true;
-                tokens.push(format!("[dR]({})P", &lbl[1..]));
+                format!("[dR]({})P", &lbl[1..])
             } else if matches!(lbl.as_str(), "A" | "C" | "G" | "U" | "T") {
                 is_nucleic = true;
-                tokens.push(format!("R({lbl})P"));
+                format!("R({lbl})P")
+            } else if lbl.len() > 1 {
+                format!("[{lbl}]")
             } else {
-                tokens.push(if lbl.len() > 1 { format!("[{lbl}]") } else { lbl.clone() });
-            }
+                lbl.clone()
+            };
+            tokens.push(tok);
+            atom_to_monomer.insert(ai, tokens.len());
         }
     }
     if tokens.is_empty() {
         let smi = crate::molecule_to_smiles(mol);
         return format!("CHEM1{{[{smi}]}}$$$$V2.0");
     }
-    if is_nucleic {
-        format!("RNA1{{{}}}$$$$V2.0", tokens.join("."))
-    } else {
-        format!("PEPTIDE1{{{}}}$$$$V2.0", tokens.join("."))
+    let poly_id = if is_nucleic { "RNA1" } else { "PEPTIDE1" };
+    // Preserve non-backbone cross-links (cyclic / disulfide bonds)
+    let mut conns: Vec<String> = Vec::new();
+    for b in &mol.bonds {
+        if let (Some(&m1), Some(&m2)) = (atom_to_monomer.get(&b.begin_atom), atom_to_monomer.get(&b.end_atom)) {
+            if m1.abs_diff(m2) > 1 {
+                let (lo, hi) = if m1 < m2 { (m1, m2) } else { (m2, m1) };
+                conns.push(format!("{poly_id},{poly_id},{lo}:R3-{hi}:R3"));
+            }
+        }
     }
+    format!("{poly_id}{{{}}}${}$$$V2.0", tokens.join("."), conns.join("|"))
 }
 
 /// Serializes a biopolymer molecule into **FASTA** format (`>ChiralCraft_Sequence\nACDEF...`).

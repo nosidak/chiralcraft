@@ -214,8 +214,12 @@ pub fn add_explicit_hydrogens_3d(mol: &ChemMolecule) -> ExplicitHResult {
                     let d1 = v_add(v_scale(bis, ch), v_scale(norm, sh));
                     let d2 = v_add(v_scale(bis, ch), v_scale(norm, -sh));
                     let mut out_d = vec![v_unit(d1).unwrap_or(bis), v_unit(d2).unwrap_or(bis)];
+                    let mut extra = 0usize;
                     while out_d.len() < imp_h {
-                        out_d.push(bis);
+                        let ang = (extra as f64 + 1.0) * 1.1;
+                        let spread = v_add(v_scale(bis, ang.cos()), v_scale(norm, ang.sin()));
+                        out_d.push(v_unit(spread).unwrap_or(bis));
+                        extra += 1;
                     }
                     out_d
                 }
@@ -233,19 +237,35 @@ pub fn add_explicit_hydrogens_3d(mol: &ChemMolecule) -> ExplicitHResult {
                     let n_vec = v_unit(v_cross(dirs[0], dirs[1])).unwrap_or([0.0, 0.0, 1.0]);
                     if p0[2] >= 0.0 { n_vec } else { v_scale(n_vec, -1.0) }
                 };
-                vec![dir; imp_h]
+                if imp_h <= 1 {
+                    vec![dir; imp_h]
+                } else {
+                    let ref_v = if dir[0].abs() < 0.8 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+                    let t1 = v_unit(v_cross(dir, ref_v)).unwrap_or([0.0, 1.0, 0.0]);
+                    let t2 = v_unit(v_cross(dir, t1)).unwrap_or([1.0, 0.0, 0.0]);
+                    (0..imp_h)
+                        .map(|k| {
+                            let phi = (k as f64) * std::f64::consts::TAU / (imp_h as f64);
+                            let v = v_add(
+                                v_scale(dir, 0.85),
+                                v_scale(v_add(v_scale(t1, phi.cos()), v_scale(t2, phi.sin())), 0.52),
+                            );
+                            v_unit(v).unwrap_or(dir)
+                        })
+                        .collect()
+                }
             }
         };
 
         for d in h_dirs {
             let mut h_atom = ChemAtom::new(next_atom_id, 1);
-            next_atom_id += 1;
+            next_atom_id = next_atom_id.saturating_add(1);
             h_atom.x = p0[0] + d[0] * xh_len_pt;
             h_atom.y = p0[1] + d[1] * xh_len_pt;
             h_atom.z_coord = p0[2] + d[2] * xh_len_pt;
             let h_idx = out.add_atom(h_atom);
             out.add_bond(next_bond_id, i, h_idx, 1, BondDisplay::Solid);
-            next_bond_id += 1;
+            next_bond_id = next_bond_id.saturating_add(1);
             parent_heavy_atom.push(Some(i));
             added_h_count += 1;
         }
@@ -253,7 +273,9 @@ pub fn add_explicit_hydrogens_3d(mol: &ChemMolecule) -> ExplicitHResult {
         out.atoms[i].explicit_num_hydrogens = None;
     }
 
-    out.has_3d_coords = true;
+    if added_h_count > 0 || out.atoms.iter().any(|a| a.z_coord.abs() > 1e-4) {
+        out.has_3d_coords = true;
+    }
     ExplicitHResult {
         molecule: out,
         parent_heavy_atom,
@@ -343,10 +365,13 @@ pub fn measure_angle_deg(mol: &ChemMolecule, i: usize, j: usize, k: usize) -> Op
     let v2 = (c.x - b.x, c.y - b.y, c.z_coord - b.z_coord);
     let n1 = (v1.0 * v1.0 + v1.1 * v1.1 + v1.2 * v1.2).sqrt();
     let n2 = (v2.0 * v2.0 + v2.1 * v2.1 + v2.2 * v2.2).sqrt();
-    if n1 < 1e-6 || n2 < 1e-6 {
+    if !n1.is_finite() || !n2.is_finite() || n1 < 1e-6 || n2 < 1e-6 {
         return None;
     }
     let cos_t = ((v1.0 * v2.0 + v1.1 * v2.1 + v1.2 * v2.2) / (n1 * n2)).clamp(-1.0, 1.0);
+    if !cos_t.is_finite() {
+        return None;
+    }
     Some(cos_t.acos().to_degrees())
 }
 
@@ -365,8 +390,10 @@ pub fn measure_dihedral_deg(mol: &ChemMolecule, i: usize, j: usize, k: usize, l:
     let b3 = sub(p3, p2);
     let n1 = cross(b1, b2);
     let n2 = cross(b2, b3);
+    let nn1 = norm(n1);
+    let nn2 = norm(n2);
     let b2n = norm(b2);
-    if norm(n1) < 1e-6 || norm(n2) < 1e-6 || b2n < 1e-6 {
+    if !nn1.is_finite() || !nn2.is_finite() || !b2n.is_finite() || nn1 < 1e-6 || nn2 < 1e-6 || b2n < 1e-6 {
         return None;
     }
     let b2u = (b2.0 / b2n, b2.1 / b2n, b2.2 / b2n);
@@ -379,14 +406,14 @@ pub fn measure_dihedral_deg(mol: &ChemMolecule, i: usize, j: usize, k: usize, l:
 /// Runs pure-Rust UFF-lite 3D molecular mechanics optimization with adaptive steepest descent.
 pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecule, ForceFieldReport) {
     let n = mol.atoms.len();
-    if n < 2 {
+    if n < 2 || mol.atoms.iter().any(|a| !a.x.is_finite() || !a.y.is_finite() || !a.z_coord.is_finite()) {
         return (
             mol.clone(),
             ForceFieldReport {
                 initial_energy_kcal: 0.0,
                 final_energy_kcal: 0.0,
                 iterations: 0,
-                converged: true,
+                converged: n < 2,
             },
         );
     }
@@ -398,6 +425,9 @@ pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecu
     for (bi, b) in mol.bonds.iter().enumerate() {
         if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
             let (u, v) = (b.begin_atom, b.end_atom);
+            if bonded[u][v] {
+                continue;
+            }
             adj[u].push((v, b.order));
             adj[v].push((u, b.order));
             bonded[u][v] = true;
@@ -415,9 +445,12 @@ pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecu
     for j in 0..n {
         let deg = adj[j].len();
         let has_triple = adj[j].iter().any(|&(_, o)| o >= 3);
-        let has_double = adj[j].iter().any(|&(_, o)| o == 2) || arom.is_atom_aromatic(j);
-        let theta0 = if has_triple {
+        let double_cnt = adj[j].iter().filter(|&&(_, o)| o == 2).count();
+        let has_double = double_cnt >= 1 || arom.is_atom_aromatic(j);
+        let theta0 = if has_triple || (deg == 2 && double_cnt >= 2) {
             std::f64::consts::PI
+        } else if deg >= 4 {
+            109.47_f64.to_radians()
         } else if has_double {
             120.0_f64.to_radians()
         } else {
@@ -456,6 +489,20 @@ pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecu
             [(a.x - cx) / PT_PER_ANG, (a.y - cy) / PT_PER_ANG, z_init]
         })
         .collect();
+    // Deterministic symmetry-breaking perturbation if any two atoms are coincident (prevents zero-gradient trap)
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = pos[j][0] - pos[i][0];
+            let dy = pos[j][1] - pos[i][1];
+            let dz = pos[j][2] - pos[i][2];
+            if dx * dx + dy * dy + dz * dz < 1e-8 {
+                let phi = (j as f64) * 2.399963229728653;
+                pos[j][0] += 0.05 * phi.cos();
+                pos[j][1] += 0.05 * phi.sin();
+                pos[j][2] += if j % 2 == 0 { 0.04 } else { -0.04 };
+            }
+        }
+    }
 
     let eval_energy_and_grad = |p: &[[f64; 3]], grad: &mut [[f64; 3]]| -> f64 {
         for g in grad.iter_mut() {
@@ -553,6 +600,10 @@ pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecu
 
     for it in 0..max_iters.clamp(10, 400) {
         iters = it + 1;
+        if !cur_e.is_finite() || grad.iter().any(|g| !g[0].is_finite() || !g[1].is_finite() || !g[2].is_finite()) {
+            converged = false;
+            break;
+        }
         let max_g = grad
             .iter()
             .map(|g| (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt())
@@ -570,7 +621,7 @@ pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecu
         }
         let mut trial_grad = vec![[0.0; 3]; n];
         let trial_e = eval_energy_and_grad(&trial, &mut trial_grad);
-        if trial_e <= cur_e {
+        if trial_e.is_finite() && trial_e <= cur_e {
             pos = trial;
             grad = trial_grad;
             cur_e = trial_e;
@@ -587,7 +638,7 @@ pub fn optimize_geometry_3d(mol: &ChemMolecule, max_iters: usize) -> (ChemMolecu
     for (i, a) in out.atoms.iter_mut().enumerate() {
         a.x = cx + pos[i][0] * PT_PER_ANG;
         a.y = cy + pos[i][1] * PT_PER_ANG;
-        a.z_coord = pos[i][2] * PT_PER_ANG;
+        a.z_coord = cz + pos[i][2] * PT_PER_ANG;
     }
     out.has_3d_coords = true;
     (

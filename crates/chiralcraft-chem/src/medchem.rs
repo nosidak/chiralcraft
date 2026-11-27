@@ -132,7 +132,10 @@ pub fn detect_structural_alerts(mol: &ChemMolecule) -> Vec<StructuralAlert> {
                     let heavy_deg = adj[i].iter().filter(|&&(nb, _)| mol.atoms[nb].z > 1).count();
                     let imp_h = val.implicit_h_counts.get(i).copied().unwrap_or(0);
                     let exp_h = adj[i].iter().filter(|&&(nb, _)| mol.atoms[nb].z == 1).count();
-                    if heavy_deg <= 2 && (imp_h as usize + exp_h) >= 1 {
+                    let has_single_hetero = adj[i]
+                        .iter()
+                        .any(|&(nb, ord)| nb != o_idx && ord == 1 && matches!(mol.atoms[nb].z, 7 | 8 | 16));
+                    if heavy_deg <= 2 && !has_single_hetero && (imp_h as usize + exp_h) >= 1 {
                         alerts.push(StructuralAlert {
                             name: "Aldehyde (reactive Schiff-base electrophile)",
                             category: "Brenk",
@@ -179,7 +182,7 @@ pub fn detect_structural_alerts(mol: &ChemMolecule) -> Vec<StructuralAlert> {
     // 4. Epoxide / Aziridine / Strained 3-membered heterocycle
     for i in 0..n {
         if matches!(mol.atoms[i].z, 7 | 8) {
-            let nbrs: Vec<usize> = adj[i].iter().map(|&(nb, _)| nb).collect();
+            let nbrs: Vec<usize> = adj[i].iter().map(|&(nb, _)| nb).filter(|&nb| mol.atoms[nb].z == 6).collect();
             'tri: for a in 0..nbrs.len() {
                 for b in (a + 1)..nbrs.len() {
                     let (u, v) = (nbrs[a], nbrs[b]);
@@ -199,7 +202,7 @@ pub fn detect_structural_alerts(mol: &ChemMolecule) -> Vec<StructuralAlert> {
 
     // 5. Peroxide (O-O), Hydrazine/Azo (N-N / N=N), Disulfide (S-S)
     for b in &mol.bonds {
-        if b.begin_atom >= n || b.end_atom >= n {
+        if b.begin_atom >= n || b.end_atom >= n || b.begin_atom == b.end_atom {
             continue;
         }
         let (u, v) = (b.begin_atom, b.end_atom);
@@ -218,6 +221,13 @@ pub fn detect_structural_alerts(mol: &ChemMolecule) -> Vec<StructuralAlert> {
                 severity: AlertSeverity::Warning,
                 atom_indices: vec![u, v],
             });
+        } else if zu == 16 && zv == 16 {
+            alerts.push(StructuralAlert {
+                name: "Disulfide (S–S redox-labile alert)",
+                category: "Brenk",
+                severity: AlertSeverity::Warning,
+                atom_indices: vec![u, v],
+            });
         }
     }
 
@@ -226,6 +236,8 @@ pub fn detect_structural_alerts(mol: &ChemMolecule) -> Vec<StructuralAlert> {
     for i in 0..n {
         let z = mol.atoms[i].z;
         let heavy_deg = adj[i].iter().filter(|&&(nb, _)| mol.atoms[nb].z > 1).count();
+        let total_h = val.implicit_h_counts.get(i).copied().unwrap_or(0) as usize
+            + adj[i].iter().filter(|&&(nb, _)| mol.atoms[nb].z == 1).count();
         if z == 7 && heavy_deg == 1 {
             if let Some(&(nb, _)) = adj[i].iter().find(|&&(k, _)| mol.atoms[k].z == 6 && arom.is_atom_aromatic(k)) {
                 alerts.push(StructuralAlert {
@@ -239,7 +251,7 @@ pub fn detect_structural_alerts(mol: &ChemMolecule) -> Vec<StructuralAlert> {
             if let Some(&(nb, _)) = adj[i].iter().find(|&&(k, _)| mol.atoms[k].z == 6 && arom.is_atom_aromatic(k)) {
                 arom_oh_carbons.push((nb, i));
             }
-        } else if z == 16 && heavy_deg == 1 && val.implicit_h_counts.get(i).copied().unwrap_or(0) >= 1 {
+        } else if z == 16 && heavy_deg == 1 && total_h >= 1 {
             alerts.push(StructuralAlert {
                 name: "Free Thiol (-SH redox / covalent alert)",
                 category: "Brenk",
@@ -336,7 +348,42 @@ pub fn compute_medchem_report(mol: &ChemMolecule) -> MedChemReport {
     }
 
     let arom_atoms = (0..n).filter(|&i| arom.is_atom_aromatic(i)).count();
-    let aromatic_rings = (arom_atoms + 3) / 5; // fast clean ring count approximation
+    let aromatic_rings = if arom_atoms == 0 {
+        0
+    } else {
+        // Exact Euler formula on the aromatic bond subgraph: E_arom - V_arom + C_arom
+        let mut arom_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut e_arom = 0usize;
+        for (bi, b) in mol.bonds.iter().enumerate() {
+            if arom.is_bond_aromatic(bi) && b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
+                arom_adj[b.begin_atom].push(b.end_atom);
+                arom_adj[b.end_atom].push(b.begin_atom);
+                e_arom += 1;
+            }
+        }
+        let mut vis = vec![false; n];
+        let mut c_arom = 0usize;
+        let mut v_arom = 0usize;
+        for i in 0..n {
+            if !arom_adj[i].is_empty() {
+                v_arom += 1;
+                if !vis[i] {
+                    c_arom += 1;
+                    let mut st = vec![i];
+                    vis[i] = true;
+                    while let Some(u) = st.pop() {
+                        for &v in &arom_adj[u] {
+                            if !vis[v] {
+                                vis[v] = true;
+                                st.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (e_arom + c_arom).saturating_sub(v_arom)
+    };
     let fsp3 = if total_c > 0 { (sp3_c as f64) / (total_c as f64) } else { 0.0 };
 
     let mw = rep.mol_weight;
@@ -363,7 +410,7 @@ pub fn compute_medchem_report(mol: &ChemMolecule) -> MedChemReport {
     let d_logd = ramp_down(log_p - 0.3, 2.0, 4.0);
     let d_mw = ramp_down(mw, 360.0, 500.0);
     let d_tpsa = if tpsa <= 20.0 {
-        (tpsa / 20.0).clamp(0.0, 1.0)
+        0.0
     } else if tpsa <= 40.0 {
         (tpsa - 20.0) / 20.0
     } else if tpsa <= 90.0 {
@@ -401,9 +448,24 @@ pub fn compute_medchem_report(mol: &ChemMolecule) -> MedChemReport {
     let stereo_centers = mol
         .bonds
         .iter()
-        .filter(|b| !matches!(b.display, crate::BondDisplay::Solid))
+        .filter(|b| {
+            matches!(
+                b.display,
+                crate::BondDisplay::WedgeBegin
+                    | crate::BondDisplay::WedgeEnd
+                    | crate::BondDisplay::WedgedHashBegin
+                    | crate::BondDisplay::WedgedHashEnd
+                    | crate::BondDisplay::HollowWedgeBegin
+                    | crate::BondDisplay::HollowWedgeEnd
+            )
+        })
         .count();
-    let ring_complexity = (mol.bonds.len() as isize - heavy_atoms as isize + 1).max(0) as f64;
+    let heavy_bonds = mol
+        .bonds
+        .iter()
+        .filter(|b| b.begin_atom < n && b.end_atom < n && mol.atoms[b.begin_atom].z > 1 && mol.atoms[b.end_atom].z > 1)
+        .count();
+    let ring_complexity = (heavy_bonds as isize - heavy_atoms as isize + 1).max(0) as f64;
     let bridgehead_like = (0..n).filter(|&i| adj[i].len() >= 4).count() as f64;
     let sa_score = (1.4
         + (heavy_atoms as f64) * 0.055
@@ -490,8 +552,11 @@ impl HrmsSimulation {
 
     /// Computes exact ppm mass error between an observed $m/z$ and the theoretical base/monoisotopic peak.
     pub fn ppm_error(&self, observed_mz: f64) -> Option<f64> {
-        let base = self.peaks.first()?;
-        if base.mz <= 0.0 {
+        let base = self
+            .peaks
+            .iter()
+            .max_by(|a, b| a.rel_intensity.partial_cmp(&b.rel_intensity).unwrap_or(std::cmp::Ordering::Equal))?;
+        if base.mz <= 0.0 || !observed_mz.is_finite() {
             return None;
         }
         Some((observed_mz - base.mz) / base.mz * 1_000_000.0)
@@ -563,20 +628,33 @@ fn convolve_isotopes(dist: Vec<(f64, f64)>, elem_iso: &[(f64, f64)], count: usiz
 
 /// Simulates the exact HRMS isotopic distribution for `mol` under the chosen adduct name (e.g. `"[M+H]+"`).
 pub fn simulate_hrms(mol: &ChemMolecule, adduct_name: &str) -> HrmsSimulation {
+    const ELECTRON_MASS: f64 = 0.000548579909;
     let rep = compute_analysis_report(mol);
     let val = CcVal::compute(mol);
     let mut elem_counts: BTreeMap<i32, usize> = BTreeMap::new();
+    let mut fixed_mass_offset = 0.0_f64;
+
     for (i, a) in mol.atoms.iter().enumerate() {
-        if a.z > 0 {
-            *elem_counts.entry(a.z).or_insert(0) += 1;
-            let ih = val.implicit_h_counts.get(i).copied().unwrap_or(0).max(0) as usize;
+        if (1..=118).contains(&a.z) {
+            if a.isotope != 0 {
+                let iso_m = crate::get_isotope(a.z, a.isotope)
+                    .map(|iso| iso.mass())
+                    .unwrap_or_else(|| crate::get_element_exact_mass(a.z).val);
+                fixed_mass_offset += iso_m;
+            } else {
+                *elem_counts.entry(a.z).or_insert(0) += 1;
+            }
+            let ih = val.implicit_h_counts.get(i).copied().unwrap_or(0) as usize;
             if ih > 0 {
                 *elem_counts.entry(1).or_insert(0) += ih;
             }
+        } else if a.z == 225 {
+            fixed_mass_offset += crate::get_isotope(1, 2).map(|iso| iso.mass()).unwrap_or(2.014101778);
+        } else if a.z == 226 {
+            fixed_mass_offset += crate::get_isotope(1, 3).map(|iso| iso.mass()).unwrap_or(3.01604928);
         }
     }
 
-    // Account for dimer/adduct isotope shifts (e.g. [M+Cl]- adds Cl isotope pattern!)
     let adducts = compute_adducts(rep.exact_mass);
     let chosen = adducts
         .iter()
@@ -593,36 +671,84 @@ pub fn simulate_hrms(mol: &ChemMolecule, adduct_name: &str) -> HrmsSimulation {
         for v in elem_counts.values_mut() {
             *v *= 2;
         }
-    }
-    if chosen.name == "[M+Cl]-" {
-        *elem_counts.entry(17).or_insert(0) += 1;
+        fixed_mass_offset *= 2.0;
     }
 
-    let mut dist = vec![(0.0_f64, 1.0_f64)];
+    // Add/remove exact adduct atoms so every element (Cl, K, C, N, O, H) contributes true isotopic fine structure & exact mass
+    match chosen.name {
+        "[M+H]+" | "[2M+H]+" => *elem_counts.entry(1).or_insert(0) += 1,
+        "[M+Na]+" | "[2M+Na]+" => *elem_counts.entry(11).or_insert(0) += 1,
+        "[M+K]+" => *elem_counts.entry(19).or_insert(0) += 1,
+        "[M+NH4]+" => {
+            *elem_counts.entry(7).or_insert(0) += 1;
+            *elem_counts.entry(1).or_insert(0) += 4;
+        }
+        "[M+CH3CN+H]+" => {
+            *elem_counts.entry(6).or_insert(0) += 2;
+            *elem_counts.entry(7).or_insert(0) += 1;
+            *elem_counts.entry(1).or_insert(0) += 4;
+        }
+        "[M+2H]2+" => *elem_counts.entry(1).or_insert(0) += 2,
+        "[M-H]-" => {
+            if let Some(h) = elem_counts.get_mut(&1) {
+                if *h > 0 {
+                    *h -= 1;
+                } else {
+                    fixed_mass_offset -= 1.007825032;
+                }
+            } else {
+                fixed_mass_offset -= 1.007825032;
+            }
+        }
+        "[M+Cl]-" => *elem_counts.entry(17).or_insert(0) += 1,
+        "[M+HCOO]-" => {
+            *elem_counts.entry(6).or_insert(0) += 1;
+            *elem_counts.entry(1).or_insert(0) += 1;
+            *elem_counts.entry(8).or_insert(0) += 2;
+        }
+        "[M+CH3COO]-" => {
+            *elem_counts.entry(6).or_insert(0) += 2;
+            *elem_counts.entry(1).or_insert(0) += 3;
+            *elem_counts.entry(8).or_insert(0) += 2;
+        }
+        _ => {}
+    }
+
+    let electron_adj = -(chosen.charge as f64) * ELECTRON_MASS;
+    let mut dist = vec![(fixed_mass_offset + electron_adj, 1.0_f64)];
     for (z, cnt) in elem_counts {
+        if cnt == 0 {
+            continue;
+        }
         let raw_iso: Vec<(f64, f64)> = get_element_isotopes(z)
             .iter()
             .filter(|iso| iso.abundance() > 0.0005)
             .map(|iso| (iso.mass(), iso.abundance()))
             .collect();
         if raw_iso.is_empty() {
+            let m = crate::get_element_exact_mass(z).val;
+            if m > 0.0 {
+                for entry in &mut dist {
+                    entry.0 += m * (cnt as f64);
+                }
+            }
             continue;
         }
         let sum_ab: f64 = raw_iso.iter().map(|&(_, a)| a).sum();
         let norm_iso: Vec<(f64, f64)> = raw_iso.into_iter().map(|(m, a)| (m, a / sum_ab.max(1e-9))).collect();
-        dist = convolve_isotopes(dist, &norm_iso, cnt);
+        let next = convolve_isotopes(dist.clone(), &norm_iso, cnt);
+        if !next.is_empty() {
+            dist = next;
+        }
     }
 
-    // Shift distribution so its lowest major monoisotopic mass aligns with exact adduct m/z
-    let mono_raw = dist.first().map(|&(m, _)| m).unwrap_or(rep.exact_mass);
-    let shift = chosen.mz * (chosen.charge.abs().max(1) as f64) - mono_raw;
-    let z_abs = chosen.charge.abs().max(1) as f64;
+    let z_abs = chosen.charge.unsigned_abs().max(1) as f64;
     let max_p = dist.iter().map(|&(_, p)| p).fold(0.0_f64, f64::max).max(1e-9);
 
     let mut peaks: Vec<IsotopePeak> = dist
         .into_iter()
         .map(|(m, p)| IsotopePeak {
-            mz: (m + shift) / z_abs,
+            mz: (m / z_abs).max(0.0),
             rel_intensity: (p / max_p) * 100.0,
         })
         .filter(|pk| pk.rel_intensity >= 0.25)

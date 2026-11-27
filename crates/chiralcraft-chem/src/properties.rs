@@ -49,7 +49,9 @@ pub fn compute_analysis_report(mol: &ChemMolecule) -> AnalysisReport {
     let exact_mass = fp.get_exact_mass().val;
     let mol_weight = fp.get_molecular_weight();
 
-    // Elemental analysis (% by atomic weight)
+    // Elemental analysis (% by atomic weight, isotope/D/T-aware via CsFormulaProperties)
+    let elem_analysis = fp.format_elemental_analysis();
+
     let val = CcVal::compute(mol);
     let mut counts: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
     for (i, a) in mol.atoms.iter().enumerate() {
@@ -61,24 +63,8 @@ pub fn compute_analysis_report(mol: &ChemMolecule) -> AnalysisReport {
             }
         }
     }
-    let mut order: Vec<i32> = counts.keys().copied().collect();
-    order.sort_by_key(|&z| {
-        if z == 6 { (0, "".to_string()) }
-        else if z == 1 { (1, "".to_string()) }
-        else { (2, crate::get_element(z).map(|e| e.symbol).unwrap_or("Z").to_string()) }
-    });
-    let total_w = if mol_weight > 0.0 { mol_weight } else { 1.0 };
-    let mut parts = Vec::new();
-    for z in order {
-        let cnt = counts[&z] as f64;
-        if let Some(el) = crate::get_element(z) {
-            let pct = (cnt * el.atomic_weight() / total_w) * 100.0;
-            parts.push(format!("{}, {:.2}", el.symbol, pct));
-        }
-    }
-    let elem_analysis = parts.join("; ");
 
-    // Top 3 M, M+1, M+2 isotope cluster probabilities (13C = 1.07%, 15N = 0.368%, 18O = 0.205%, 37Cl = 32.0%, 81Br = 97.3%)
+    // Top 3 M, M+1, M+2 isotope cluster probabilities normalized so base peak = 100%
     let nc = counts.get(&6).copied().unwrap_or(0) as f64;
     let nn = counts.get(&7).copied().unwrap_or(0) as f64;
     let no = counts.get(&8).copied().unwrap_or(0) as f64;
@@ -86,13 +72,16 @@ pub fn compute_analysis_report(mol: &ChemMolecule) -> AnalysisReport {
     let ncl = counts.get(&17).copied().unwrap_or(0) as f64;
     let nbr = counts.get(&35).copied().unwrap_or(0) as f64;
     let p1 = (nc * 0.0108 + nn * 0.0037) * 100.0;
-    let p2 = (0.5 * (nc * 0.0108).powi(2) + no * 0.00205 + ns * 0.044 + ncl * 0.320 + nbr * 0.973) * 100.0;
-    let mut mz_peaks = vec![(exact_mass, 100.0)];
-    if p1 >= 0.1 {
-        mz_peaks.push((exact_mass + 1.00335, (p1 * 10.0).round() / 10.0));
+    let p2 = (0.5 * nc * (nc - 1.0).max(0.0) * 0.0108_f64.powi(2) + no * 0.00205 + ns * 0.044 + ncl * 0.320 + nbr * 0.973) * 100.0;
+    let max_p = 100.0_f64.max(p1).max(p2);
+    let scale = 100.0 / max_p;
+    let mut mz_peaks = vec![(exact_mass, ((100.0 * scale) * 10.0).round() / 10.0)];
+    if p1 * scale >= 0.1 {
+        mz_peaks.push((exact_mass + 1.00335, ((p1 * scale) * 10.0).round() / 10.0));
     }
-    if p2 >= 0.1 {
-        mz_peaks.push((exact_mass + 2.0042, (p2 * 10.0).round() / 10.0));
+    if p2 * scale >= 0.1 {
+        let dm2 = if ncl > 0.0 || nbr > 0.0 { 1.99705 } else { 2.0042 };
+        mz_peaks.push((exact_mass + dm2, ((p2 * scale) * 10.0).round() / 10.0));
     }
 
     AnalysisReport {
@@ -128,18 +117,56 @@ fn atom_in_ring(mol: &ChemMolecule, adj: &[Vec<(usize, i32)>], start: usize) -> 
     false
 }
 
+fn bond_in_ring(n: usize, adj: &[Vec<(usize, i32)>], u: usize, v: usize) -> bool {
+    let mut vis = vec![false; n];
+    let mut stack = vec![u];
+    vis[u] = true;
+    while let Some(curr) = stack.pop() {
+        for &(nb, _) in &adj[curr] {
+            if (curr == u && nb == v) || (curr == v && nb == u) {
+                continue;
+            }
+            if nb == v {
+                return true;
+            }
+            if !vis[nb] {
+                vis[nb] = true;
+                stack.push(nb);
+            }
+        }
+    }
+    false
+}
+
 /// Estimate ChiralCraft Chemical Properties using Ertl tPSA, Wildman-Crippen LogP/MR,
 /// Joback-Reid BP/MP, Delaney ESOL LogS, Meylan-Howard Henry, and Hammett-corrected pKa.
 pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
+    let n = mol.atoms.len();
+    if n == 0 || !mol.atoms.iter().any(|a| a.z > 1) {
+        return ChemicalProperties {
+            boiling_point_k: 0.0,
+            melting_point_k: 0.0,
+            critical_temp_k: 0.0,
+            critical_pres_bar: 0.0,
+            critical_vol: 0.0,
+            gibbs_energy: 0.0,
+            log_p: 0.0,
+            molar_refractivity: 0.0,
+            henry_law: 0.0,
+            heat_of_form: 0.0,
+            tpsa: 0.0,
+            log_s: 0.0,
+            pka: None,
+        };
+    }
     let val = CcVal::compute(mol);
     let arom = CcAromaticityInfo::perceive(mol);
-    let mut fm = mol.compute_formula_properties();
-    let mw = fm.get_exact_mass().val;
+    let fm = mol.compute_formula_properties();
+    let mw = fm.get_molecular_weight();
 
-    let n = mol.atoms.len();
     let mut adj: Vec<Vec<(usize, i32)>> = vec![Vec::new(); n];
     for b in &mol.bonds {
-        if b.begin_atom < n && b.end_atom < n {
+        if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
             adj[b.begin_atom].push((b.end_atom, b.order));
             adj[b.end_atom].push((b.begin_atom, b.order));
         }
@@ -205,7 +232,20 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
         // ---- 1. Ertl (2000) tPSA ----
         match atom.z {
             7 => {
-                if is_arom {
+                if atom.charge > 0 {
+                    if is_arom {
+                        tpsa += 3.88;
+                    } else if has_double {
+                        tpsa += if th >= 1 { 13.97 } else { 3.01 };
+                    } else {
+                        tpsa += match th {
+                            0 => 0.0,
+                            1 => 4.44,
+                            2 => 16.61,
+                            _ => 27.64,
+                        };
+                    }
+                } else if is_arom {
                     if th == 0 && heavy_deg == 2 {
                         tpsa += 12.89; // :n: (pyridine/imidazole imine N)
                     } else if th == 1 && heavy_deg == 2 {
@@ -226,7 +266,9 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
                 }
             }
             8 => {
-                if is_arom {
+                if atom.charge < 0 {
+                    tpsa += 23.06; // [O-]
+                } else if is_arom {
                     tpsa += 13.14;
                 } else if has_double {
                     tpsa += 17.07; // =O
@@ -234,6 +276,13 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
                     tpsa += 20.23; // -OH
                 } else {
                     tpsa += 9.23; // -O-
+                }
+            }
+            15 => {
+                if has_double {
+                    tpsa += if th >= 1 { 23.47 } else { 9.81 };
+                } else {
+                    tpsa += if th >= 1 { 27.31 } else { 13.59 };
                 }
             }
             16 => {
@@ -463,15 +512,16 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
     }
 
     for b in &mol.bonds {
-        if b.order == 1 && b.begin_atom < n && b.end_atom < n {
+        if b.order == 1 && b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
             let a1 = &mol.atoms[b.begin_atom];
             let a2 = &mol.atoms[b.end_atom];
+            let hdeg1 = adj[b.begin_atom].iter().filter(|&&(nb, _)| mol.atoms[nb].z > 1).count();
+            let hdeg2 = adj[b.end_atom].iter().filter(|&&(nb, _)| mol.atoms[nb].z > 1).count();
             if a1.z > 1
                 && a2.z > 1
-                && !in_ring[b.begin_atom]
-                && !in_ring[b.end_atom]
-                && adj[b.begin_atom].len() > 1
-                && adj[b.end_atom].len() > 1
+                && hdeg1 > 1
+                && hdeg2 > 1
+                && !bond_in_ring(n, &adj, b.begin_atom, b.end_atom)
             {
                 rotatable_bonds += 1;
             }

@@ -40,9 +40,13 @@ impl JsonValue {
         let mut p = JsonParser {
             bytes: input.as_bytes(),
             pos: 0,
+            depth: 0,
         };
         let v = p.parse_value()?;
         p.skip_ws();
+        if p.pos < p.bytes.len() {
+            return Err(format!("Trailing characters in JSON at byte {}", p.pos));
+        }
         Ok(v)
     }
 
@@ -102,9 +106,12 @@ impl JsonValue {
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
+    const MAX_DEPTH: usize = 128;
+
     fn skip_ws(&mut self) {
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
@@ -143,21 +150,28 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_object(&mut self) -> Result<JsonValue, String> {
+        if self.depth >= Self::MAX_DEPTH {
+            return Err("JSON nesting depth exceeded".to_string());
+        }
+        self.depth += 1;
         self.pos += 1; // '{'
         let mut map = BTreeMap::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
+            self.depth -= 1;
             return Ok(JsonValue::Object(map));
         }
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
+                self.depth -= 1;
                 return Err(format!("Expected JSON string key at {}", self.pos));
             }
             let key = self.parse_string()?;
             self.skip_ws();
             if self.peek() != Some(b':') {
+                self.depth -= 1;
                 return Err(format!("Expected ':' at {}", self.pos));
             }
             self.pos += 1;
@@ -168,19 +182,28 @@ impl<'a> JsonParser<'a> {
                 Some(b',') => self.pos += 1,
                 Some(b'}') => {
                     self.pos += 1;
+                    self.depth -= 1;
                     return Ok(JsonValue::Object(map));
                 }
-                _ => return Err(format!("Expected ',' or '}}' at {}", self.pos)),
+                _ => {
+                    self.depth -= 1;
+                    return Err(format!("Expected ',' or '}}' at {}", self.pos));
+                }
             }
         }
     }
 
     fn parse_array(&mut self) -> Result<JsonValue, String> {
+        if self.depth >= Self::MAX_DEPTH {
+            return Err("JSON nesting depth exceeded".to_string());
+        }
+        self.depth += 1;
         self.pos += 1; // '['
         let mut arr = Vec::new();
         self.skip_ws();
         if self.peek() == Some(b']') {
             self.pos += 1;
+            self.depth -= 1;
             return Ok(JsonValue::Array(arr));
         }
         loop {
@@ -191,9 +214,13 @@ impl<'a> JsonParser<'a> {
                 Some(b',') => self.pos += 1,
                 Some(b']') => {
                     self.pos += 1;
+                    self.depth -= 1;
                     return Ok(JsonValue::Array(arr));
                 }
-                _ => return Err(format!("Expected ',' or ']' at {}", self.pos)),
+                _ => {
+                    self.depth -= 1;
+                    return Err(format!("Expected ',' or ']' at {}", self.pos));
+                }
             }
         }
     }
@@ -259,14 +286,29 @@ impl<'a> JsonParser<'a> {
                 }
                 _ if b < 0x80 => out.push(b as char),
                 _ => {
-                    // Multi-byte UTF-8 sequence starting at self.pos - 1
+                    // Multi-byte UTF-8 sequence starting at self.pos - 1 (O(1) decode of 1 codepoint)
                     let start = self.pos - 1;
-                    let s = std::str::from_utf8(&self.bytes[start..])
+                    let expected_len = if (b & 0xE0) == 0xC0 {
+                        2
+                    } else if (b & 0xF0) == 0xE0 {
+                        3
+                    } else if (b & 0xF8) == 0xF0 {
+                        4
+                    } else {
+                        return Err("Invalid UTF-8 lead byte in JSON string".to_string());
+                    };
+                    let slice = self
+                        .bytes
+                        .get(start..start + expected_len)
+                        .ok_or_else(|| "Truncated UTF-8 in JSON string".to_string())?;
+                    let s = std::str::from_utf8(slice)
                         .map_err(|_| "Invalid UTF-8 in JSON string".to_string())?;
-                    if let Some(ch) = s.chars().next() {
-                        out.push(ch);
-                        self.pos = start + ch.len_utf8();
-                    }
+                    let ch = s
+                        .chars()
+                        .next()
+                        .ok_or_else(|| "Invalid UTF-8 in JSON string".to_string())?;
+                    out.push(ch);
+                    self.pos = start + expected_len;
                 }
             }
         }
@@ -290,6 +332,9 @@ impl<'a> JsonParser<'a> {
         let n = s
             .parse::<f64>()
             .map_err(|_| format!("Invalid JSON number '{s}'"))?;
+        if !n.is_finite() {
+            return Err(format!("Non-finite JSON number '{s}'"));
+        }
         Ok(JsonValue::Number(n))
     }
 }
@@ -429,7 +474,7 @@ pub fn strip_nonessential_explicit_hydrogens(mol: &mut ChemMolecule) {
         if incident.len() == 1 {
             let (nbr, order, disp) = incident[0];
             let nbr_is_heavy = mol.atoms.get(nbr).map(|a| a.z > 1).unwrap_or(false);
-            let is_plain_single = order == 1 && matches!(disp, BondDisplay::Solid | BondDisplay::Bold);
+            let is_plain_single = order == 1 && matches!(disp, BondDisplay::Solid);
             if nbr_is_heavy && is_plain_single {
                 keep[ai] = false;
             }
@@ -845,7 +890,12 @@ const PUBCHEM_PROPS: &str =
 
 fn is_inchikey(q: &str) -> bool {
     let b = q.as_bytes();
-    b.len() == 27 && b[14] == b'-' && b[25] == b'-' && b.iter().all(|&c| c == b'-' || c.is_ascii_uppercase())
+    b.len() == 27
+        && b[14] == b'-'
+        && b[25] == b'-'
+        && b[0..14].iter().all(|c| c.is_ascii_uppercase())
+        && b[15..25].iter().all(|c| c.is_ascii_uppercase())
+        && b[26].is_ascii_uppercase()
 }
 
 fn is_formula_like(q: &str) -> bool {
@@ -1401,13 +1451,15 @@ fn paint_molecule_preview(painter: &egui::Painter, rect: Rect, mol: &ChemMolecul
             }
         }
         if a.charge != 0 {
-            let abs_c = a.charge.abs();
+            let abs_c = a.charge.unsigned_abs();
             if abs_c > 1 {
-                lbl.push(match abs_c {
-                    2 => '²',
-                    3 => '³',
-                    _ => '⁺',
-                });
+                for ch in abs_c.to_string().chars() {
+                    lbl.push(match ch {
+                        '0' => '⁰', '1' => '¹', '2' => '²', '3' => '³', '4' => '⁴',
+                        '5' => '⁵', '6' => '⁶', '7' => '⁷', '8' => '⁸', '9' => '⁹',
+                        _ => ch,
+                    });
+                }
             }
             lbl.push(if a.charge > 0 { '⁺' } else { '⁻' });
         }

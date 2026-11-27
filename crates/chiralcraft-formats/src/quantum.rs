@@ -556,7 +556,8 @@ pub fn parse_molden_vibrations(text: &str) -> Result<QuantumOutputReport, String
     let lines: Vec<&str> = text.lines().collect();
     let mut freqs: Vec<f64> = Vec::new();
     let mut ints: Vec<f64> = Vec::new();
-    let mut coords: Vec<(i32, f64, f64, f64)> = Vec::new();
+    let mut fr_coords: Vec<(i32, f64, f64, f64)> = Vec::new();
+    let mut atoms_coords: Vec<(i32, f64, f64, f64)> = Vec::new();
     let mut mode_vecs: Vec<Vec<[f64; 3]>> = Vec::new();
 
     #[derive(PartialEq)]
@@ -624,23 +625,21 @@ pub fn parse_molden_vibrations(text: &str) -> Result<QuantumOutputReport, String
                         toks[3].parse::<f64>(),
                     ) {
                         // Molden [FR-COORD] is in Bohr (a.u.)
-                        coords.push((el.z, x * BOHR_TO_ANG, y * BOHR_TO_ANG, z * BOHR_TO_ANG));
+                        fr_coords.push((el.z, x * BOHR_TO_ANG, y * BOHR_TO_ANG, z * BOHR_TO_ANG));
                     }
                 }
             }
             Sec::AtomsAngs | Sec::AtomsAu => {
-                if coords.is_empty() {
-                    let toks: Vec<&str> = t.split_whitespace().collect();
-                    if toks.len() >= 6 {
-                        if let (Ok(z), Ok(x), Ok(y), Ok(zc)) = (
-                            toks[2].parse::<i32>(),
-                            toks[3].parse::<f64>(),
-                            toks[4].parse::<f64>(),
-                            toks[5].parse::<f64>(),
-                        ) {
-                            let s = if sec == Sec::AtomsAu { BOHR_TO_ANG } else { 1.0 };
-                            coords.push((z, x * s, y * s, zc * s));
-                        }
+                let toks: Vec<&str> = t.split_whitespace().collect();
+                if toks.len() >= 6 {
+                    if let (Ok(z), Ok(x), Ok(y), Ok(zc)) = (
+                        toks[2].parse::<i32>(),
+                        toks[3].parse::<f64>(),
+                        toks[4].parse::<f64>(),
+                        toks[5].parse::<f64>(),
+                    ) {
+                        let s = if sec == Sec::AtomsAu { BOHR_TO_ANG } else { 1.0 };
+                        atoms_coords.push((z, x * s, y * s, zc * s));
                     }
                 }
             }
@@ -696,6 +695,7 @@ pub fn parse_molden_vibrations(text: &str) -> Result<QuantumOutputReport, String
         });
     }
 
+    let coords = if !fr_coords.is_empty() { fr_coords } else { atoms_coords };
     Ok(QuantumOutputReport {
         program: "Molden".to_string(),
         converged: true,
@@ -790,6 +790,7 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
     let mut orca_norm_cols: std::collections::BTreeMap<usize, Vec<f64>> = std::collections::BTreeMap::new();
     // Gaussian / xTB g98.out structured vibrational modes
     let mut gauss_modes: Vec<QuantumIrMode> = Vec::new();
+    let mut in_gauss_occ = false;
 
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0usize;
@@ -849,7 +850,7 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
         if line == "ORBITAL ENERGIES" {
             let mut j = i + 1;
             let mut prev_occ_ev = None;
-            while j < lines.len() && j < i + 600 {
+            while j < lines.len() {
                 let l = lines[j].trim();
                 if l.is_empty() && prev_occ_ev.is_some() {
                     break;
@@ -871,7 +872,12 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
         }
 
         // 4. Gaussian Alpha occ./virt. eigenvalues (Hartree -> eV * 27.211386)
+        // Reset lumo_ev whenever a new SCF cycle's occupied block begins so Opt Freq always uses final HOMO & final LUMO!
         if line.starts_with("Alpha  occ. eigenvalues --") {
+            if !in_gauss_occ {
+                lumo_ev = None;
+                in_gauss_occ = true;
+            }
             if let Some(last) = line
                 .split("--")
                 .nth(1)
@@ -880,15 +886,20 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
             {
                 homo_ev = Some(last * 27.211_386);
             }
-        } else if line.starts_with("Alpha virt. eigenvalues --") && lumo_ev.is_none() {
-            if let Some(first) = line
-                .split("--")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .and_then(|v| v.parse::<f64>().ok())
-            {
-                lumo_ev = Some(first * 27.211_386);
+        } else if line.starts_with("Alpha virt. eigenvalues --") {
+            in_gauss_occ = false;
+            if lumo_ev.is_none() {
+                if let Some(first) = line
+                    .split("--")
+                    .nth(1)
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|v| v.parse::<f64>().ok())
+                {
+                    lumo_ev = Some(first * 27.211_386);
+                }
             }
+        } else if !line.is_empty() {
+            in_gauss_occ = false;
         }
 
         // 5a. ORCA VIBRATIONAL FREQUENCIES block
@@ -1011,13 +1022,18 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
                 }
                 if !cur_cols.is_empty() && toks.len() >= 2 {
                     if let Ok(row_idx) = toks[0].parse::<usize>() {
+                        if row_idx > 300_000 {
+                            break;
+                        }
                         for (c_off, &col_id) in cur_cols.iter().enumerate() {
                             if let Some(val) = toks.get(1 + c_off).and_then(|s| s.parse::<f64>().ok()) {
                                 let entry = orca_norm_cols.entry(col_id).or_default();
-                                if entry.len() <= row_idx {
-                                    entry.resize(row_idx + 1, 0.0);
+                                if let Some(need) = row_idx.checked_add(1) {
+                                    if entry.len() < need {
+                                        entry.resize(need, 0.0);
+                                    }
+                                    entry[row_idx] = val;
                                 }
-                                entry[row_idx] = val;
                             }
                         }
                     } else {
@@ -1052,6 +1068,9 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
                 })
                 .unwrap_or_default();
             let k_modes = block_freqs.len();
+            if k_modes == 0 {
+                continue;
+            }
             let mut block_ints = vec![0.0_f64; k_modes];
             let mut block_disps: Vec<Vec<[f64; 3]>> = vec![Vec::new(); k_modes];
 
@@ -1090,7 +1109,7 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
                         }
                     } else if l.is_empty() || toks.len() < 5 {
                         in_atom_table = false;
-                        if !block_disps[0].is_empty() {
+                        if block_disps.first().is_some_and(|v| !v.is_empty()) {
                             break;
                         }
                     }
@@ -1270,7 +1289,12 @@ pub fn parse_quantum_output(text: &str) -> Result<QuantumOutputReport, String> {
     {
         return Err("Unrecognized or empty ORCA/Gaussian/xTB/Molden quantum file".to_string());
     }
-    if (energy_hartree.is_some() || !ir_modes.is_empty()) && !converged && !text.contains("ERROR") {
+    let text_low = text.to_ascii_lowercase();
+    let has_err = text_low.contains("error termination")
+        || text_low.contains("not converge")
+        || text_low.contains("aborting the run")
+        || text.contains("ERROR");
+    if (energy_hartree.is_some() || !ir_modes.is_empty()) && !converged && !has_err {
         converged = true;
     }
     let homo_lumo_gap_ev = homo_lumo_gap_override.or_else(|| match (homo_ev, lumo_ev) {

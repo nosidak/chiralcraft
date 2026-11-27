@@ -304,8 +304,18 @@ pub fn show_analysis_window(
                     if state.chk_formula { lines.push(format!("Chemical Formula: {}", pretty_formula)); }
                     if state.chk_exact { lines.push(format!("Exact Mass: {:.*}", d, rep.exact_mass)); }
                     if state.chk_mw { lines.push(format!("Molecular Weight: {:.*}", d, rep.mol_weight)); }
+                    if state.chk_mz && !rep.mz_peaks.is_empty() {
+                        let mz_s: Vec<String> = rep
+                            .mz_peaks
+                            .iter()
+                            .map(|&(mass, pct)| format!("{:.*} ({:.1}%)", d, mass, pct))
+                            .collect();
+                        lines.push(format!("m/z: {}", mz_s.join(", ")));
+                    }
                     if state.chk_elem { lines.push(format!("Elemental Analysis: {}", rep.elem_analysis)); }
-                    action = AnalysisAction::Paste(lines.join("\n"));
+                    if !lines.is_empty() {
+                        action = AnalysisAction::Paste(lines.join("\n"));
+                    }
                 }
                 if ui.button("Paste Name").on_hover_text("Stamp centered IUPAC name below structure (Alt+Ctrl+N)").clicked() {
                     action = AnalysisAction::PasteNameCentered;
@@ -487,31 +497,44 @@ fn draw_molecule_thumbnail(ui: &mut egui::Ui, mol: &ChemMolecule, idx: usize) ->
         let mut x2 = f64::NEG_INFINITY;
         let mut y2 = f64::NEG_INFINITY;
         for a in &mol.atoms {
-            x1 = x1.min(a.x);
-            y1 = y1.min(a.y);
-            x2 = x2.max(a.x);
-            y2 = y2.max(a.y);
+            if a.x.is_finite() && a.y.is_finite() {
+                x1 = x1.min(a.x);
+                y1 = y1.min(a.y);
+                x2 = x2.max(a.x);
+                y2 = y2.max(a.y);
+            }
         }
-        let inner = rect.shrink(6.0);
-        let w = (x2 - x1).max(1.0);
-        let h = (y2 - y1).max(1.0);
-        let scale = ((inner.width() as f64) / w).min((inner.height() as f64) / h);
-        let ox = inner.center().x as f64 - 0.5 * (x1 + x2) * scale;
-        let oy = inner.center().y as f64 - 0.5 * (y1 + y2) * scale;
-        let map = |x: f64, y: f64| Pos2::new((ox + x * scale) as f32, (oy + y * scale) as f32);
+        if x1.is_finite() {
+            let inner = rect.shrink(6.0);
+            let w = (x2 - x1).max(1.0);
+            let h = (y2 - y1).max(1.0);
+            let scale = ((inner.width() as f64) / w).min((inner.height() as f64) / h);
+            let ox = inner.center().x as f64 - 0.5 * (x1 + x2) * scale;
+            let oy = inner.center().y as f64 - 0.5 * (y1 + y2) * scale;
+            let map = |x: f64, y: f64| Pos2::new((ox + x * scale) as f32, (oy + y * scale) as f32);
 
-        for b in &mol.bonds {
-            if b.begin_atom < mol.atoms.len() && b.end_atom < mol.atoms.len() {
-                let p1 = map(mol.atoms[b.begin_atom].x, mol.atoms[b.begin_atom].y);
-                let p2 = map(mol.atoms[b.end_atom].x, mol.atoms[b.end_atom].y);
-                let d = p2 - p1;
-                let len = d.length().max(1e-3);
-                let n = Vec2::new(-d.y / len, d.x / len);
-                if b.order == 2 {
-                    p.line_segment([p1 + n * 1.1, p2 + n * 1.1], Stroke::new(1.0_f32, Color32::BLACK));
-                    p.line_segment([p1 - n * 1.1, p2 - n * 1.1], Stroke::new(1.0_f32, Color32::BLACK));
-                } else {
-                    p.line_segment([p1, p2], Stroke::new(1.0_f32, Color32::BLACK));
+            for b in &mol.bonds {
+                if b.begin_atom < mol.atoms.len() && b.end_atom < mol.atoms.len() {
+                    let a1 = &mol.atoms[b.begin_atom];
+                    let a2 = &mol.atoms[b.end_atom];
+                    if !(a1.x.is_finite() && a1.y.is_finite() && a2.x.is_finite() && a2.y.is_finite()) {
+                        continue;
+                    }
+                    let p1 = map(a1.x, a1.y);
+                    let p2 = map(a2.x, a2.y);
+                    let d = p2 - p1;
+                    let len = d.length().max(1e-3);
+                    let n = Vec2::new(-d.y / len, d.x / len);
+                    if b.order == 2 {
+                        p.line_segment([p1 + n * 1.1, p2 + n * 1.1], Stroke::new(1.0_f32, Color32::BLACK));
+                        p.line_segment([p1 - n * 1.1, p2 - n * 1.1], Stroke::new(1.0_f32, Color32::BLACK));
+                    } else if b.order >= 3 {
+                        p.line_segment([p1 + n * 1.5, p2 + n * 1.5], Stroke::new(0.9_f32, Color32::BLACK));
+                        p.line_segment([p1, p2], Stroke::new(0.9_f32, Color32::BLACK));
+                        p.line_segment([p1 - n * 1.5, p2 - n * 1.5], Stroke::new(0.9_f32, Color32::BLACK));
+                    } else {
+                        p.line_segment([p1, p2], Stroke::new(1.0_f32, Color32::BLACK));
+                    }
                 }
             }
         }

@@ -444,19 +444,25 @@ pub fn show_3d_viewer_window(
                             }
                         }
                     }
-                    // Click-to-measure: pick nearest projected atom on primary click!
+                    // Click-to-measure: pick front-most projected atom within hit radius on primary click!
                     state.measure_atoms.retain(|&i| i < mol.atoms.len());
                     if resp.clicked() {
                         if let Some(cpos) = resp.interact_pointer_pos() {
-                            let mut best: Option<(usize, f32)> = None;
+                            let mut best: Option<(usize, f64, f32)> = None;
                             for (idx, pt) in rot_pts.iter().enumerate() {
                                 let sp = project(*pt).0;
                                 let d = sp.distance(cpos);
-                                if d < 16.0 && best.map(|(_, bd)| d < bd).unwrap_or(true) {
-                                    best = Some((idx, d));
+                                if d < 16.0 {
+                                    let better = match best {
+                                        None => true,
+                                        Some((_, bz, bd)) => pt.2 > bz + 1e-6 || ((pt.2 - bz).abs() <= 1e-6 && d < bd),
+                                    };
+                                    if better {
+                                        best = Some((idx, pt.2, d));
+                                    }
                                 }
                             }
-                            if let Some((hit_i, _)) = best {
+                            if let Some((hit_i, _, _)) = best {
                                 if let Some(pos_i) = state.measure_atoms.iter().position(|&x| x == hit_i) {
                                     state.measure_atoms.remove(pos_i);
                                 } else {
@@ -483,13 +489,18 @@ pub fn show_3d_viewer_window(
                             );
                         }
                     }
-                    // Live 3D measurement readout (Distance / Angle / Dihedral)
+                    // Live 3D measurement readout on equilibrium geometry (not oscillating displaced coords)
+                    let meas_mol = state
+                        .vib_anim
+                        .as_ref()
+                        .map(|a| &a.base_mol_3d)
+                        .unwrap_or(&mol);
                     let meas_txt = match state.measure_atoms.as_slice() {
-                        [a, b] => measure_distance_angstrom(&mol, *a, *b)
+                        [a, b] => measure_distance_angstrom(meas_mol, *a, *b)
                             .map(|d| format!("Distance #{}-#{}: {d:.3} Å", a + 1, b + 1)),
-                        [a, b, c] => measure_angle_deg(&mol, *a, *b, *c)
+                        [a, b, c] => measure_angle_deg(meas_mol, *a, *b, *c)
                             .map(|ang| format!("Angle #{}-#{}-#{}: {ang:.1}°", a + 1, b + 1, c + 1)),
-                        [a, b, c, d] => measure_dihedral_deg(&mol, *a, *b, *c, *d)
+                        [a, b, c, d] => measure_dihedral_deg(meas_mol, *a, *b, *c, *d)
                             .map(|dih| format!("Dihedral #{}-#{}-#{}-#{}: {dih:.1}°", a + 1, b + 1, c + 1, d + 1)),
                         _ => None,
                     };

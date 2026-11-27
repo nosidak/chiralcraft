@@ -10,7 +10,7 @@ Every chemistry subcommand accepts **either a file path** (any supported format)
 
 ```bash
 chiralcraft --help                      # Full usage help
-chiralcraft --version                   # Print version (chiralcraft 1.0.0)
+chiralcraft --version                   # Print version (chiralcraft 1.1.1)
 chiralcraft [FILE]                      # Launch GUI (optionally opening FILE)
 chiralcraft --edit-svg <FILE.svg>       # Round-trip edit an embedded ChiralCraft SVG
 chiralcraft --screenshot <PRESET> <OUT> # Capture deterministic GPU screenshot (hero, medchem, spectroscopy, 3d-quantum, synthesis, organometallic, dark-slide)
@@ -40,7 +40,7 @@ chiralcraft --mcp                       # Start stdio JSON-RPC 2.0 MCP server
 
 ## 2. Built-In MCP Server (`chiralcraft --mcp`)
 
-ChiralCraft implements **Model Context Protocol (JSON-RPC 2.0 over newline-delimited stdio)** with **17 chemistry and publishing tools** so AI assistants and coding agents can draw, verify, analyze, and render chemistry directly.
+ChiralCraft implements **Model Context Protocol (JSON-RPC 2.0 over newline-delimited stdio)** with **19 chemistry and publishing tools** so AI assistants and coding agents can draw, verify, analyze, and render chemistry directly.
 
 ### Client Configuration Example
 
@@ -57,7 +57,7 @@ Add ChiralCraft to any MCP-compatible host (JSON config):
 }
 ```
 
-### All 17 Exposed MCP Tools
+### All 19 Exposed MCP Tools
 
 | # | Tool Name | Required Args | Optional Args | Description |
 |---|---|---|---|---|
@@ -72,9 +72,11 @@ Add ChiralCraft to any MCP-compatible host (JSON config):
 | 9 | `medchem_scorecard` | `smiles` | — | Compute Lipinski, Veber, Ghose, CNS MPO, QED, Fsp³, SA score & PAINS/Brenk alerts |
 | 10 | `simulate_hrms` | `smiles` | `adduct` | Simulate exact HRMS isotopic envelope peaks and ESI+/ESI− adduct table |
 | 11 | `retrosynthesis_suggest` | `smiles` | — | Suggest ranked strategic retrosynthetic disconnections, synthons & reagents |
-| 12 | `predict_spectroscopy` | `smiles` | — | Predict FT-IR bands, UV–Vis `λmax`/color, and 2D NMR (HSQC/HMBC) cross-peak counts |
+| 12 | `predict_spectroscopy` | `smiles` | — | Predict FT-IR bands, UV–Vis `λmax`/color, and 2D NMR (COSY/HSQC/HMBC) cross-peak counts |
 | 13 | `analyze_organometallic` | `smiles` | — | Analyze transition-metal complexes via the 18-electron rule & Green CBC (`MLxXy`) |
 | 14 | `export_latex` | `smiles` | — | Export compilable LaTeX `\chemfig{...}` and `tikzpicture` vector code |
 | 15 | `generate_si_procedure` | `smiles` | `name`, `solvent`, `yield_pct` | Generate ACS/JOC Supporting Information experimental procedure + NMR/IR/HRMS block |
 | 16 | `export_quantum_input` | `smiles` | `program` (`"orca"` \| `"gaussian"` \| `"xtb"`), `method`, `basis`, `solvent` | Generate ready-to-run quantum chemistry input decks from SMILES |
-| 17 | `parse_quantum_output` | `path` | — | Parse ORCA `.out` or Gaussian `.log` files for SCF energy, HOMO–LUMO gap, dipole & IR modes |
+| 17 | `parse_quantum_output` | `path` | — | Parse ORCA `.out`, Gaussian `.log`, xTB `g98.out`/`vibspectrum`, or Molden files for SCF energy, HOMO–LUMO gap, dipole & IR modes |
+| 18 | `parse_jcamp_ir` | `path` | `compare_smiles` | Parse experimental FT-IR JCAMP-DX (`.jdx`/`.dx`, ASDF/SQZ/DIF/DUP) or CSV/DPT files, pick peaks & compute HQI/Pearson match |
+| 19 | `run_xtb_ir` | `smiles` | `method` (`"gfn2"` \| `"gfnff"`), `solvent` | Run local GFN2-xTB or GFN-FF harmonic IR (`--ohess`) and return scaled wavenumbers & intensities (km/mol) |

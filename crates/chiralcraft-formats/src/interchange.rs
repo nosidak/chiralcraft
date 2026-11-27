@@ -234,6 +234,9 @@ pub fn molfile_v3000_to_molecule(src: &str) -> Result<ChemMolecule, String> {
                 .get(&e_id)
                 .copied()
                 .unwrap_or_else(|| (e_id as usize).saturating_sub(1));
+            if b >= mol.atoms.len() || e >= mol.atoms.len() || b == e {
+                return Err(format!("V3000 bond endpoint out of range: {b_id}-{e_id}"));
+            }
             let mut bond = mk_bond(id, b, e, order);
             for kv in &toks[4..] {
                 if *kv == "CFG=1" {
@@ -272,18 +275,20 @@ pub fn molecule_to_ct(mol: &ChemMolecule, title: &str) -> String {
     }
     for b in &mol.bonds {
         // ChiralCraft CT bond display column (`p35a-out.ct`): 1=plain, 7=WedgeBegin, 4=WedgedHashBegin
-        let ct_disp = match b.display {
-            BondDisplay::WedgeBegin | BondDisplay::WedgeEnd => 7,
-            BondDisplay::WedgedHashBegin | BondDisplay::WedgedHashEnd => 4,
-            BondDisplay::Bold => 2,
-            BondDisplay::Dash => 3,
-            BondDisplay::Wavy => 6,
-            _ => 1,
+        let (a1, a2, ct_disp) = match b.display {
+            BondDisplay::WedgeBegin => (b.begin_atom, b.end_atom, 7),
+            BondDisplay::WedgeEnd => (b.end_atom, b.begin_atom, 7),
+            BondDisplay::WedgedHashBegin => (b.begin_atom, b.end_atom, 4),
+            BondDisplay::WedgedHashEnd => (b.end_atom, b.begin_atom, 4),
+            BondDisplay::Bold => (b.begin_atom, b.end_atom, 2),
+            BondDisplay::Dash => (b.begin_atom, b.end_atom, 3),
+            BondDisplay::Wavy => (b.begin_atom, b.end_atom, 6),
+            _ => (b.begin_atom, b.end_atom, 1),
         };
         out.push_str(&format!(
             "{} {} {:2} {:2}\n",
-            b.begin_atom + 1,
-            b.end_atom + 1,
+            a1 + 1,
+            a2 + 1,
             b.order,
             ct_disp
         ));
@@ -319,8 +324,13 @@ pub fn ct_to_molecule(src: &str) -> Result<ChemMolecule, String> {
         if t.len() < 3 {
             return Err("Invalid CT bond line".to_string());
         }
-        let b = t[0].parse::<usize>().unwrap_or(1).saturating_sub(1);
-        let e = t[1].parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let b = t[0].parse::<usize>().unwrap_or(0);
+        let e = t[1].parse::<usize>().unwrap_or(0);
+        if b == 0 || e == 0 || b > mol.atoms.len() || e > mol.atoms.len() || b == e {
+            return Err(format!("CT bond endpoint out of range at bond {}", i));
+        }
+        let b = b - 1;
+        let e = e - 1;
         let o = t[2].parse::<i32>().unwrap_or(1);
         let mut bond = mk_bond((i + 1) as u32, b, e, o);
         if let Some(d) = t.get(3).and_then(|s| s.parse::<i32>().ok()) {
@@ -373,13 +383,18 @@ pub fn molecules_to_cml(mols: &[ChemMolecule]) -> String {
         }
         out.push_str("</atomArray>\n<bondArray>\n");
         for b in &mol.bonds {
-            let a1 = mol.atoms[b.begin_atom].id;
-            let a2 = mol.atoms[b.end_atom].id;
-            let stereo = match b.display {
-                BondDisplay::WedgeBegin | BondDisplay::WedgeEnd => " bondStereo=\"W\"",
-                BondDisplay::WedgedHashBegin | BondDisplay::WedgedHashEnd => " bondStereo=\"H\"",
-                _ => "",
+            if b.begin_atom >= mol.atoms.len() || b.end_atom >= mol.atoms.len() || b.begin_atom == b.end_atom {
+                continue;
+            }
+            let (i1, i2, stereo) = match b.display {
+                BondDisplay::WedgeBegin => (b.begin_atom, b.end_atom, " bondStereo=\"W\""),
+                BondDisplay::WedgeEnd => (b.end_atom, b.begin_atom, " bondStereo=\"W\""),
+                BondDisplay::WedgedHashBegin => (b.begin_atom, b.end_atom, " bondStereo=\"H\""),
+                BondDisplay::WedgedHashEnd => (b.end_atom, b.begin_atom, " bondStereo=\"H\""),
+                _ => (b.begin_atom, b.end_atom, ""),
             };
+            let a1 = mol.atoms[i1].id;
+            let a2 = mol.atoms[i2].id;
             out.push_str(&format!(
                 "<bond atomRefs2=\"a{} a{}\"{} id=\"b{}\" order=\"{}\"/>\n",
                 a1, a2, stereo, b.id, b.order
@@ -400,7 +415,7 @@ pub fn cml_to_molecules(src: &str) -> Result<Vec<ChemMolecule>, String> {
     let mut cur: Option<ChemMolecule> = None;
     let mut id_map = HashMap::<String, usize>::new();
     let get_attr = |line: &str, k: &str| -> Option<String> {
-        let pat = format!("{}=\"", k);
+        let pat = format!(" {}=\"", k);
         let s = line.find(&pat)? + pat.len();
         let e = line[s..].find('"')? + s;
         Some(line[s..e].to_string())
@@ -448,9 +463,14 @@ pub fn cml_to_molecules(src: &str) -> Result<Vec<ChemMolecule>, String> {
                             let bid = get_attr(l, "id")
                                 .and_then(|s| s.trim_start_matches('b').parse::<u32>().ok())
                                 .unwrap_or((m.bonds.len() + 1) as u32);
-                            let o = get_attr(l, "order")
-                                .and_then(|v| v.parse::<i32>().ok())
-                                .unwrap_or(1);
+                            let o = match get_attr(l, "order").as_deref() {
+                                Some("S" | "s" | "1") => 1,
+                                Some("D" | "d" | "2") => 2,
+                                Some("T" | "t" | "3") => 3,
+                                Some("A" | "a" | "4" | "6") => 6,
+                                Some(other) => other.parse::<i32>().unwrap_or(1),
+                                None => 1,
+                            };
                             let mut bond = mk_bond(bid, b, e, o);
                             if let Some(st) = get_attr(l, "bondStereo") {
                                 match st.as_str() {
@@ -913,7 +933,7 @@ pub fn molecule_to_eps(mol: &ChemMolecule) -> String {
                 } else {
                     (x2, y2, x1, y1)
                 };
-                let steps = ((len / 2.49).round() as usize).max(4);
+                let steps = ((len / 2.49).round() as usize).clamp(4, 256);
                 for k in 1..=steps {
                     let t = k as f64 / steps as f64;
                     let mx = sx + (ex - sx) * t;
@@ -958,11 +978,12 @@ pub fn molecule_to_eps(mol: &ChemMolecule) -> String {
                 "1 1 1 setrgbcolor newpath {:.2} {:.2} moveto {:.2} {:.2} lineto {:.2} {:.2} lineto {:.2} {:.2} lineto closepath fill\n",
                 x - bw * 0.5, y - 4.5, x + bw * 0.5, y - 4.5, x + bw * 0.5, y + 5.5, x - bw * 0.5, y + 5.5
             ));
+            let esc_lbl = lbl.replace('\\', "\\\\").replace('(', "\\(").replace(')', "\\)");
             out.push_str(&format!(
                 "0 0 0 setrgbcolor {:.2} {:.2} moveto ({}) show\n",
                 x - bw * 0.4,
                 y - 3.2,
-                lbl
+                esc_lbl
             ));
         }
     }
@@ -1265,7 +1286,7 @@ pub fn molecule_to_png(mol: &ChemMolecule, scale: f64) -> Vec<u8> {
                 } else {
                     (x2, y2, x1, y1)
                 };
-                let steps = ((len / (2.49 * sc)).round() as usize).max(4);
+                let steps = ((len / (2.49 * sc)).round() as usize).clamp(4, 256);
                 let mut pb = PathBuilder::new();
                 for k in 1..=steps {
                     let t = k as f32 / steps as f32;
@@ -1561,21 +1582,25 @@ pub fn inchi_to_inchikey(inchi: &str) -> String {
         .or_else(|| inchi.strip_prefix("InChI=1/"))
         .unwrap_or(inchi);
     let is_std = inchi.starts_with("InChI=1S/");
-    // Split major (formula + /c + /h) vs minor (remaining layers)
+    // Split major (formula + main-layer /c + main-layer /h only) vs minor (all layers from /q, /p, /b, /t, /i, /f, /r onward)
     let mut major = String::new();
     let mut minor = String::new();
     let mut proton_delta: i32 = 0;
+    let mut in_main_layer = true;
     for (idx, part) in body.split('/').enumerate() {
         if idx == 0 {
             major.push_str(part);
-        } else if part.starts_with('c') || part.starts_with('h') {
+        } else if in_main_layer && (part.starts_with('c') || part.starts_with('h')) {
             major.push('/');
             major.push_str(part);
-        } else if let Some(p) = part.strip_prefix('p') {
-            proton_delta = p.parse().unwrap_or(0);
         } else {
-            minor.push('/');
-            minor.push_str(part);
+            in_main_layer = false;
+            if let Some(p) = part.strip_prefix('p') {
+                proton_delta = p.parse().unwrap_or(0);
+            } else {
+                minor.push('/');
+                minor.push_str(part);
+            }
         }
     }
     let d1 = sha256(major.as_bytes());
@@ -1602,7 +1627,11 @@ pub fn inchi_to_inchikey(inchi: &str) -> String {
     block2.push(if is_std { 'S' } else { 'N' });
     block2.push('A');
 
-    let pflag = ((b'N' as i32) + proton_delta).clamp(b'A' as i32, b'Z' as i32) as u8 as char;
+    let pflag = if proton_delta.abs() > 12 {
+        'A'
+    } else {
+        ((b'N' as i32) + proton_delta) as u8 as char
+    };
     format!("{block1}-{block2}-{pflag}")
 }
 
@@ -1650,7 +1679,12 @@ pub fn molecule_to_inchi(mol: &ChemMolecule) -> String {
     let mut h_parts = Vec::new();
     for &idx in &heavy {
         let r = rank[&idx];
-        let h = val.implicit_h_counts.get(idx).copied().unwrap_or(0);
+        let exp_h = mol
+            .neighbors(idx)
+            .into_iter()
+            .filter(|&(nb, _)| mol.atoms.get(nb).map(|a| a.z == 1 || a.z == 225 || a.z == 226).unwrap_or(false))
+            .count();
+        let h = val.implicit_h_counts.get(idx).copied().unwrap_or(0) as usize + exp_h;
         if h == 1 {
             h_parts.push(format!("{r}H"));
         } else if h > 1 {
@@ -1675,25 +1709,29 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
+    if info.width > 16384 || info.height > 16384 {
+        return None;
+    }
+    let rgba_cap = (info.width as usize).checked_mul(info.height as usize)?.checked_mul(4)?;
     let raw = &buf[..info.buffer_size()];
     let rgba = match info.color_type {
         png::ColorType::Rgba => raw.to_vec(),
         png::ColorType::Rgb => {
-            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+            let mut out = Vec::with_capacity(rgba_cap);
             for px in raw.chunks_exact(3) {
                 out.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
             out
         }
         png::ColorType::GrayscaleAlpha => {
-            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+            let mut out = Vec::with_capacity(rgba_cap);
             for px in raw.chunks_exact(2) {
                 out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
             }
             out
         }
         png::ColorType::Grayscale => {
-            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+            let mut out = Vec::with_capacity(rgba_cap);
             for &g in raw {
                 out.extend_from_slice(&[g, g, g, 255]);
             }

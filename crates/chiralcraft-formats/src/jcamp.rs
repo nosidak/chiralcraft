@@ -264,33 +264,33 @@ fn decode_asdf_line(line: &str) -> Option<(f64, Vec<f64>, bool)> {
         if c.is_ascii_digit() || c == '+' || c == '-' || c == '.' {
             let start = i;
             let mut has_dot = c == '.';
+            let mut has_exp = false;
             i += 1;
             while i < len {
                 let ch = chars[i];
                 if ch.is_ascii_digit() {
                     i += 1;
-                } else if ch == '.' && !has_dot {
+                } else if ch == '.' && !has_dot && !has_exp {
                     has_dot = true;
                     i += 1;
                 } else if (ch == 'E' || ch == 'e')
+                    && !has_exp
                     && i + 1 < len
-                    && (chars[i + 1] == '+'
-                        || chars[i + 1] == '-'
-                        || (has_dot && chars[i + 1].is_ascii_digit()))
+                    && (chars[i + 1] == '+' || chars[i + 1] == '-')
                 {
-                    // Scientific notation only when explicit sign (E+/E-) or floating decimal (1.5E2);
-                    // otherwise 'E'/'e' after an integer like "1712E0" is a JCAMP SQZ pseudo-digit (+5 / -5)!
-                    i += 1;
-                    if i < len && (chars[i] == '+' || chars[i] == '-') {
-                        i += 1;
-                    }
+                    // Scientific notation only when explicit sign (E+/E-);
+                    // otherwise 'E'/'e' followed by a digit (e.g. "1700.0E0K0") is a JCAMP SQZ pseudo-digit (+5 / -5)!
+                    has_exp = true;
+                    i += 2;
                 } else {
                     break;
                 }
             }
             let s: String = chars[start..i].iter().collect();
             if let Ok(v) = s.parse::<f64>() {
-                tokens.push(AsdfToken::Abs(v));
+                if v.is_finite() {
+                    tokens.push(AsdfToken::Abs(v));
+                }
             }
             continue;
         }
@@ -524,11 +524,15 @@ pub fn parse_jcamp_dx(text: &str) -> Result<JcampSpectrum, String> {
             x_units = JcampXUnit::Ppm;
         }
     } else if x_units == JcampXUnit::Micrometers {
-        raw_xy.retain(|&(x, _)| x > 0.1);
+        raw_xy.retain(|&(x, y)| x.is_finite() && y.is_finite() && x > 0.1);
         for (x, _) in &mut raw_xy {
             *x = 10_000.0 / *x;
         }
         x_units = JcampXUnit::Cm1;
+    }
+    raw_xy.retain(|&(x, y)| x.is_finite() && y.is_finite());
+    if raw_xy.is_empty() {
+        return Err("No valid finite XYDATA points remain after unit conversion".to_string());
     }
 
     raw_xy.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -609,6 +613,9 @@ pub fn parse_ir_csv_dpt(text: &str, title: &str) -> Result<JcampSpectrum, String
             *x = 10_000.0 / *x;
         }
         x_units = JcampXUnit::Cm1;
+    }
+    if raw_xy.is_empty() {
+        return Err("No valid wavenumber/intensity points remain after micrometer conversion".to_string());
     }
     raw_xy.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 

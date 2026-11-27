@@ -436,7 +436,7 @@ impl CdxDocument {
                                         isotope = p.as_i16().unwrap_or(0) as i32;
                                     }
                                     CDX_PROP_ATOM_RADICAL => {
-                                        radical = p.as_i8().unwrap_or(0) as i32;
+                                        radical = mdl_rad_to_chem(p.as_i8().unwrap_or(0) as i32);
                                     }
                                     CDX_PROP_2D_POSITION => {
                                         if let Some((px, py)) = p.as_2d_position_xy_pt() {
@@ -1037,6 +1037,9 @@ impl CdxmlDocument {
             }
         }
 
+        if !stack.is_empty() {
+            return Err("Unclosed XML element(s) in CDXML".to_string());
+        }
         let root = root_id.ok_or_else(|| "No root element found in CDXML".to_string())?;
         let mut font_ids: HashMap<String, Vec<OccurrenceId>> = HashMap::new();
         let mut object_ids: HashMap<String, Vec<OccurrenceId>> = HashMap::new();
@@ -1229,10 +1232,10 @@ impl CdxmlDocument {
                                 .attr("Element")
                                 .and_then(|s| s.parse::<i32>().ok())
                                 .unwrap_or_else(|| {
-                                    if node_type.is_some() {
-                                        0
+                                    if matches!(node_type, None | Some("Element")) {
+                                        6 // Default unlabeled node (or explicit NodeType="Element") in CDXML is Carbon (Z=6)
                                     } else {
-                                        6 // Default unlabeled node in CDXML is Carbon (Z=6)
+                                        0
                                     }
                                 });
                             let mut atom = ChemAtom::new(id, z);
@@ -2034,18 +2037,19 @@ pub fn molfile_v2000_to_molecule(molfile: &str) -> Result<ChemMolecule, String> 
         return Err("Molfile V2000 truncated header".to_string());
     }
     let counts = lines[3];
-    if counts.len() < 6 {
-        return Err("Molfile V2000 invalid counts line".to_string());
-    }
-    let n_atoms: usize = counts[0..3]
+    let n_atoms: usize = counts
+        .get(0..3)
+        .ok_or_else(|| "Molfile V2000 invalid counts line".to_string())?
         .trim()
         .parse()
         .map_err(|_| "Invalid atom count in V2000 header".to_string())?;
-    let n_bonds: usize = counts[3..6]
+    let n_bonds: usize = counts
+        .get(3..6)
+        .ok_or_else(|| "Molfile V2000 invalid counts line".to_string())?
         .trim()
         .parse()
         .map_err(|_| "Invalid bond count in V2000 header".to_string())?;
-    if lines.len() < 4 + n_atoms + n_bonds {
+    if lines.len() < 4 + n_atoms.saturating_add(n_bonds) {
         return Err("Molfile V2000 truncated atom/bond block".to_string());
     }
 
@@ -2117,16 +2121,30 @@ pub fn molfile_v2000_to_molecule(molfile: &str) -> Result<ChemMolecule, String> 
         mol.add_bond(j as u32 + 1, a1 - 1, a2 - 1, order, display);
     }
 
-    // Parse M  CHG / M  ISO / M  RAD property block lines
+    // Parse M  CHG / M  ISO / M  RAD property block lines (per CTfile spec, presence of M  CHG / M  RAD supersedes atom-block codes)
+    let mut cleared_chg = false;
+    let mut cleared_rad = false;
     for line in &lines[4 + n_atoms + n_bonds..] {
         if line.starts_with("M  END") {
             break;
         }
         if line.starts_with("M  CHG") || line.starts_with("M  ISO") || line.starts_with("M  RAD") {
+            if line.starts_with("M  CHG") && !cleared_chg {
+                for a in &mut mol.atoms {
+                    a.charge = 0;
+                }
+                cleared_chg = true;
+            } else if line.starts_with("M  RAD") && !cleared_rad {
+                for a in &mut mol.atoms {
+                    a.radical = 0;
+                }
+                cleared_rad = true;
+            }
             let tokens: Vec<&str> = line[6..].split_whitespace().collect();
             if let Some(cnt_s) = tokens.first() {
                 if let Ok(cnt) = cnt_s.parse::<usize>() {
-                    for k in 0..cnt {
+                    let max_pairs = tokens.len().saturating_sub(1) / 2;
+                    for k in 0..cnt.min(max_pairs) {
                         if let (Some(idx_s), Some(val_s)) = (tokens.get(1 + k * 2), tokens.get(2 + k * 2)) {
                             if let (Ok(idx1), Ok(v)) = (idx_s.parse::<usize>(), val_s.parse::<i32>()) {
                                 if idx1 >= 1 && idx1 <= mol.atoms.len() {
@@ -2168,7 +2186,8 @@ pub fn molfile_v2000_extract_data_sgroups(molfile: &str) -> Vec<MolfileDataSGrou
         if line.starts_with("M  STY") {
             let toks: Vec<&str> = line[6..].split_whitespace().collect();
             if let Some(cnt) = toks.first().and_then(|s| s.parse::<usize>().ok()) {
-                for k in 0..cnt {
+                let max_pairs = toks.len().saturating_sub(1) / 2;
+                for k in 0..cnt.min(max_pairs) {
                     if let (Some(idx_s), Some("DAT")) = (toks.get(1 + k * 2), toks.get(2 + k * 2).copied()) {
                         if let Ok(idx) = idx_s.parse::<usize>() {
                             if !map.contains_key(&idx) {
@@ -2199,10 +2218,12 @@ pub fn molfile_v2000_extract_data_sgroups(molfile: &str) -> Vec<MolfileDataSGrou
                     }
                 }
             }
-        } else if line.starts_with("M  SDT") && line.len() >= 11 {
-            if let Ok(idx) = line[6..10].trim().parse::<usize>() {
-                if let Some(sg) = map.get_mut(&idx) {
-                    sg.field_name = line[10..].trim().to_string();
+        } else if line.starts_with("M  SDT") {
+            if let (Some(idx_s), Some(field_s)) = (line.get(6..10), line.get(10..)) {
+                if let Ok(idx) = idx_s.trim().parse::<usize>() {
+                    if let Some(sg) = map.get_mut(&idx) {
+                        sg.field_name = field_s.trim().to_string();
+                    }
                 }
             }
         } else if line.starts_with("M  SDD") && line.len() >= 11 {
@@ -2214,10 +2235,12 @@ pub fn molfile_v2000_extract_data_sgroups(molfile: &str) -> Vec<MolfileDataSGrou
                     }
                 }
             }
-        } else if line.starts_with("M  SED") && line.len() >= 11 {
-            if let Ok(idx) = line[6..10].trim().parse::<usize>() {
-                if let Some(sg) = map.get_mut(&idx) {
-                    sg.data = line[10..].trim().to_string();
+        } else if line.starts_with("M  SED") {
+            if let (Some(idx_s), Some(data_s)) = (line.get(6..10), line.get(10..)) {
+                if let Ok(idx) = idx_s.trim().parse::<usize>() {
+                    if let Some(sg) = map.get_mut(&idx) {
+                        sg.data = data_s.trim().to_string();
+                    }
                 }
             }
         }
@@ -2229,12 +2252,21 @@ pub fn molfile_v2000_extract_data_sgroups(molfile: &str) -> Vec<MolfileDataSGrou
 /// Serializes a `ChemMolecule` into an MDL Molfile V2000 string.
 pub fn molecule_to_molfile_v2000(mol: &ChemMolecule, title: &str) -> String {
     let mut out = String::new();
-    out.push_str(title);
+    let clean_title: String = title.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    out.push_str(&clean_title);
     out.push('\n');
-    out.push_str("  ChiralCraft 1.0 2D\n\n");
-    out.push_str(&format!("{:3}{:3}  0  0  0  0  0  0  0  0999 V2000\n", mol.atoms.len(), mol.bonds.len()));
+    let dim = if mol.has_3d_coords { "3D" } else { "2D" };
+    out.push_str(&format!("  ChiralCraft 1.0 {dim}\n\n"));
+    let na = mol.atoms.len().min(999);
+    let nb = mol
+        .bonds
+        .iter()
+        .filter(|b| b.begin_atom < na && b.end_atom < na && b.begin_atom != b.end_atom)
+        .take(999)
+        .count();
+    out.push_str(&format!("{:3}{:3}  0  0  0  0  0  0  0  0999 V2000\n", na, nb));
 
-    for atom in &mol.atoms {
+    for atom in mol.atoms.iter().take(na) {
         let sym = if let Some(el) = chiralcraft_chem::get_element(atom.z) {
             el.symbol
         } else if atom.z == 225 {
@@ -2259,22 +2291,29 @@ pub fn molecule_to_molfile_v2000(mol: &ChemMolecule, title: &str) -> String {
         ));
     }
 
-    for bond in &mol.bonds {
+    for bond in mol
+        .bonds
+        .iter()
+        .filter(|b| b.begin_atom < na && b.end_atom < na && b.begin_atom != b.end_atom)
+        .take(999)
+    {
         let ord_code = match bond.order {
             1..=3 => bond.order,
             6 => 4,
             _ => 1,
         };
-        let stereo_code = match bond.display {
-            BondDisplay::WedgeBegin | BondDisplay::HollowWedgeBegin => 1,
-            BondDisplay::Wavy => 4,
-            BondDisplay::WedgedHashBegin | BondDisplay::Hash => 6,
-            _ => 0,
+        let (a1, a2, stereo_code) = match bond.display {
+            BondDisplay::WedgeBegin | BondDisplay::HollowWedgeBegin => (bond.begin_atom, bond.end_atom, 1),
+            BondDisplay::WedgeEnd | BondDisplay::HollowWedgeEnd => (bond.end_atom, bond.begin_atom, 1),
+            BondDisplay::Wavy => (bond.begin_atom, bond.end_atom, 4),
+            BondDisplay::WedgedHashBegin | BondDisplay::Hash => (bond.begin_atom, bond.end_atom, 6),
+            BondDisplay::WedgedHashEnd => (bond.end_atom, bond.begin_atom, 6),
+            _ => (bond.begin_atom, bond.end_atom, 0),
         };
         out.push_str(&format!(
             "{:3}{:3}{:3}{:3}  0  0  0\n",
-            bond.begin_atom + 1,
-            bond.end_atom + 1,
+            a1 + 1,
+            a2 + 1,
             ord_code,
             stereo_code
         ));
@@ -2569,18 +2608,23 @@ fn write_v3000_ctab_body(
             1..=3 => bond.order,
             _ => 1,
         };
+        let (a1, a2, cfg) = match bond.display {
+            BondDisplay::WedgeBegin | BondDisplay::HollowWedgeBegin => (bond.begin_atom, bond.end_atom, Some(1)),
+            BondDisplay::WedgeEnd | BondDisplay::HollowWedgeEnd => (bond.end_atom, bond.begin_atom, Some(1)),
+            BondDisplay::Wavy => (bond.begin_atom, bond.end_atom, Some(2)),
+            BondDisplay::WedgedHashBegin | BondDisplay::Hash => (bond.begin_atom, bond.end_atom, Some(3)),
+            BondDisplay::WedgedHashEnd => (bond.end_atom, bond.begin_atom, Some(3)),
+            _ => (bond.begin_atom, bond.end_atom, None),
+        };
         out.push_str(&format!(
             "M  V30 {} {} {} {}",
             idx + 1,
             ord,
-            bond.begin_atom + 1,
-            bond.end_atom + 1
+            a1 + 1,
+            a2 + 1
         ));
-        match bond.display {
-            BondDisplay::WedgeBegin | BondDisplay::HollowWedgeBegin => out.push_str(" CFG=1"),
-            BondDisplay::Wavy => out.push_str(" CFG=2"),
-            BondDisplay::WedgedHashBegin | BondDisplay::Hash => out.push_str(" CFG=3"),
-            _ => {}
+        if let Some(c) = cfg {
+            out.push_str(&format!(" CFG={c}"));
         }
         if let Some(rc) = rxn_ctrs.and_then(|r| r.get(idx).copied()) {
             if rc != 0 {
@@ -2986,52 +3030,76 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
                 let ib = inside.as_bytes();
                 let mut iso = 0i32;
                 while p < ib.len() && ib[p].is_ascii_digit() {
-                    iso = iso * 10 + (ib[p] - b'0') as i32;
+                    iso = iso.saturating_mul(10).saturating_add((ib[p] - b'0') as i32);
                     p += 1;
                 }
                 let sym_start = p;
                 if p >= ib.len() {
                     return Err("Empty SMILES bracket atom".to_string());
                 }
-                let is_arom = ib[p].is_ascii_lowercase();
-                p += 1;
-                if p < ib.len()
-                    && ib[p].is_ascii_lowercase()
-                    && !matches!(ib[p], b'h')
-                {
-                    let candidate = &inside[sym_start..=p];
-                    let cap = format!(
-                        "{}{}",
-                        candidate.chars().next().unwrap().to_ascii_uppercase(),
-                        &candidate[1..]
-                    );
-                    if get_element_by_symbol(&cap).is_some() {
-                        p += 1;
-                    }
-                }
-                let raw_sym = &inside[sym_start..p];
-                let lookup = if is_arom {
-                    raw_sym.to_ascii_uppercase()
+                let (z, is_arom) = if ib[p] == b'*' {
+                    p += 1;
+                    (0, false)
                 } else {
-                    raw_sym.to_string()
+                    if !ib[p].is_ascii_alphabetic() {
+                        return Err(format!("Invalid atom symbol in SMILES bracket: {inside}"));
+                    }
+                    let is_arom = ib[p].is_ascii_lowercase();
+                    p += 1;
+                    if p < ib.len() && ib[p].is_ascii_lowercase() {
+                        let candidate = &inside[sym_start..=p];
+                        let cap = format!(
+                            "{}{}",
+                            candidate.chars().next().unwrap().to_ascii_uppercase(),
+                            &candidate[1..]
+                        );
+                        if get_element_by_symbol(&cap).is_some() {
+                            p += 1;
+                        }
+                    }
+                    let raw_sym = &inside[sym_start..p];
+                    let lookup = if is_arom {
+                        let mut cs = raw_sym.chars();
+                        match cs.next() {
+                            Some(first) => format!("{}{}", first.to_ascii_uppercase(), cs.as_str().to_ascii_lowercase()),
+                            None => String::new(),
+                        }
+                    } else {
+                        raw_sym.to_string()
+                    };
+                    let z = get_element_by_symbol(&lookup)
+                        .map(|e| e.z)
+                        .ok_or_else(|| format!("Unknown element in SMILES bracket: {inside}"))?;
+                    (z, is_arom)
                 };
-                let z = get_element_by_symbol(&lookup)
-                    .map(|e| e.z)
-                    .ok_or_else(|| format!("Unknown element in SMILES bracket: {inside}"))?;
                 let mut chg = 0i32;
+                let mut explicit_h: u8 = 0;
                 while p < ib.len() {
                     match ib[p] {
+                        b'H' => {
+                            p += 1;
+                            if p < ib.len() && ib[p].is_ascii_digit() {
+                                let mut hcnt: u32 = 0;
+                                while p < ib.len() && ib[p].is_ascii_digit() {
+                                    hcnt = hcnt.saturating_mul(10).saturating_add((ib[p] - b'0') as u32);
+                                    p += 1;
+                                }
+                                explicit_h = explicit_h.saturating_add(hcnt.min(255) as u8);
+                            } else {
+                                explicit_h = explicit_h.saturating_add(1);
+                            }
+                        }
                         b'+' => {
                             p += 1;
                             if p < ib.len() && ib[p].is_ascii_digit() {
                                 let mut mag = 0i32;
                                 while p < ib.len() && ib[p].is_ascii_digit() {
-                                    mag = mag * 10 + (ib[p] - b'0') as i32;
+                                    mag = mag.saturating_mul(10).saturating_add((ib[p] - b'0') as i32);
                                     p += 1;
                                 }
-                                chg += mag;
+                                chg = chg.saturating_add(mag);
                             } else {
-                                chg += 1;
+                                chg = chg.saturating_add(1);
                             }
                         }
                         b'-' => {
@@ -3039,12 +3107,12 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
                             if p < ib.len() && ib[p].is_ascii_digit() {
                                 let mut mag = 0i32;
                                 while p < ib.len() && ib[p].is_ascii_digit() {
-                                    mag = mag * 10 + (ib[p] - b'0') as i32;
+                                    mag = mag.saturating_mul(10).saturating_add((ib[p] - b'0') as i32);
                                     p += 1;
                                 }
-                                chg -= mag;
+                                chg = chg.saturating_sub(mag);
                             } else {
-                                chg -= 1;
+                                chg = chg.saturating_sub(1);
                             }
                         }
                         _ => p += 1,
@@ -3054,6 +3122,10 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
                 next_atom_id += 1;
                 atom.isotope = iso;
                 atom.charge = chg;
+                atom.explicit_num_hydrogens = Some(i32::from(explicit_h));
+                if z == 0 {
+                    atom.is_query = true;
+                }
                 let cur_idx = mol.add_atom(atom);
                 aromatic_atoms.push(is_arom);
                 if let Some(prev) = prev_atom {
@@ -3084,11 +3156,15 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
                     b'o' => ("O", true, 1),
                     b'p' => ("P", true, 1),
                     b's' => ("S", true, 1),
+                    b'*' => ("*", false, 1),
                     _ => return Err(format!("Unsupported SMILES token '{}' at index {i}", ch as char)),
                 };
                 i += adv;
-                let z = get_element_by_symbol(sym).unwrap().z;
-                let atom = ChemAtom::new(next_atom_id, z);
+                let z = if sym == "*" { 0 } else { get_element_by_symbol(sym).unwrap().z };
+                let mut atom = ChemAtom::new(next_atom_id, z);
+                if z == 0 {
+                    atom.is_query = true;
+                }
                 next_atom_id += 1;
                 let cur_idx = mol.add_atom(atom);
                 aromatic_atoms.push(is_arom);
@@ -3128,8 +3204,10 @@ pub fn molecule_to_smiles(mol: &ChemMolecule) -> String {
     let n = mol.atoms.len();
     let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for (bi, b) in mol.bonds.iter().enumerate() {
-        adj[b.begin_atom].push((b.end_atom, bi));
-        adj[b.end_atom].push((b.begin_atom, bi));
+        if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
+            adj[b.begin_atom].push((b.end_atom, bi));
+            adj[b.end_atom].push((b.begin_atom, bi));
+        }
     }
 
     let atom_is_arom: Vec<bool> = (0..n)
@@ -3181,10 +3259,23 @@ pub fn molecule_to_smiles(mol: &ChemMolecule) -> String {
         if arom.aromatic_bonds.contains(&bi) {
             return "";
         }
-        match mol.bonds[bi].order {
+        let b = &mol.bonds[bi];
+        match b.order {
             2 => "=",
             3 => "#",
-            _ => "",
+            _ => {
+                // Explicit single bond between two aromatic atoms (e.g., biphenyl c1ccccc1-c2ccccc2)
+                // MUST emit "-" so parsers do not interpret it as an aromatic bond!
+                if b.begin_atom < n
+                    && b.end_atom < n
+                    && atom_is_arom[b.begin_atom]
+                    && atom_is_arom[b.end_atom]
+                {
+                    "-"
+                } else {
+                    ""
+                }
+            }
         }
     };
 
@@ -3636,5 +3727,54 @@ mod tests {
             assert_eq!(reparsed.product_bond_rxctrs, parsed_v3.product_bond_rxctrs);
             assert_eq!(rxn_to_reaction(&reemitted).unwrap().products[0].atoms.len(), 3);
         }
+    }
+
+    #[test]
+    fn test_comprehensive_audit_formats_regressions() {
+        // 1. SMILES [Rh], [Th], [se], biphenyl explicit single bond, and multi-byte UTF-8 bracket safety
+        let rh = smiles_to_molecule("[Rh]").unwrap();
+        assert_eq!(rh.atoms[0].z, 45, "[Rh] must parse as Rhodium Z=45");
+        let th = smiles_to_molecule("[Th]").unwrap();
+        assert_eq!(th.atoms[0].z, 90, "[Th] must parse as Thorium Z=90");
+        let selenophene = smiles_to_molecule("c1cc[se]c1").unwrap();
+        assert!(selenophene.atoms.iter().any(|a| a.z == 34), "selenophene must contain Selenium Z=34");
+        let biph = smiles_to_molecule("c1ccc(-c2ccccc2)cc1").unwrap();
+        let biph_smi = molecule_to_smiles(&biph);
+        let biph_rt = smiles_to_molecule(&biph_smi).unwrap();
+        assert_eq!(biph_rt.atoms.len(), 12);
+        assert_eq!(biph_rt.bonds.len(), 13, "Biphenyl SMILES roundtrip must preserve bridging bond: {biph_smi}");
+        let _ = smiles_to_molecule("[α]"); // Must not panic on multi-byte UTF-8
+
+        // 2. Editable PDF places %%EOF at the very end (PDF 1.4 1024-byte tail spec) and roundtrips cleanly
+        let sample_cdxml = "<CDXML><page><fragment><n id=\"1\" p=\"10 10\"/></fragment></page></CDXML>";
+        let pdf = editable_media::scene_to_editable_pdf(&[biph.clone()], &[], &[], sample_cdxml, "Audit", false, 16.0);
+        assert!(pdf.ends_with(b"%%EOF\n"), "Editable PDF must end with %%EOF\\n");
+        let extracted = editable_media::extract_chiralcraft_cdxml_from_pdf(&pdf).expect("extract cdxml from pdf");
+        assert_eq!(extracted, sample_cdxml);
+
+        // 3. Molden [Atoms] parses ALL atoms (not just atom 1)
+        let molden = "[Molden Format]\n[Atoms] Angs\nO 1 8 0.0 0.0 0.1\nH 2 1 0.0 0.75 -0.46\nH 3 1 0.0 -0.75 -0.46\n[FREQ]\n1595.0\n[INT]\n70.0\n";
+        let qrep = parse_quantum_output(molden).expect("parse molden");
+        let opt = qrep.optimized_molecule.expect("molden geometry");
+        assert_eq!(opt.atoms.len(), 3, "Molden [Atoms] must parse all 3 atoms");
+
+        // 4. JCAMP-DX ASDF float-X with SQZ digit 'E' (5) does not misparse as scientific notation
+        let jdx_sqz = "##TITLE=ASDF Float X\n##DATA TYPE=INFRARED SPECTRUM\n##XUNITS=1/CM\n##YUNITS=ABSORBANCE\n##FIRSTX=1700.0\n##LASTX=1698.0\n##NPOINTS=3\n##XYDATA=(X++(Y..Y))\n1700.0E0K0A0\n##END=\n";
+        let sp = parse_jcamp_dx(jdx_sqz).expect("parse float-X SQZ");
+        assert_eq!(sp.raw_points.len(), 3);
+        assert!((sp.raw_points[0].0 - 1698.0).abs() < 1e-6);
+        assert!((sp.raw_points[2].0 - 1700.0).abs() < 1e-6);
+
+        // 5. PDB CA -> Carbon (not Calcium) and 1HB -> Hydrogen
+        let pdb = "ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00\nATOM      2 1HB  ALA A   1       1.500   2.500   3.500  1.00  0.00\nEND\n";
+        let pm = pdb_to_molecule(pdb).expect("parse pdb");
+        assert_eq!(pm.atoms[0].z, 6, "PDB CA must be Carbon, not Calcium");
+        assert_eq!(pm.atoms[1].z, 1, "PDB 1HB must be Hydrogen");
+
+        // 6. HELM multi-polymer & inverted-brace guard
+        let helm = helm_to_molecule("PEPTIDE1{A.C}|PEPTIDE2{G.C}$PEPTIDE1,PEPTIDE2,2:R3-2:R3$$$V2.0", 14.4).unwrap();
+        assert_eq!(helm.atoms.len(), 4);
+        assert_eq!(helm.bonds.len(), 3, "2 intra-chain + 1 inter-chain disulfide bond");
+        assert!(helm_to_molecule("PEPTIDE1}A{", 14.4).is_err(), "Inverted braces must return Err, not panic");
     }
 }

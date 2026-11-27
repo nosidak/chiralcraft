@@ -315,15 +315,19 @@ impl NicknameTable {
             expanded_atom_ids.push(dst.id);
         }
 
-        // Append remaining nickname atoms
+        // Append remaining nickname atoms (subtract attachment atom origin so user-defined nicknames never drift)
+        let attach_x = def.fragment.atoms.get(attach_src).map(|a| a.x).unwrap_or(0.0);
+        let attach_y = def.fragment.atoms.get(attach_src).map(|a| a.y).unwrap_or(0.0);
         for (i, src) in def.fragment.atoms.iter().enumerate() {
             if i == attach_src {
                 continue;
             }
             let id = *next_id;
-            *next_id += 1;
-            let rx = (src.x * cos_r - src.y * sin_r) * scale;
-            let ry = (src.x * sin_r + src.y * cos_r) * scale;
+            *next_id = next_id.saturating_add(1);
+            let dx = src.x - attach_x;
+            let dy = src.y - attach_y;
+            let rx = (dx * cos_r - dy * sin_r) * scale;
+            let ry = (dx * sin_r + dy * cos_r) * scale;
             let mut a = ChemAtom::new(id, src.z);
             a.charge = src.charge;
             a.isotope = src.isotope;
@@ -337,8 +341,11 @@ impl NicknameTable {
 
         // Append nickname internal bonds
         for b in &def.fragment.bonds {
+            if b.begin_atom >= idx_map.len() || b.end_atom >= idx_map.len() {
+                continue;
+            }
             let bid = *next_id;
-            *next_id += 1;
+            *next_id = next_id.saturating_add(1);
             mol.bonds.push(ChemBond {
                 id: bid,
                 begin_atom: idx_map[b.begin_atom],
@@ -385,7 +392,7 @@ impl NicknameTable {
 
         // Build old->new atom index map while removing dropped atoms
         let mut old_to_new: Vec<Option<usize>> = vec![None; mol.atoms.len()];
-        let mut new_atoms = Vec::with_capacity(mol.atoms.len() - drop_ids.len());
+        let mut new_atoms = Vec::with_capacity(mol.atoms.len().saturating_sub(drop_ids.len()));
         for (old_i, a) in mol.atoms.drain(..).enumerate() {
             if !drop_ids.contains(&a.id) {
                 old_to_new[old_i] = Some(new_atoms.len());

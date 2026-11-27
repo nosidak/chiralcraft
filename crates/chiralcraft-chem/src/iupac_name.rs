@@ -191,7 +191,7 @@ fn subst_to_smiles(name: &str) -> Option<&'static str> {
         "propyl" => Some("CCC"),
         "isopropyl" => Some("C(C)C"),
         "butyl" => Some("CCCC"),
-        "tert-butyl" | "t-butyl" => Some("C(C)(C)C"),
+        "tert-butyl" | "t-butyl" | "tertbutyl" => Some("C(C)(C)C"),
         "methoxy" => Some("OC"),
         "ethoxy" => Some("OCC"),
         "phenyl" => Some("c1ccccc1"),
@@ -274,15 +274,19 @@ fn parse_systematic_iupac_to_smiles(raw: &str) -> Option<String> {
     ];
     for &(pname, pos1_sub, is_pyr) in arom_parents {
         if let Some(prefix) = s.strip_suffix(pname) {
-            let subs = parse_substituent_prefix(prefix);
-            if !prefix.trim().is_empty() && subs.is_empty() {
+            let Some(subs) = parse_substituent_prefix_checked(prefix) else {
                 continue;
-            }
+            };
             let mut ring_subs: [Vec<String>; 6] = Default::default();
             if let Some(p1) = pos1_sub {
                 ring_subs[0].push(p1.to_string());
             }
-            for (loc, smi) in subs {
+            let mut next_ring = 2usize;
+            for (loc, mut smi) in subs {
+                if smi.contains('1') && next_ring <= 9 {
+                    smi = smi.replace('1', &next_ring.to_string());
+                    next_ring += 1;
+                }
                 let idx = loc.saturating_sub(1).min(5);
                 ring_subs[idx].push(smi);
             }
@@ -313,7 +317,9 @@ fn parse_systematic_iupac_to_smiles(raw: &str) -> Option<String> {
                 if n < 3 {
                     continue;
                 }
-                let subs = parse_substituent_prefix(prefix);
+                let Some(subs) = parse_substituent_prefix_checked(prefix) else {
+                    continue;
+                };
                 let mut ring_subs: Vec<Vec<String>> = vec![Vec::new(); n];
                 let mut dbl_pos: Option<usize> = None;
                 match after_root {
@@ -326,7 +332,12 @@ fn parse_systematic_iupac_to_smiles(raw: &str) -> Option<String> {
                     "anecarboxylic acid" => ring_subs[0].push("C(=O)O".to_string()),
                     _ => continue,
                 }
-                for (loc, smi) in subs {
+                let mut next_ring = 2usize;
+                for (loc, mut smi) in subs {
+                    if smi.contains('1') && next_ring <= 9 {
+                        smi = smi.replace('1', &next_ring.to_string());
+                        next_ring += 1;
+                    }
                     let idx = loc.saturating_sub(1).min(n - 1);
                     ring_subs[idx].push(smi);
                 }
@@ -382,7 +393,9 @@ fn parse_systematic_iupac_to_smiles(raw: &str) -> Option<String> {
                     first_b.0 = loc.saturating_sub(1);
                 }
             }
-            let subs = parse_substituent_prefix(clean_prefix);
+            let Some(subs) = parse_substituent_prefix_checked(clean_prefix) else {
+                continue;
+            };
             let mut atom_subs: Vec<Vec<String>> = vec![Vec::new(); n];
             let mut orders = vec![1i32; n.saturating_sub(1)];
             for (bpos, ord) in bond_orders {
@@ -458,25 +471,27 @@ fn parse_acyclic_suffix(suffix: &str, chain_len: usize) -> Option<(Vec<(usize, i
     }
 }
 
-/// Parses substituent prefixes like `"2,4-dichloro-3-methyl-"` into `Vec<(locant, smiles)>`.
-fn parse_substituent_prefix(prefix: &str) -> Vec<(usize, String)> {
+/// Parses substituent prefixes like `"2,4-dichloro-3-methyl-"` into `Some(Vec<(locant, smiles)>)`,
+/// returning `None` if a non-empty prefix contains unrecognized substituent tokens.
+fn parse_substituent_prefix_checked(prefix: &str) -> Option<Vec<(usize, String)>> {
     let mut out = Vec::new();
-    let p = prefix.trim().trim_end_matches('-');
-    if p.is_empty() {
-        return out;
+    let norm = prefix
+        .trim()
+        .trim_end_matches('-')
+        .replace("tert-butyl", "tertbutyl")
+        .replace("t-butyl", "tertbutyl");
+    if norm.is_empty() {
+        return Some(out);
     }
-    let tokens: Vec<&str> = p.split('-').filter(|t| !t.is_empty()).collect();
+    let tokens: Vec<&str> = norm.split('-').filter(|t| !t.is_empty()).collect();
     let mut pending_locs: Vec<usize> = Vec::new();
     for tok in tokens {
-        // Check if token is comma-separated locants (e.g., "2,4")
         let nums: Vec<usize> = tok.split(',').filter_map(|x| x.parse::<usize>().ok()).collect();
         if !nums.is_empty() && nums.len() == tok.split(',').count() {
             pending_locs = nums;
             continue;
         }
-        // Otherwise may be one or more concatenated substituents (e.g. "chloromethyl" or "dimethyl")
         let mut rem = tok;
-        let mut matched_any = false;
         while !rem.is_empty() {
             let stripped = strip_multiplier(rem);
             if let Some(smi) = subst_to_smiles(stripped) {
@@ -484,13 +499,11 @@ fn parse_substituent_prefix(prefix: &str) -> Vec<(usize, String)> {
                 for l in locs {
                     out.push((l, smi.to_string()));
                 }
-                matched_any = true;
                 break;
             }
-            // Try matching a prefix substituent (e.g. "chloro" + "methyl")
             let mut found_prefix = None;
             for cand in [
-                "trifluoromethyl", "tert-butyl", "isopropyl", "methoxy", "ethoxy", "hydroxy",
+                "trifluoromethyl", "tertbutyl", "isopropyl", "methoxy", "ethoxy", "hydroxy",
                 "fluoro", "chloro", "bromo", "iodo", "amino", "nitro", "cyano", "methyl", "ethyl",
                 "propyl", "butyl", "phenyl", "acetyl", "formyl", "carboxy", "oxo",
             ] {
@@ -506,20 +519,19 @@ fn parse_substituent_prefix(prefix: &str) -> Vec<(usize, String)> {
                     for l in locs {
                         out.push((l, smi.to_string()));
                     }
-                    matched_any = true;
                     rem = rest;
                 } else {
-                    break;
+                    return None;
                 }
             } else {
-                break;
+                return None;
             }
         }
-        if !matched_any {
-            pending_locs.clear();
-        }
     }
-    out
+    if !pending_locs.is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
 /// Returns `true` when `molecule_to_name` could only produce a generic formula fallback.
@@ -711,13 +723,15 @@ fn prepend_stereo(mol: &ChemMolecule, base: &str) -> String {
         match code {
             2 => tags.push((ai, "R")),
             3 => tags.push((ai, "S")),
+            4 => tags.push((ai, "r")),
+            5 => tags.push((ai, "s")),
             _ => {}
         }
     }
     for (&bi, &code) in &st.bond_stereo {
         match code {
-            1 => tags.push((1000 + bi, "E")),
-            2 => tags.push((1000 + bi, "Z")),
+            10 => tags.push((1000 + bi, "Z")),
+            11 => tags.push((1000 + bi, "E")),
             _ => {}
         }
     }
@@ -1054,23 +1068,48 @@ fn name_substituted_benzene(
             break;
         }
     }
-    let remaining: Vec<(usize, String)> = pos_subs
+    let raw_rem: Vec<(usize, String)> = pos_subs
         .into_iter()
         .enumerate()
         .filter(|&(si, _)| Some(si) != consumed_idx)
-        .map(|(_, (ridx, s))| {
-            let cw = (ridx + 6 - anchor_idx) % 6 + 1;
-            let ccw = (anchor_idx + 6 - ridx) % 6 + 1;
-            (cw.min(ccw), s)
-        })
+        .map(|(_, (ridx, s))| (ridx, s))
         .collect();
-    if remaining.is_empty() {
+    if raw_rem.is_empty() {
         return Some(parent_name.to_string());
     }
-    if remaining.len() == 1 && parent_name == "benzene" {
-        return Some(format!("{}{}", remaining[0].1, parent_name));
+    // Choose a SINGLE consistent CW or CCW ring numbering (and best anchor for bare benzene)
+    let anchors: Vec<usize> = if parent_name == "benzene" {
+        raw_rem.iter().map(|(r, _)| *r).collect()
+    } else {
+        vec![anchor_idx]
+    };
+    let mut best_locs: Option<Vec<usize>> = None;
+    let mut best_rem: Vec<(usize, String)> = Vec::new();
+    for anc in anchors {
+        for dir in [1isize, -1isize] {
+            let mapped: Vec<(usize, String)> = raw_rem
+                .iter()
+                .map(|(ridx, s)| {
+                    let loc = if dir == 1 {
+                        (*ridx + 6 - anc) % 6 + 1
+                    } else {
+                        (anc + 6 - *ridx) % 6 + 1
+                    };
+                    (loc, s.clone())
+                })
+                .collect();
+            let mut locs: Vec<usize> = mapped.iter().map(|x| x.0).collect();
+            locs.sort_unstable();
+            if best_locs.as_ref().map(|b| locs < *b).unwrap_or(true) {
+                best_locs = Some(locs);
+                best_rem = mapped;
+            }
+        }
     }
-    Some(format!("{}{}", format_substituents(&remaining), parent_name))
+    if best_rem.len() == 1 && parent_name == "benzene" {
+        return Some(format!("{}{}", best_rem[0].1, parent_name));
+    }
+    Some(format!("{}{}", format_substituents(&best_rem), parent_name))
 }
 
 /// Names monocyclic 3..=8-membered cycloalkanes, cycloalkenes, cycloalkanols, cycloalkanones,
@@ -1110,7 +1149,7 @@ fn name_substituted_cycloalkane(mol: &ChemMolecule) -> Option<String> {
     let heavy_b = mol
         .bonds
         .iter()
-        .filter(|b| mol.atoms[b.begin_atom].z != 1 && mol.atoms[b.end_atom].z != 1)
+        .filter(|b| b.begin_atom < n_atoms && b.end_atom < n_atoms && mol.atoms[b.begin_atom].z != 1 && mol.atoms[b.end_atom].z != 1)
         .count();
     if heavy_b != heavy_n {
         return None; // monocyclic graph always satisfies E == V
@@ -1175,32 +1214,37 @@ fn name_substituted_cycloalkane(mol: &ChemMolecule) -> Option<String> {
         return Some(format!("cyclo{root}{suffix}"));
     }
 
-    // Pick lowest-locant ring orientation (anchored at principal group, or across all candidate starts for cycloalkanes)
-    let candidates: Vec<usize> = match anchor_opt {
-        Some(a) => vec![a],
-        None => raw_rem.iter().map(|(r, _)| *r).collect(),
+    // Pick lowest-locant ring orientation (for cycloalkenes, C1=C2 must traverse the double bond!)
+    let cand_pairs: Vec<(usize, isize)> = if suffix == "ene" {
+        if let Some(d_idx) = ring_dbl {
+            vec![(d_idx, 1), ((d_idx + 1) % rlen, -1)]
+        } else {
+            vec![(0, 1), (0, -1)]
+        }
+    } else if let Some(a) = anchor_opt {
+        vec![(a, 1), (a, -1)]
+    } else {
+        raw_rem.iter().flat_map(|&(r, _)| [(r, 1), (r, -1)]).collect()
     };
     let mut best_locs: Option<Vec<usize>> = None;
     let mut best_rem: Vec<(usize, String)> = Vec::new();
-    for anc in candidates {
-        for dir in [1isize, -1isize] {
-            let mapped: Vec<(usize, String)> = raw_rem
-                .iter()
-                .map(|(r, s)| {
-                    let loc = if dir == 1 {
-                        (*r + rlen - anc) % rlen + 1
-                    } else {
-                        (anc + rlen - *r) % rlen + 1
-                    };
-                    (loc, s.clone())
-                })
-                .collect();
-            let mut locs: Vec<usize> = mapped.iter().map(|x| x.0).collect();
-            locs.sort_unstable();
-            if best_locs.as_ref().map(|b| locs < *b).unwrap_or(true) {
-                best_locs = Some(locs);
-                best_rem = mapped;
-            }
+    for (anc, dir) in cand_pairs {
+        let mapped: Vec<(usize, String)> = raw_rem
+            .iter()
+            .map(|(r, s)| {
+                let loc = if dir == 1 {
+                    (*r + rlen - anc) % rlen + 1
+                } else {
+                    (anc + rlen - *r) % rlen + 1
+                };
+                (loc, s.clone())
+            })
+            .collect();
+        let mut locs: Vec<usize> = mapped.iter().map(|x| x.0).collect();
+        locs.sort_unstable();
+        if best_locs.as_ref().map(|b| locs < *b).unwrap_or(true) {
+            best_locs = Some(locs);
+            best_rem = mapped;
         }
     }
     if best_rem.len() == 1 && suffix == "ane" {
@@ -1213,13 +1257,28 @@ fn name_acyclic_chain(mol: &ChemMolecule, _val: &CcVal, carbons: &[usize]) -> Op
     if carbons.is_empty() {
         return None;
     }
-    // Find longest simple carbon chain via DFS from each terminal carbon
+    // Reject cyclic graphs up front (avoids exponential simple-path search on polycycles/cages)
+    let n_atoms = mol.atoms.len();
+    let heavy_n = (0..n_atoms).filter(|&i| mol.atoms[i].z != 1).count();
+    let heavy_b = mol
+        .bonds
+        .iter()
+        .filter(|b| b.begin_atom < n_atoms && b.end_atom < n_atoms && b.begin_atom != b.end_atom && mol.atoms[b.begin_atom].z != 1 && mol.atoms[b.end_atom].z != 1)
+        .count();
+    if heavy_b >= heavy_n {
+        return None;
+    }
+    // Find longest simple carbon chain via bounded DFS
     let mut best_chain: Vec<usize> = Vec::new();
+    let mut budget = 10_000usize;
     for &start in carbons {
+        if budget == 0 {
+            break;
+        }
         let mut path = vec![start];
-        let mut visited = vec![false; mol.atoms.len()];
+        let mut visited = vec![false; n_atoms];
         visited[start] = true;
-        dfs_longest_c_chain(mol, start, &mut visited, &mut path, &mut best_chain);
+        dfs_longest_c_chain(mol, start, &mut visited, &mut path, &mut best_chain, &mut budget);
     }
     let n = best_chain.len();
     if n == 0 || n > 12 {
@@ -1347,7 +1406,8 @@ fn name_acyclic_chain(mol: &ChemMolecule, _val: &CcVal, carbons: &[usize]) -> Op
     let parent = match grp_pos {
         None => format!("{root}{infix}e"),
         Some((loc, suf)) => match suf {
-            "oic acid" | "al" | "amide" | "nitrile" => format!("{root}{infix}{suf}"),
+            "nitrile" => format!("{root}{infix}e{suf}"),
+            "oic acid" | "al" | "amide" => format!("{root}{infix}{suf}"),
             _ => {
                 if n <= 2 {
                     format!("{root}{infix}{suf}")
@@ -1391,15 +1451,23 @@ fn dfs_longest_c_chain(
     visited: &mut [bool],
     cur: &mut Vec<usize>,
     best: &mut Vec<usize>,
+    budget: &mut usize,
 ) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
     if cur.len() > best.len() {
         *best = cur.clone();
+    }
+    if cur.len() >= 13 {
+        return;
     }
     for &(v, _) in &mol.neighbors(u) {
         if !visited[v] && mol.atoms[v].z == 6 {
             visited[v] = true;
             cur.push(v);
-            dfs_longest_c_chain(mol, v, visited, cur, best);
+            dfs_longest_c_chain(mol, v, visited, cur, best, budget);
             cur.pop();
             visited[v] = false;
         }

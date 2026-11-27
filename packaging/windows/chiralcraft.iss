@@ -4,6 +4,9 @@
 #ifndef MyAppArch
   #define MyAppArch "x64"
 #endif
+#ifndef InnoArchAllowed
+  #define InnoArchAllowed "x64compatible"
+#endif
 
 [Setup]
 AppId={{94E7A5D1-7C3B-4A68-9E8F-3C1A4D2B7E55}

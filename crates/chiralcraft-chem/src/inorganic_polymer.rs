@@ -84,9 +84,14 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
             if disp == BondDisplay::Dative || order == 5 {
                 l_cnt += 1;
                 details.push(format!("{lsym} (dative L-type, 2e-)"));
+            } else if transition_metal_group(la.z).is_some() {
+                // Metal-metal bond (single/double/triple/quadruple) contributes `order` e- to each metal
+                let mm = order.clamp(1, 4);
+                extra_e += mm;
+                details.push(format!("M–{lsym} (metal-metal bond order {mm}, {mm}e-)"));
             } else if order == 2 {
-                // Fischer/Schrock carbene or oxo/imido: treat M=O / M=N as X2 (4e-), M=C as L (2e- Schrock X2)
-                if matches!(la.z, 8 | 7 | 16) && l_deg == 1 {
+                // Fischer/Schrock carbene or oxo/imido: M=O / M=S (deg 1) or M=NR (deg <= 2) -> X2 (4e-), M=CR2 -> L (2e-)
+                if (matches!(la.z, 8 | 16) && l_deg == 1) || (la.z == 7 && l_deg <= 2) {
                     x_cnt += 2;
                     details.push(format!("={lsym} (X2 oxo/imido, 4e-)"));
                 } else {
@@ -99,8 +104,8 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
             } else {
                 // Single bond classification:
                 // Halogens (F, Cl, Br, I), H, C (alkyl/aryl unless CO!), alkoxide O (deg<=2), amide N (deg==2 single) -> X-type
-                // Phosphines P (deg>=3 or deg==1 PH3), carbonyl C=O, amines/ammines N (deg>=3, deg==1 neutral NH3, or aromatic/nitrile), ethers/aqua O (deg>=3) -> L-type
-                let is_co = la.z == 6 && adj[lig].iter().any(|&(k, o, _)| mol.atoms[k].z == 8 && o >= 2);
+                // Phosphines P (deg>=3 or deg==1 PH3), carbonyl C=O (deg==2), amines/ammines N (deg>=3, deg==1 neutral NH3, or aromatic/nitrile), ethers/aqua O (deg>=3) -> L-type
+                let is_co = la.z == 6 && l_deg == 2 && adj[lig].iter().any(|&(k, o, _)| mol.atoms[k].z == 8 && o >= 2);
                 let is_nitrile_or_imine_n = la.z == 7
                     && adj[lig].iter().any(|&(k, o, _)| k != mi && (o >= 2 || o == 4));
                 let is_l = is_co
@@ -121,10 +126,6 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
                 if is_l {
                     l_cnt += 1;
                     details.push(format!("{lsym} (L-type neutral, 2e-)"));
-                } else if transition_metal_group(la.z).is_some() {
-                    // Metal-metal single bond contributes 1e- to each metal
-                    extra_e += 1;
-                    details.push(format!("M–{lsym} (metal-metal bond, 1e-)"));
                 } else {
                     x_cnt += 1;
                     details.push(format!("{lsym} (X-type anionic, 2e-)"));
@@ -134,10 +135,9 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
 
         let ox = atom.charge + (x_cnt as i32);
         let d_elec = (group - ox).max(0);
-        // Ionic method: total valence e- = d_elec + 2*(x_cnt + l_cnt) + extra_e
-        // Equivalent to neutral method: group - charge + x_cnt + 2*l_cnt + extra_e!
+        // Neutral method: total valence e- = group - charge + x_cnt + 2*l_cnt + extra_e (never fabricates e- if ox > group)
         let lig_e = 2 * ((x_cnt + l_cnt) as i32) + extra_e;
-        let total_e = d_elec + lig_e;
+        let total_e = (group - atom.charge + (x_cnt as i32) + 2 * (l_cnt as i32) + extra_e).max(0);
         let cn = adj[mi].len();
 
         let geometry = match cn {
@@ -249,7 +249,7 @@ pub fn compute_polymer_metrics(
         CopolymerTopology::Homopolymer => format!("{{[$]{clean_smi}[$]}}"),
         CopolymerTopology::Random => format!("{{[$]{clean_smi}[$],[$]C(C)([$])}}"),
         CopolymerTopology::Block => format!("{{[$]{clean_smi}[$]}}{{[$]C(C)[$]}}"),
-        CopolymerTopology::Alternating => format!("{{[<]{clean_smi}[>],[>]C(C)[<]}}"),
+        CopolymerTopology::Alternating => format!("{{[<]{clean_smi}[<],[>]C(C)[>]}}"),
     };
 
     PolymerReport {

@@ -49,14 +49,18 @@ pub fn detect_ionizable_sites(mol: &ChemMolecule) -> Vec<IonizableSite> {
     let arom = CcAromaticityInfo::perceive(mol);
     let mut sites = Vec::new();
 
+    let mut seen_guanidine_c = BTreeSet::new();
     for i in 0..n {
-        let z = mol.atoms[i].z;
+        let a = &mol.atoms[i];
+        let z = a.z;
         let heavy_nbrs: Vec<(usize, i32)> = adj[i]
             .iter()
             .filter(|&&(nb, _, _)| mol.atoms[nb].z > 1)
             .map(|&(nb, _, o)| (nb, o))
             .collect();
-        let imp_h = val.implicit_h_counts.get(i).copied().unwrap_or(0);
+        let imp_h = val.implicit_h_counts.get(i).copied().unwrap_or(0) as usize;
+        let exp_h = adj[i].iter().filter(|&&(nb, _, _)| mol.atoms[nb].z == 1).count();
+        let total_h = imp_h + exp_h;
 
         if z == 8 && heavy_nbrs.len() == 1 && heavy_nbrs[0].1 == 1 {
             let (nb, _) = heavy_nbrs[0];
@@ -70,7 +74,7 @@ pub fn detect_ionizable_sites(mol: &ChemMolecule) -> Vec<IonizableSite> {
             } else if matches!(mol.atoms[nb].z, 15 | 16) {
                 sites.push(IonizableSite { atom_idx: i, label: "Sulfonic / Phosphoric Acid", pka: 1.9, is_acid: true });
             }
-        } else if z == 16 && heavy_nbrs.len() == 1 && imp_h >= 1 {
+        } else if z == 16 && heavy_nbrs.len() == 1 && total_h >= 1 {
             sites.push(IonizableSite { atom_idx: i, label: "Thiol", pka: 8.5, is_acid: true });
         } else if z == 7 {
             let is_amide = heavy_nbrs.iter().any(|&(nb, _)| {
@@ -84,25 +88,28 @@ pub fn detect_ionizable_sites(mol: &ChemMolecule) -> Vec<IonizableSite> {
             let is_sulfonamide = heavy_nbrs.iter().any(|&(nb, _)| {
                 mol.atoms[nb].z == 16 && adj[nb].iter().any(|&(k, _, o)| mol.atoms[k].z == 8 && o == 2)
             });
-            if is_sulfonamide && imp_h >= 1 {
+            if is_sulfonamide && total_h >= 1 {
                 sites.push(IonizableSite { atom_idx: i, label: "Sulfonamide", pka: 10.1, is_acid: true });
                 continue;
             }
             if arom.is_atom_aromatic(i) {
-                if heavy_nbrs.len() == 2 && imp_h == 0 {
+                if heavy_nbrs.len() == 2 && total_h == 0 {
                     sites.push(IonizableSite { atom_idx: i, label: "Pyridine / Imidazole-like N", pka: 5.3, is_acid: false });
                 }
                 continue;
             }
             let attached_arom = heavy_nbrs.iter().any(|&(nb, _)| arom.is_atom_aromatic(nb));
-            let is_guanidine = heavy_nbrs.iter().any(|&(nb, _)| {
-                mol.atoms[nb].z == 6 && adj[nb].iter().filter(|&&(k, _, _)| mol.atoms[k].z == 7).count() >= 3
+            let guanidine_c = heavy_nbrs.iter().find_map(|&(nb, _)| {
+                (mol.atoms[nb].z == 6 && adj[nb].iter().filter(|&&(k, _, _)| mol.atoms[k].z == 7).count() >= 3)
+                    .then_some(nb)
             });
-            if is_guanidine {
-                sites.push(IonizableSite { atom_idx: i, label: "Guanidine", pka: 12.5, is_acid: false });
+            if let Some(gc) = guanidine_c {
+                if seen_guanidine_c.insert(gc) {
+                    sites.push(IonizableSite { atom_idx: i, label: "Guanidine", pka: 12.5, is_acid: false });
+                }
             } else if attached_arom {
                 sites.push(IonizableSite { atom_idx: i, label: "Aniline", pka: 4.6, is_acid: false });
-            } else if heavy_nbrs.len() <= 3 {
+            } else if heavy_nbrs.len() <= 3 && a.charge <= 0 {
                 sites.push(IonizableSite { atom_idx: i, label: "Aliphatic Amine", pka: 9.8, is_acid: false });
             }
         }
@@ -114,11 +121,10 @@ pub fn net_charge_at_ph(sites: &[IonizableSite], ph: f64) -> f64 {
     sites
         .iter()
         .map(|s| {
-            let ratio = 10.0_f64.powf(ph - s.pka);
             if s.is_acid {
-                -ratio / (1.0 + ratio)
+                -1.0 / (1.0 + 10.0_f64.powf(s.pka - ph))
             } else {
-                1.0 / (1.0 + ratio)
+                1.0 / (1.0 + 10.0_f64.powf(ph - s.pka))
             }
         })
         .sum()
@@ -128,30 +134,35 @@ pub fn net_charge_at_ph(sites: &[IonizableSite], ph: f64) -> f64 {
 pub fn compute_microspecies_at_ph(mol: &ChemMolecule, ph: f64) -> MicrospeciesResult {
     let sites = detect_ionizable_sites(mol);
     let mut out = mol.clone();
-    for a in &mut out.atoms {
-        a.charge = 0;
-    }
+    let site_atoms: BTreeSet<usize> = sites.iter().map(|s| s.atom_idx).collect();
+    let perm_charge: f64 = out
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !site_atoms.contains(i))
+        .map(|(_, a)| a.charge as f64)
+        .sum();
     for s in &sites {
-        if s.is_acid {
-            if ph > s.pka {
-                out.atoms[s.atom_idx].charge = -1;
-            }
+        out.atoms[s.atom_idx].charge = if s.is_acid {
+            if ph > s.pka { -1 } else { 0 }
         } else if ph < s.pka {
-            out.atoms[s.atom_idx].charge = 1;
-        }
+            1
+        } else {
+            0
+        };
     }
-    let net_charge = net_charge_at_ph(&sites, ph);
+    let net_charge = perm_charge + net_charge_at_ph(&sites, ph);
     let formal_charge_sum = out.atoms.iter().map(|a| a.charge).sum();
 
-    // Solve pI (pH where net_charge == 0) via bisection if molecule is amphoteric
-    let has_acid = sites.iter().any(|s| s.is_acid);
-    let has_base = sites.iter().any(|s| !s.is_acid);
-    let isoelectric_point = if has_acid && has_base {
+    // Solve pI (pH where net_charge == 0) via bisection if charge crosses zero across 0..=14
+    let q_lo = perm_charge + net_charge_at_ph(&sites, 0.0);
+    let q_hi = perm_charge + net_charge_at_ph(&sites, 14.0);
+    let isoelectric_point = if q_lo >= 0.0 && q_hi <= 0.0 && !sites.is_empty() {
         let mut lo = 0.0_f64;
         let mut hi = 14.0_f64;
         for _ in 0..40 {
             let mid = 0.5 * (lo + hi);
-            if net_charge_at_ph(&sites, mid) > 0.0 {
+            if perm_charge + net_charge_at_ph(&sites, mid) > 0.0 {
                 lo = mid;
             } else {
                 hi = mid;
@@ -398,8 +409,9 @@ pub fn enumerate_resonance_structures(mol: &ChemMolecule, max_count: usize) -> V
                 if don == acc || od != 1 {
                     continue;
                 }
+                let don_no_mult = adj[don].iter().all(|&(_, _, o)| o == 1);
                 let can_donate = mol.atoms[don].charge < 0
-                    || (matches!(mol.atoms[don].z, 7 | 8 | 16) && mol.atoms[don].charge == 0);
+                    || (matches!(mol.atoms[don].z, 7 | 8 | 16) && mol.atoms[don].charge == 0 && don_no_mult);
                 if can_donate {
                     let mut cand = mol.clone();
                     cand.bonds[bd].order = 2;
@@ -423,26 +435,30 @@ pub fn enumerate_resonance_structures(mol: &ChemMolecule, max_count: usize) -> V
         }
     }
 
-    // 3. Alternate Kekulé aromatic ring resonance form (toggle 1<->2 on all aromatic ring bonds)
+    // 3. Alternate Kekulé aromatic ring resonance form (constrained valid re-kekulization so fused rings & heterocycles stay valence-valid)
     let arom = CcAromaticityInfo::perceive(mol);
-    let arom_bonds: Vec<usize> = mol
+    let arom_dbl_bonds: Vec<usize> = mol
         .bonds
         .iter()
         .enumerate()
-        .filter(|&(bi, b)| arom.is_bond_aromatic(bi) && matches!(b.order, 1 | 2))
+        .filter(|&(bi, b)| arom.is_bond_aromatic(bi) && b.order == 2)
         .map(|(bi, _)| bi)
         .collect();
-    if arom_bonds.len() >= 6 {
-        let mut kek = mol.clone();
-        for &bi in &arom_bonds {
-            kek.bonds[bi].order = if kek.bonds[bi].order == 2 { 1 } else { 2 };
-        }
-        if seen.insert(bond_signature(&kek)) {
-            out.push(ResonanceContributor {
-                description: "Alternate Kekulé aromatic contributor".to_string(),
-                weight_score: score_mol(&kek),
-                molecule: kek,
-            });
+    if arom_dbl_bonds.len() >= 3 {
+        let mut base_dek = mol.clone();
+        crate::dekekulize_aromatic_bonds(&mut base_dek);
+        for &ban_bi in &arom_dbl_bonds {
+            let mut kek = base_dek.clone();
+            // Force one previously-double aromatic bond to single, then find a valid Kekulé matching
+            kek.bonds[ban_bi].order = 1;
+            if crate::kekulize_aromatic_bonds(&mut kek) && seen.insert(bond_signature(&kek)) {
+                out.push(ResonanceContributor {
+                    description: "Alternate Kekulé aromatic contributor".to_string(),
+                    weight_score: score_mol(&kek),
+                    molecule: kek,
+                });
+                break;
+            }
         }
     }
 

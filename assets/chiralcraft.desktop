@@ -7,5 +7,5 @@ Exec=chiralcraft %f
 Icon=chiralcraft
 Terminal=false
 Categories=Science;Chemistry;Education;Graphics;
-MimeType=chemical/x-cdx;chemical/x-cdxml;chemical/x-mdl-molfile;chemical/x-mdl-sdfile;image/svg+xml;
+MimeType=chemical/x-cdx;chemical/x-cdxml;chemical/x-mdl-molfile;chemical/x-mdl-sdfile;chemical/x-xyz;chemical/x-cif;chemical/x-pdb;image/svg+xml;
 StartupWMClass=ChiralCraft

@@ -469,8 +469,8 @@ pub fn compare_ir_spectra(
     wn_min: f64,
     wn_max: f64,
 ) -> IrComparisonMetrics {
-    let mut a = calc_wn_abs.to_vec();
-    let mut b = exp_wn_abs.to_vec();
+    let mut a: Vec<(f64, f64)> = calc_wn_abs.iter().copied().filter(|(x, y)| x.is_finite() && y.is_finite()).collect();
+    let mut b: Vec<(f64, f64)> = exp_wn_abs.iter().copied().filter(|(x, y)| x.is_finite() && y.is_finite()).collect();
     a.sort_by(|u, v| u.0.partial_cmp(&v.0).unwrap_or(std::cmp::Ordering::Equal));
     b.sort_by(|u, v| u.0.partial_cmp(&v.0).unwrap_or(std::cmp::Ordering::Equal));
     if a.len() < 2 || b.len() < 2 {
@@ -766,7 +766,10 @@ pub fn predict_ir_spectrum(mol: &ChemMolecule) -> IrPrediction {
                     k != o_idx && mol.atoms[k].z == 8 && o == 1 && tot_h_of(k) >= 1
                 });
                 let has_or = adj[i].iter().any(|&(k, o)| {
-                    k != o_idx && mol.atoms[k].z == 8 && o == 1 && adj[k].len() >= 2
+                    k != o_idx
+                        && mol.atoms[k].z == 8
+                        && o == 1
+                        && adj[k].iter().filter(|&&(m, _)| mol.atoms[m].z > 1).count() >= 2
                 });
                 let conj = adj[i].iter().any(|&(k, _)| {
                     k != o_idx && (arom.is_atom_aromatic(k) || adj[k].iter().any(|&(_, o2)| o2 == 2))
@@ -817,7 +820,8 @@ pub fn predict_ir_spectrum(mol: &ChemMolecule) -> IrPrediction {
                     bands.push(IrBand::rule(2825.0, 0.44, 22.0, "m", "Aldehyde C–H Fermi doublet (high)", vec![i]));
                     bands.push(IrBand::rule(2720.0, 0.42, 22.0, "m", "Aldehyde C–H Fermi doublet (low)", vec![i]));
                 }
-                if has_n && !matches!(ring_sz, Some(4)) {
+                let has_amide_nh = adj[i].iter().any(|&(k, o)| mol.atoms[k].z == 7 && o == 1 && tot_h_of(k) >= 1);
+                if has_amide_nh && !matches!(ring_sz, Some(4)) {
                     bands.push(IrBand::rule(1545.0, 0.58, 24.0, "m", "Amide II N–H bend / C–N stretch", vec![i, o_idx]));
                 }
             }
@@ -834,9 +838,9 @@ pub fn predict_ir_spectrum(mol: &ChemMolecule) -> IrPrediction {
                 bands.push(IrBand::rule(1530.0, 0.85, 24.0, "s", "Nitro N=O asym stretch", at.clone()));
                 bands.push(IrBand::rule(1350.0, 0.76, 22.0, "s", "Nitro N=O sym stretch", at));
             }
-            // Azide -N=N+=N- (central N with two N neighbors, at least one multiple bond)
+            // Azide -N=N+=N- (non-aromatic linear central N with two N neighbors, at least one multiple bond)
             let n_nbrs: Vec<(usize, i32)> = adj[i].iter().copied().filter(|&(k, _)| mol.atoms[k].z == 7).collect();
-            if n_nbrs.len() == 2 && n_nbrs.iter().any(|&(_, o)| o >= 2) {
+            if !arom.is_atom_aromatic(i) && n_nbrs.len() == 2 && n_nbrs.iter().any(|&(_, o)| o >= 2) {
                 bands.push(IrBand::rule(
                     2135.0,
                     0.90,
@@ -966,7 +970,7 @@ pub fn predict_ir_spectrum(mol: &ChemMolecule) -> IrPrediction {
                 3 => bands.push(IrBand::rule(820.0, 0.68, 20.0, "s", "para-Disubstituted Benzene C–H OOP bend", arom_atoms)),
                 _ => bands.push(IrBand::rule(755.0, 0.62, 24.0, "s", "Aromatic C–H out-of-plane bend", arom_atoms)),
             }
-        } else {
+        } else if has_arom_ch {
             bands.push(IrBand::rule(755.0, 0.62, 24.0, "s", "Aromatic C–H out-of-plane bend", arom_atoms));
         }
     }
@@ -1011,35 +1015,30 @@ pub fn predict_uv_vis(mol: &ChemMolecule) -> UvVisPrediction {
     let adj = build_adj(mol);
     let arom = CcAromaticityInfo::perceive(mol);
 
-    // Find largest connected conjugated π-system (aromatic + sp2/sp atoms)
+    // Find largest connected conjugated π-system (aromatic + sp2/sp atoms, excluding tetrahedral sulfone/phosphoryl S/P)
     let is_pi: Vec<bool> = (0..n)
-        .map(|i| arom.is_atom_aromatic(i) || adj[i].iter().any(|&(_, o)| o >= 2))
+        .map(|i| {
+            if arom.is_atom_aromatic(i) {
+                true
+            } else if matches!(mol.atoms[i].z, 15 | 16) && adj[i].len() >= 3 {
+                false
+            } else {
+                adj[i].iter().any(|&(_, o)| matches!(o, 2 | 3 | 6))
+            }
+        })
         .collect();
     let mut vis = vec![false; n];
     let mut max_pi_comp = 0usize;
     let mut max_arom_comp = 0usize;
-    let mut has_azo = false;
-    let mut has_nitro = false;
-    let mut has_donor = false;
-    let mut has_carbonyl = false;
+    let mut best_comp: Vec<usize> = Vec::new();
+    let mut has_any_carbonyl = false;
 
     for b in &mol.bonds {
         if b.begin_atom < n && b.end_atom < n {
             let (zu, zv) = (mol.atoms[b.begin_atom].z, mol.atoms[b.end_atom].z);
-            if b.order == 2 && zu == 7 && zv == 7 {
-                has_azo = true;
-            }
             if b.order == 2 && ((zu == 6 && zv == 8) || (zu == 8 && zv == 6)) {
-                has_carbonyl = true;
+                has_any_carbonyl = true;
             }
-        }
-    }
-    for i in 0..n {
-        if mol.atoms[i].z == 7 && adj[i].iter().filter(|&&(k, _)| mol.atoms[k].z == 8).count() >= 2 {
-            has_nitro = true;
-        }
-        if matches!(mol.atoms[i].z, 7 | 8) && adj[i].iter().any(|&(k, o)| o == 1 && is_pi[k]) {
-            has_donor = true;
         }
     }
 
@@ -1049,10 +1048,10 @@ pub fn predict_uv_vis(mol: &ChemMolecule) -> UvVisPrediction {
         }
         let mut stack = vec![i];
         vis[i] = true;
-        let mut cnt = 0usize;
+        let mut comp = Vec::new();
         let mut acnt = 0usize;
         while let Some(u) = stack.pop() {
-            cnt += 1;
+            comp.push(u);
             if arom.is_atom_aromatic(u) { acnt += 1; }
             for &(v, _) in &adj[u] {
                 if is_pi[v] && !vis[v] {
@@ -1061,9 +1060,53 @@ pub fn predict_uv_vis(mol: &ChemMolecule) -> UvVisPrediction {
                 }
             }
         }
-        if cnt > max_pi_comp {
-            max_pi_comp = cnt;
+        if comp.len() > max_pi_comp || (comp.len() == max_pi_comp && acnt > max_arom_comp) {
+            max_pi_comp = comp.len();
             max_arom_comp = acnt;
+            best_comp = comp;
+        }
+    }
+
+    let in_best: BTreeSet<usize> = best_comp.iter().copied().collect();
+    let mut has_azo = false;
+    let mut has_nitro = false;
+    let mut has_donor = false;
+    let mut has_carbonyl = has_any_carbonyl;
+    if !in_best.is_empty() {
+        has_carbonyl = false;
+        for b in &mol.bonds {
+            if b.begin_atom < n && b.end_atom < n && in_best.contains(&b.begin_atom) && in_best.contains(&b.end_atom) {
+                let (zu, zv) = (mol.atoms[b.begin_atom].z, mol.atoms[b.end_atom].z);
+                if b.order == 2 && zu == 7 && zv == 7 {
+                    has_azo = true;
+                }
+                if b.order == 2 && ((zu == 6 && zv == 8) || (zu == 8 && zv == 6)) {
+                    has_carbonyl = true;
+                }
+            }
+        }
+        for &u in &best_comp {
+            if mol.atoms[u].z == 7 && adj[u].iter().filter(|&&(k, _)| mol.atoms[k].z == 8).count() >= 2 {
+                has_nitro = true;
+            }
+        }
+        for i in 0..n {
+            if matches!(mol.atoms[i].z, 7 | 8) {
+                // Donor must be attached directly to an aromatic/alkene carbon of best_comp (NOT a carboxylic -OH on C=O)
+                let attached_to_arom_or_alkene = adj[i].iter().any(|&(k, o)| {
+                    if o != 1 || !in_best.contains(&k) {
+                        return false;
+                    }
+                    let is_carbonyl_c = mol.atoms[k].z == 6 && adj[k].iter().any(|&(m, mo)| mol.atoms[m].z == 8 && mo == 2);
+                    !is_carbonyl_c
+                });
+                if attached_to_arom_or_alkene {
+                    has_donor = true;
+                }
+            }
+        }
+        if !has_carbonyl {
+            has_carbonyl = has_any_carbonyl;
         }
     }
 
@@ -1166,40 +1209,49 @@ pub fn predict_2d_nmr(mol: &ChemMolecule, kind: Nmr2dKind) -> Nmr2dPrediction {
         .map(|p| (p.atom_idx, p.shift_ppm))
         .collect();
 
+    let max_h_ppm = h1.peaks.iter().map(|p| p.shift_ppm).fold(10.5_f64, f64::max).ceil().max(10.5);
+    let max_c_ppm = c13.peaks.iter().map(|p| p.shift_ppm).fold(210.0_f64, f64::max).ceil().max(210.0);
+
     let mut peaks = Vec::new();
     match kind {
         Nmr2dKind::Cosy => {
-            // Diagonal peaks + vicinal (bonded C-C) 3J H-H off-diagonal cross-peaks
+            // Diagonal peaks + vicinal (bonded C-C) 3J H-H off-diagonal cross-peaks (exclude exchangeable OH/NH/SH)
             for (&ai, &sh) in &h_by_atom {
-                peaks.push(Nmr2dCrossPeak {
-                    x_ppm: sh,
-                    y_ppm: sh,
-                    atom_x: ai,
-                    atom_y: ai,
-                    label: format!("Diag #{} ({:.2} ppm)", ai + 1, sh),
-                });
+                if mol.atoms.get(ai).map(|a| a.z == 6).unwrap_or(false) {
+                    peaks.push(Nmr2dCrossPeak {
+                        x_ppm: sh,
+                        y_ppm: sh,
+                        atom_x: ai,
+                        atom_y: ai,
+                        label: format!("Diag #{} ({:.2} ppm)", ai + 1, sh),
+                    });
+                }
             }
             for b in &mol.bonds {
-                if b.begin_atom < n && b.end_atom < n {
+                if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom
+                    && mol.atoms[b.begin_atom].z == 6 && mol.atoms[b.end_atom].z == 6
+                {
                     if let (Some(&s1), Some(&s2)) = (h_by_atom.get(&b.begin_atom), h_by_atom.get(&b.end_atom)) {
-                        peaks.push(Nmr2dCrossPeak {
-                            x_ppm: s1,
-                            y_ppm: s2,
-                            atom_x: b.begin_atom,
-                            atom_y: b.end_atom,
-                            label: format!("³J H#{} ↔ H#{} ({:.2}, {:.2})", b.begin_atom + 1, b.end_atom + 1, s1, s2),
-                        });
-                        peaks.push(Nmr2dCrossPeak {
-                            x_ppm: s2,
-                            y_ppm: s1,
-                            atom_x: b.end_atom,
-                            atom_y: b.begin_atom,
-                            label: format!("³J H#{} ↔ H#{} ({:.2}, {:.2})", b.end_atom + 1, b.begin_atom + 1, s2, s1),
-                        });
+                        if (s1 - s2).abs() > 1e-3 {
+                            peaks.push(Nmr2dCrossPeak {
+                                x_ppm: s1,
+                                y_ppm: s2,
+                                atom_x: b.begin_atom,
+                                atom_y: b.end_atom,
+                                label: format!("³J H#{} ↔ H#{} ({:.2}, {:.2})", b.begin_atom + 1, b.end_atom + 1, s1, s2),
+                            });
+                            peaks.push(Nmr2dCrossPeak {
+                                x_ppm: s2,
+                                y_ppm: s1,
+                                atom_x: b.end_atom,
+                                atom_y: b.begin_atom,
+                                label: format!("³J H#{} ↔ H#{} ({:.2}, {:.2})", b.end_atom + 1, b.begin_atom + 1, s2, s1),
+                            });
+                        }
                     }
                 }
             }
-            Nmr2dPrediction { kind, x_range: (0.0, 10.5), y_range: (0.0, 10.5), peaks }
+            Nmr2dPrediction { kind, x_range: (0.0, max_h_ppm), y_range: (0.0, max_h_ppm), peaks }
         }
         Nmr2dKind::Hsqc => {
             // Direct 1-bond ¹H–¹³C correlations on protonated carbons
@@ -1214,13 +1266,16 @@ pub fn predict_2d_nmr(mol: &ChemMolecule, kind: Nmr2dKind) -> Nmr2dPrediction {
                     });
                 }
             }
-            Nmr2dPrediction { kind, x_range: (0.0, 10.5), y_range: (0.0, 210.0), peaks }
+            Nmr2dPrediction { kind, x_range: (0.0, max_h_ppm), y_range: (0.0, max_c_ppm), peaks }
         }
         Nmr2dKind::Hmbc => {
-            // 2-bond and 3-bond ¹H–¹³C correlations (graph distance 1 or 2 between protonated host atom & target C)
+            // 2-bond (all distance 1 first) then 3-bond (distance 2) ¹H–¹³C correlations on C-H protons
             let mut seen = BTreeSet::new();
             for (&ha, &sh) in &h_by_atom {
-                // Distance 1 (2J_CH) and distance 2 (3J_CH)
+                if !mol.atoms.get(ha).map(|a| a.z == 6).unwrap_or(false) {
+                    continue;
+                }
+                // Pass 1: Distance 1 (2J_CH)
                 for &(n1, _) in &adj[ha] {
                     if let Some(&sc) = c_by_atom.get(&n1) {
                         if seen.insert((ha, n1)) {
@@ -1233,6 +1288,9 @@ pub fn predict_2d_nmr(mol: &ChemMolecule, kind: Nmr2dKind) -> Nmr2dPrediction {
                             });
                         }
                     }
+                }
+                // Pass 2: Distance 2 (3J_CH)
+                for &(n1, _) in &adj[ha] {
                     for &(n2, _) in &adj[n1] {
                         if n2 != ha {
                             if let Some(&sc) = c_by_atom.get(&n2) {
@@ -1250,7 +1308,7 @@ pub fn predict_2d_nmr(mol: &ChemMolecule, kind: Nmr2dKind) -> Nmr2dPrediction {
                     }
                 }
             }
-            Nmr2dPrediction { kind, x_range: (0.0, 10.5), y_range: (0.0, 210.0), peaks }
+            Nmr2dPrediction { kind, x_range: (0.0, max_h_ppm), y_range: (0.0, max_c_ppm), peaks }
         }
     }
 }

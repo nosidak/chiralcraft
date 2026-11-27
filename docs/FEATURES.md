@@ -104,7 +104,7 @@ Open via **`Structure › Multi-Spectroscopy Studio (FT-IR / UV–Vis / 2D NMR).
    - **Reductive Amination** (`NaBH(OAc)₃`, AcOH)
    - **Friedel–Crafts Acylation** (`AlCl₃`, DCM)
    - **Wittig Olefination** (`Ph₃P=CHR`, THF)
-5. **CLI & MCP Access**: Run `chiralcraft retro target.mol` (or `chiralcraft retro "CC(=O)Nc1ccccc1"`) from the terminal, or call `retrosynthesis` via `chiralcraft --mcp`.
+5. **CLI & MCP Access**: Run `chiralcraft retro target.mol` (or `chiralcraft retro "CC(=O)Nc1ccccc1"`) from the terminal, or call `retrosynthesis_suggest` via `chiralcraft --mcp`.
 
 ### Additional Synthesis & ELN Tools
 - **Markush R-Group Enumerator & SAR Grid**: Enumerate `R1`/`R2` substituent combinations onto any scaffold, sort the generated SAR library by MW/LogP/MPO/QED/Alerts, stamp visual grids onto the canvas, or export to `.sdf`/`.csv`.

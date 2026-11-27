@@ -192,7 +192,7 @@ pub static ELEMENTS: [ElementRecord; 118] = [
     ElementRecord { z: 91, symbol: "Pa", name: "Protactinium", atomic_weight_bits: 0x406ce125edd05293, melting_point_c_bits: 0x4098800000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x402ebd70a3d70a3d, ionization_energy_kj_bits: 0x4081c00000000000, group: 5, period: 7, discoverer: "Hahn & Meitner, 1917", electronegativity_bits: 0x3ff8000000000000, covalent_radius_pm: 180, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 92, symbol: "U", name: "Uranium", atomic_weight_bits: 0x406dc0ecd4aa10e0, melting_point_c_bits: 0x4091b0999999999a, boiling_point_c_bits: 0x40ae780000000000, density_bits: 0x40330ccccccccccd, ionization_energy_kj_bits: 0x4082accccccccccd, group: 6, period: 7, discoverer: "Peligot, 1841", electronegativity_bits: 0x3ff6147ae147ae14, covalent_radius_pm: 175, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 93, symbol: "Np", name: "Neptunium", atomic_weight_bits: 0x406da00000000000, melting_point_c_bits: 0x4083e80000000000, boiling_point_c_bits: 0x40af400000000000, density_bits: 0x4034733333333333, ionization_energy_kj_bits: 0x4082e40000000000, group: 7, period: 7, discoverer: "McMillan & Abelson, 1940", electronegativity_bits: 0x3ff5c28f5c28f5c3, covalent_radius_pm: 175, preferred_valence: 0, allowed_valences: &[] },
-    ElementRecord { z: 94, symbol: "Pu", name: "Plutonium", atomic_weight_bits: 0x406e800000000000, melting_point_c_bits: 0x4083facccccccccd, boiling_point_c_bits: 0x40a93c0000000000, density_bits: 0x4033d0e560418937, ionization_energy_kj_bits: 0x408245999999999a, group: 8, period: 7, discoverer: "Seaborg et. al., 1957", electronegativity_bits: 0x3ff47ae147ae147b, covalent_radius_pm: 175, preferred_valence: 0, allowed_valences: &[] },
+    ElementRecord { z: 94, symbol: "Pu", name: "Plutonium", atomic_weight_bits: 0x406e800000000000, melting_point_c_bits: 0x4083facccccccccd, boiling_point_c_bits: 0x40a93c0000000000, density_bits: 0x4033d0e560418937, ionization_energy_kj_bits: 0x408245999999999a, group: 8, period: 7, discoverer: "Seaborg et. al., 1940", electronegativity_bits: 0x3ff47ae147ae147b, covalent_radius_pm: 175, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 95, symbol: "Am", name: "Americium", atomic_weight_bits: 0x406e600000000000, melting_point_c_bits: 0x4092600000000000, boiling_point_c_bits: 0x40a45e0000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x4082100000000000, group: 9, period: 7, discoverer: "Seaborg et. al., 1944", electronegativity_bits: 0x3ff4cccccccccccd, covalent_radius_pm: 175, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 96, symbol: "Cm", name: "Curium", atomic_weight_bits: 0x406ee00000000000, melting_point_c_bits: 0x4094f00000000000, boiling_point_c_bits: 0x40a84c0000000000, density_bits: 0x402b051eb851eb85, ionization_energy_kj_bits: 0x4082280000000000, group: 10, period: 7, discoverer: "Seaborg et. al., 1944", electronegativity_bits: 0x3ff4cccccccccccd, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 97, symbol: "Bk", name: "Berkelium", atomic_weight_bits: 0x406ee00000000000, melting_point_c_bits: 0x408ed00000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x402d8f5c28f5c28f, ionization_energy_kj_bits: 0x4082c80000000000, group: 11, period: 7, discoverer: "Seaborg et. al., 1949", electronegativity_bits: 0x3ff4cccccccccccd, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
@@ -201,7 +201,7 @@ pub static ELEMENTS: [ElementRecord; 118] = [
     ElementRecord { z: 100, symbol: "Fm", name: "Fermium", atomic_weight_bits: 0x4070100000000000, melting_point_c_bits: 0x4097700000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x4083980000000000, group: 14, period: 7, discoverer: "Ghiorso et. al., 1953", electronegativity_bits: 0x3ff4cccccccccccd, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 101, symbol: "Md", name: "Mendelevium", atomic_weight_bits: 0x4070200000000000, melting_point_c_bits: 0x4089000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x4083d80000000000, group: 15, period: 7, discoverer: "Ghiorso et. al., 1955", electronegativity_bits: 0x3ff4cccccccccccd, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 102, symbol: "No", name: "Nobelium", atomic_weight_bits: 0x4070300000000000, melting_point_c_bits: 0x4089000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 16, period: 7, discoverer: "Ghiorso et. al., 1957", electronegativity_bits: 0x3ff4cccccccccccd, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
-    ElementRecord { z: 103, symbol: "Lr", name: "Lawrencium", atomic_weight_bits: 0x4070600000000000, melting_point_c_bits: 0x4099000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x4084100000000000, group: 17, period: 7, discoverer: "Ghiorso et. al., 1961", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
+    ElementRecord { z: 103, symbol: "Lr", name: "Lawrencium", atomic_weight_bits: 0x4070600000000000, melting_point_c_bits: 0x4099000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x4084100000000000, group: 3, period: 7, discoverer: "Ghiorso et. al., 1961", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 104, symbol: "Rf", name: "Rutherfordium", atomic_weight_bits: 0x4070b00000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 4, period: 7, discoverer: "Nuclear Institute at Dubna, and the University of California, Berkeley", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 105, symbol: "Db", name: "Dubnium", atomic_weight_bits: 0x4070e00000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 5, period: 7, discoverer: "Nuclear Institute at Dubna, and the University of California, Berkeley", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 106, symbol: "Sg", name: "Seaborgium", atomic_weight_bits: 0x4070d00000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 6, period: 7, discoverer: "Ghiorso et. al., 1974", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
@@ -216,7 +216,7 @@ pub static ELEMENTS: [ElementRecord; 118] = [
     ElementRecord { z: 115, symbol: "Mc", name: "Moscovium", atomic_weight_bits: 0x4072100000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 15, period: 7, discoverer: "", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 116, symbol: "Lv", name: "Livermorium", atomic_weight_bits: 0x4072500000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 16, period: 7, discoverer: "", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
     ElementRecord { z: 117, symbol: "Ts", name: "Tennessine", atomic_weight_bits: 0x4072500000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 17, period: 7, discoverer: "", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
-    ElementRecord { z: 118, symbol: "Og", name: "Oganesson", atomic_weight_bits: 0x4072600000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 4, period: 7, discoverer: "", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
+    ElementRecord { z: 118, symbol: "Og", name: "Oganesson", atomic_weight_bits: 0x4072600000000000, melting_point_c_bits: 0x0000000000000000, boiling_point_c_bits: 0x0000000000000000, density_bits: 0x0000000000000000, ionization_energy_kj_bits: 0x0000000000000000, group: 18, period: 7, discoverer: "", electronegativity_bits: 0x0000000000000000, covalent_radius_pm: 0, preferred_valence: 0, allowed_valences: &[] },
 ];
 
 pub static ISOTOPES: [IsotopeRecord; 2938] = [
@@ -3162,3 +3162,30 @@ pub static ISOTOPES: [IsotopeRecord; 2938] = [
 
 pub mod nicknames_data;
 pub use nicknames_data::{ShippedNickAtom, ShippedNickBond, ShippedNickname, SHIPPED_NICKNAMES};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_periodic_table_and_nicknames_audit_regressions() {
+        let og = ELEMENTS.iter().find(|e| e.z == 118).expect("Oganesson");
+        assert_eq!(og.symbol, "Og");
+        assert_eq!(og.group, 18, "Oganesson must be Group 18");
+        let lr = ELEMENTS.iter().find(|e| e.z == 103).expect("Lawrencium");
+        assert_eq!(lr.symbol, "Lr");
+        assert_eq!(lr.group, 3, "Lawrencium must be Group 3");
+        let pu = ELEMENTS.iter().find(|e| e.z == 94).expect("Plutonium");
+        assert!(pu.discoverer.contains("1940"), "Plutonium was discovered in 1940: {}", pu.discoverer);
+
+        let all_nick = SHIPPED_NICKNAMES.iter().find(|n| n.name == "All").expect("All nickname");
+        let allyl_nick = SHIPPED_NICKNAMES.iter().find(|n| n.name == "Allyl").expect("Allyl nickname");
+        assert_eq!(all_nick.atoms.len(), allyl_nick.atoms.len());
+        assert_eq!(all_nick.bonds.len(), allyl_nick.bonds.len());
+        assert_eq!(
+            all_nick.bonds.iter().map(|b| (b.b, b.e, b.order)).collect::<Vec<_>>(),
+            allyl_nick.bonds.iter().map(|b| (b.b, b.e, b.order)).collect::<Vec<_>>(),
+            "'All' must match 'Allyl' (-CH2-CH=CH2)"
+        );
+    }
+}

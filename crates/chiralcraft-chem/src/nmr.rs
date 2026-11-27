@@ -273,14 +273,19 @@ pub fn predict_1h_nmr(mol: &ChemMolecule) -> NmrPrediction {
                 (s, "Aldehyde -CHO".to_string(), false)
             } else if arom.is_atom_aromatic(i) {
                 let mut s = 7.27;
-                // Heteroaromatic ring boost (pyridine-like N)
+                // Heteroaromatic ring boost (pyridine-like imine N only, excluding pyrrole/indole -NH-)
                 for (j, aj) in mol.atoms.iter().enumerate() {
                     if arom.is_atom_aromatic(j) && aj.z == 7 {
-                        match graph_distance(mol, i, j, 3) {
-                            Some(1) => s += 1.32,
-                            Some(2) => s += 0.02,
-                            Some(3) => s += 0.42,
-                            _ => {}
+                        let j_nbrs = mol.neighbors(j);
+                        let j_heavy_deg = j_nbrs.iter().filter(|&&(nb, _)| mol.atoms[nb].z > 1).count();
+                        let j_h = val.implicit_h(j) as usize + j_nbrs.iter().filter(|&&(nb, _)| mol.atoms[nb].z == 1).count();
+                        if j_heavy_deg == 2 && j_h == 0 {
+                            match graph_distance(mol, i, j, 3) {
+                                Some(1) => s += 1.32,
+                                Some(2) => s += 0.02,
+                                Some(3) => s += 0.42,
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -316,8 +321,9 @@ pub fn predict_1h_nmr(mol: &ChemMolecule) -> NmrPrediction {
                 }
                 (s.clamp(4.4, 8.2), "Alkene =CH".to_string(), false)
             } else {
-                // sp3 CH3 / CH2 / CH (Shoolery's additive increments!)
+                // sp3 CH4 / CH3 / CH2 / CH (Shoolery's additive increments!)
                 let mut s: f64 = match total_h {
+                    4 => 0.23,
                     3 => 0.88,
                     2 => 1.25,
                     _ => 1.55,
@@ -375,11 +381,12 @@ pub fn predict_1h_nmr(mol: &ChemMolecule) -> NmrPrediction {
                     };
                 }
                 let kind = match total_h {
+                    4 => "Methane CH4",
                     3 => "Aliphatic -CH3",
                     2 => "Aliphatic -CH2-",
                     _ => "Aliphatic >CH-",
                 };
-                (s.clamp(0.6, 7.8), kind.to_string(), false)
+                (s.clamp(0.15, 7.8), kind.to_string(), false)
             }
         } else {
             (2.0, "Heteroatom H".to_string(), true)
@@ -410,7 +417,7 @@ pub fn predict_1h_nmr(mol: &ChemMolecule) -> NmrPrediction {
                 (1, 1) => ("d".to_string(), vec![j_typ]),
                 (1, 2) => ("t".to_string(), vec![j_typ]),
                 (1, 3) => ("q".to_string(), vec![j_typ]),
-                (2, 2) if arom.is_atom_aromatic(i) => ("dd".to_string(), vec![7.8, 1.8]),
+                (2, 2) if arom.is_atom_aromatic(i) => ("t".to_string(), vec![7.8]),
                 (_, 2) => ("t".to_string(), vec![j_typ]),
                 _ => ("m".to_string(), vec![j_typ]),
             }
@@ -426,14 +433,53 @@ pub fn predict_1h_nmr(mol: &ChemMolecule) -> NmrPrediction {
         });
     }
 
+    // Detect chemically equivalent vicinal pairs (identical predicted shift & environment, e.g. benzene, ethane, ethylene) -> singlet
+    let shift_by_atom: std::collections::HashMap<usize, (f64, String)> = peaks
+        .iter()
+        .map(|p| (p.atom_idx, (p.shift_ppm, p.environment.clone())))
+        .collect();
+    for p in &mut peaks {
+        if p.multiplicity == "s" {
+            continue;
+        }
+        let my_key = shift_by_atom.get(&p.atom_idx);
+        let mut non_equiv_vic: Vec<i32> = Vec::new();
+        for &(nb, _) in &mol.neighbors(p.atom_idx) {
+            if mol.atoms[nb].z == 6 {
+                let nb_key = shift_by_atom.get(&nb);
+                if nb_key == my_key {
+                    continue;
+                }
+                let nb_h = val.implicit_h_counts.get(nb).copied().unwrap_or(0) as i32
+                    + mol.neighbors(nb).iter().filter(|&&(nn, _)| mol.atoms[nn].z == 1).count() as i32;
+                if nb_h > 0 {
+                    non_equiv_vic.push(nb_h);
+                }
+            }
+        }
+        let total_vic: i32 = non_equiv_vic.iter().sum();
+        let j_typ = if arom.is_atom_aromatic(p.atom_idx) { 7.8 } else { 7.1 };
+        let (m, js) = match (non_equiv_vic.len(), total_vic) {
+            (0, _) | (_, 0) => ("s".to_string(), Vec::new()),
+            (1, 1) => ("d".to_string(), vec![j_typ]),
+            (1, 2) => ("t".to_string(), vec![j_typ]),
+            (1, 3) => ("q".to_string(), vec![j_typ]),
+            (2, 2) if arom.is_atom_aromatic(p.atom_idx) => ("t".to_string(), vec![7.8]),
+            (_, 2) => ("t".to_string(), vec![j_typ]),
+            _ => ("m".to_string(), vec![j_typ]),
+        };
+        p.multiplicity = m;
+        p.j_hz = js;
+    }
+
     peaks.sort_by(|a, b| b.shift_ppm.partial_cmp(&a.shift_ppm).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Group equivalent peaks within 0.03 ppm for journal report formatting
-    let mut grouped: BTreeMap<i32, (f64, i32, String, Vec<f64>)> = BTreeMap::new();
+    // Group equivalent peaks within 0.03 ppm ONLY when multiplicity & environment match (never merge e.g. CH2 q + OH s)
+    let mut grouped: BTreeMap<(i32, String, String), (f64, i32, String, Vec<f64>)> = BTreeMap::new();
     for p in &peaks {
         let bucket = (p.shift_ppm * 30.0).round() as i32;
         grouped
-            .entry(bucket)
+            .entry((bucket, p.multiplicity.clone(), p.environment.clone()))
             .and_modify(|e| e.1 += p.protons)
             .or_insert_with(|| (p.shift_ppm, p.protons, p.multiplicity.clone(), p.j_hz.clone()));
     }
@@ -521,6 +567,8 @@ pub fn predict_13c_nmr(mol: &ChemMolecule) -> NmrPrediction {
         let nbrs = mol.neighbors(i);
         let max_order = nbrs.iter().map(|&(_, bi)| mol.bonds[bi].order).max().unwrap_or(1);
         let impl_h = val.implicit_h_counts.get(i).copied().unwrap_or(0) as i32;
+        let expl_h = nbrs.iter().filter(|&&(nb, _)| mol.atoms[nb].z == 1).count() as i32;
+        let total_c_h = impl_h + expl_h;
 
         let (shift, env) = if has_carbonyl_o(mol, i) {
             if is_carboxyl_carbon(mol, i) {
@@ -536,7 +584,7 @@ pub fn predict_13c_nmr(mol: &ChemMolecule) -> NmrPrediction {
                 }
             } else if is_amide_carbon(mol, i) {
                 (170.8, "Amide C=O".to_string())
-            } else if impl_h >= 1 {
+            } else if total_c_h >= 1 {
                 let s = if nbrs.iter().any(|&(nb, _)| arom.is_atom_aromatic(nb)) { 192.3 } else { 200.5 };
                 (s, "Aldehyde C=O".to_string())
             } else {
@@ -549,11 +597,16 @@ pub fn predict_13c_nmr(mol: &ChemMolecule) -> NmrPrediction {
             let mut s = 128.5;
             for (j, aj) in mol.atoms.iter().enumerate() {
                 if arom.is_atom_aromatic(j) && aj.z == 7 {
-                    match graph_distance(mol, i, j, 3) {
-                        Some(1) => s += 21.4,
-                        Some(2) => s -= 4.7,
-                        Some(3) => s += 7.4,
-                        _ => {}
+                    let j_nbrs = mol.neighbors(j);
+                    let j_heavy_deg = j_nbrs.iter().filter(|&&(nb, _)| mol.atoms[nb].z > 1).count();
+                    let j_h = val.implicit_h(j) as usize + j_nbrs.iter().filter(|&&(nb, _)| mol.atoms[nb].z == 1).count();
+                    if j_heavy_deg == 2 && j_h == 0 {
+                        match graph_distance(mol, i, j, 3) {
+                            Some(1) => s += 21.4,
+                            Some(2) => s -= 4.7,
+                            Some(3) => s += 7.4,
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -568,7 +621,7 @@ pub fn predict_13c_nmr(mol: &ChemMolecule) -> NmrPrediction {
             }
             (s.clamp(95.0, 172.0), "Aromatic C".to_string())
         } else if max_order == 3 {
-            let s = if impl_h >= 1 { 68.5 } else { 81.2 };
+            let s = if total_c_h >= 1 { 68.5 } else { 81.2 };
             (s, "Alkyne C≡".to_string())
         } else if max_order == 2 {
             let mut s: f64 = 123.3;
@@ -599,16 +652,16 @@ pub fn predict_13c_nmr(mol: &ChemMolecule) -> NmrPrediction {
                             s += 23.0;
                         } else {
                             s += 9.1;
-                        }
-                        // Beta carbons
-                        for &(bb, _) in &mol.neighbors(nb) {
-                            if bb != i {
-                                match mol.atoms[bb].z {
-                                    6 => s += 9.4,
-                                    8 => s += 10.0,
-                                    7 => s += 11.0,
-                                    17 => s += 10.5,
-                                    _ => {}
+                            // Beta atoms only for aliphatic alpha-carbons (carbonyl/aromatic already include beta deshielding)
+                            for &(bb, _) in &mol.neighbors(nb) {
+                                if bb != i {
+                                    match mol.atoms[bb].z {
+                                        6 => s += 9.4,
+                                        8 => s += 10.0,
+                                        7 => s += 11.0,
+                                        17 => s += 10.5,
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -629,7 +682,7 @@ pub fn predict_13c_nmr(mol: &ChemMolecule) -> NmrPrediction {
             if alpha_c >= 3 {
                 s -= 2.5; // steric branching correction
             }
-            (s.clamp(5.0, 105.0), "Aliphatic C".to_string())
+            (s.clamp(-3.0, 105.0), "Aliphatic C".to_string())
         };
 
         peaks.push(NmrPeak {

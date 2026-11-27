@@ -425,9 +425,11 @@ pub fn show_hrms_window(
                 ui.label("Observed m/z:");
                 ui.add(egui::TextEdit::singleline(&mut state.hrms_observed_mz).desired_width(82.0).hint_text("e.g. 181.0501"));
                 if let Ok(obs) = state.hrms_observed_mz.trim().parse::<f64>() {
-                    if let Some(err) = sim.ppm_error(obs) {
-                        let col = if err.abs() <= 5.0 { Color32::from_rgb(20, 145, 70) } else { Color32::from_rgb(205, 45, 45) };
-                        ui.label(RichText::new(format!("Δ = {err:+.2} ppm")).strong().color(col));
+                    if obs.is_finite() && obs > 0.0 {
+                        if let Some(err) = sim.ppm_error(obs) {
+                            let col = if err.abs() <= 5.0 { Color32::from_rgb(20, 145, 70) } else { Color32::from_rgb(205, 45, 45) };
+                            ui.label(RichText::new(format!("Δ = {err:+.2} ppm")).strong().color(col));
+                        }
                     }
                 }
             });
@@ -513,6 +515,14 @@ pub fn show_markush_window(
                 if ui.button("Enumerate Library").clicked() {
                     if let Some(m) = active_mol.filter(|m| !m.atoms.is_empty()) {
                         state.sar_analogs = enumerate_rgroup_library(m, &state.r1_input, &state.r2_input, bond_len);
+                        match state.sar_sort {
+                            SarSortKey::Id => state.sar_analogs.sort_by(|a, b| a.id.cmp(&b.id)),
+                            SarSortKey::Mw => state.sar_analogs.sort_by(|a, b| a.medchem.mw.partial_cmp(&b.medchem.mw).unwrap_or(std::cmp::Ordering::Equal)),
+                            SarSortKey::LogP => state.sar_analogs.sort_by(|a, b| a.medchem.log_p.partial_cmp(&b.medchem.log_p).unwrap_or(std::cmp::Ordering::Equal)),
+                            SarSortKey::CnsMpo => state.sar_analogs.sort_by(|a, b| b.medchem.cns_mpo.partial_cmp(&a.medchem.cns_mpo).unwrap_or(std::cmp::Ordering::Equal)),
+                            SarSortKey::Qed => state.sar_analogs.sort_by(|a, b| b.medchem.qed.partial_cmp(&a.medchem.qed).unwrap_or(std::cmp::Ordering::Equal)),
+                            SarSortKey::Alerts => state.sar_analogs.sort_by(|a, b| a.medchem.alerts.len().cmp(&b.medchem.alerts.len())),
+                        }
                     } else {
                         act = ProSuiteAction::StatusMsg("Draw a scaffold molecule first to enumerate R-groups".into());
                     }
@@ -703,7 +713,10 @@ pub fn show_publication_composer_window(
     let mut act = ProSuiteAction::None;
     let mut open = state.show_pub_composer;
     let presets = TocPreset::presets();
-    state.selected_toc_idx = state.selected_toc_idx.min(presets.len() - 1);
+    if presets.is_empty() {
+        return ProSuiteAction::None;
+    }
+    state.selected_toc_idx = state.selected_toc_idx.min(presets.len().saturating_sub(1));
 
     egui::Window::new("Publication TOC & Scheme Composer")
         .open(&mut open)

@@ -96,8 +96,8 @@ pub fn show_nmr_window(
                 let epts: Vec<Pos2> = exp
                     .points
                     .iter()
-                    .filter(|&&(ppm, _)| ppm >= min_ppm && ppm <= max_ppm)
-                    .map(|&(ppm, y)| Pos2::new(ppm_to_x(ppm), base_y - (y as f32) * h_scale * 0.92))
+                    .filter(|&&(ppm, y)| ppm.is_finite() && y.is_finite() && ppm >= min_ppm && ppm <= max_ppm)
+                    .map(|&(ppm, y)| Pos2::new(ppm_to_x(ppm), base_y - (y.clamp(0.0, 1.0) as f32) * h_scale * 0.92))
                     .collect();
                 for w in epts.windows(2) {
                     p.line_segment([w[0], w[1]], Stroke::new(1.1_f32, Color32::from_rgba_unmultiplied(20, 155, 85, 190)));
@@ -241,6 +241,19 @@ pub fn show_helm_monomer_window(
                                     symbol: entry.symbol.clone(),
                                 };
                             } else {
+                                if entry.symbol.len() > 1 || seq_buf.contains('-') {
+                                    if !seq_buf.is_empty() && !seq_buf.ends_with('-') {
+                                        if !seq_buf.contains('-') && seq_buf.chars().all(|c| c.is_ascii_alphabetic()) {
+                                            let expanded: String = seq_buf
+                                                .chars()
+                                                .map(|c| c.to_string())
+                                                .collect::<Vec<_>>()
+                                                .join("-");
+                                            *seq_buf = expanded;
+                                        }
+                                        seq_buf.push('-');
+                                    }
+                                }
                                 seq_buf.push_str(&entry.symbol);
                             }
                         }

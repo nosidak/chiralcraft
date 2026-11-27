@@ -730,7 +730,7 @@ impl DocumentDiff {
 /// Compares two `InteractiveDocument` instances chemically by SMILES, molecular formula, MW,
 /// stereochemistry, captions, and reaction objects rather than raw XML lines.
 pub fn compare_documents(left: &crate::InteractiveDocument, right: &crate::InteractiveDocument) -> DocumentDiff {
-    let summarize = |m: &ChemMolecule| -> (String, String, f64, usize) {
+    let summarize = |m: &ChemMolecule| -> (String, String, f64, usize, Vec<u8>, Vec<u8>) {
         let rep = compute_analysis_report(m);
         let smi = chiralcraft_formats::molecule_to_smiles(m);
         let stereo_cnt = m
@@ -738,7 +738,12 @@ pub fn compare_documents(left: &crate::InteractiveDocument, right: &crate::Inter
             .iter()
             .filter(|b| !matches!(b.display, BondDisplay::Solid))
             .count();
-        (rep.formula, smi, rep.mol_weight, stereo_cnt)
+        let st = chiralcraft_chem::perceive_stereochemistry(m);
+        let mut atom_st: Vec<u8> = st.atom_stereo.values().copied().collect();
+        atom_st.sort_unstable();
+        let mut bond_st: Vec<u8> = st.bond_stereo.values().copied().collect();
+        bond_st.sort_unstable();
+        (rep.formula, smi, rep.mol_weight, stereo_cnt, atom_st, bond_st)
     };
 
     let l_info: Vec<_> = left.scene.molecules.iter().map(summarize).collect();
@@ -747,10 +752,10 @@ pub fn compare_documents(left: &crate::InteractiveDocument, right: &crate::Inter
     let mut r_matched = vec![false; r_info.len()];
     let mut entries = Vec::new();
 
-    // Pass 1: exact chemical match (same SMILES + same stereo bond count)
-    for (li, (lf, ls, lmw, lst)) in l_info.iter().enumerate() {
-        if let Some(ri) = r_info.iter().enumerate().position(|(ri, (rf, rs, _, rst))| {
-            !r_matched[ri] && lf == rf && ls == rs && lst == rst
+    // Pass 1: exact chemical match (same formula + SMILES + stereobonds + perceived CIP R/S & E/Z multiset)
+    for (li, (lf, ls, lmw, lst, las, lbs)) in l_info.iter().enumerate() {
+        if let Some(ri) = r_info.iter().enumerate().position(|(ri, (rf, rs, _, rst, ras, rbs))| {
+            !r_matched[ri] && lf == rf && ls == rs && lst == rst && las == ras && lbs == rbs
         }) {
             l_matched[li] = true;
             r_matched[ri] = true;
@@ -776,11 +781,11 @@ pub fn compare_documents(left: &crate::InteractiveDocument, right: &crate::Inter
     for k in 0..pair_n {
         let li = rem_l[k];
         let ri = rem_r[k];
-        let (lf, ls, lmw, lst) = &l_info[li];
-        let (rf, rs, rmw, rst) = &r_info[ri];
+        let (lf, ls, lmw, lst, las, lbs) = &l_info[li];
+        let (rf, rs, rmw, rst, ras, rbs) = &r_info[ri];
         let dmw = rmw - lmw;
-        let reason = if ls == rs && lst != rst {
-            format!("stereo changed ({lst} -> {rst} stereobonds)")
+        let reason = if ls == rs && (lst != rst || las != ras || lbs != rbs) {
+            format!("stereochemistry changed ({lst} -> {rst} stereobonds)")
         } else {
             format!("{lf} ({ls}) -> {rf} ({rs}), ΔMW {dmw:+.2}")
         };
@@ -798,7 +803,7 @@ pub fn compare_documents(left: &crate::InteractiveDocument, right: &crate::Inter
         });
     }
     for &li in rem_l.iter().skip(pair_n) {
-        let (lf, ls, lmw, _) = &l_info[li];
+        let (lf, ls, lmw, _, _, _) = &l_info[li];
         entries.push(MolDiffEntry {
             status: DiffStatus::Removed,
             left_index: Some(li),
@@ -813,7 +818,7 @@ pub fn compare_documents(left: &crate::InteractiveDocument, right: &crate::Inter
         });
     }
     for &ri in rem_r.iter().skip(pair_n) {
-        let (rf, rs, rmw, _) = &r_info[ri];
+        let (rf, rs, rmw, _, _, _) = &r_info[ri];
         entries.push(MolDiffEntry {
             status: DiffStatus::Added,
             left_index: None,

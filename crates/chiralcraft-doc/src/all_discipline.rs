@@ -104,9 +104,10 @@ pub fn eyring_rate_and_halflife(dg_kcal: f64, temp_k: f64) -> (f64, f64) {
 pub fn boltzmann_selectivity(ddg_kcal: f64, temp_k: f64) -> (f64, f64) {
     const R_KCAL: f64 = 1.987_204_258e-3;
     let t = temp_k.max(10.0);
-    let ratio = (ddg_kcal.abs() / (R_KCAL * t)).exp();
-    let major_pct = (ratio / (1.0 + ratio)) * 100.0;
-    let ee_pct = ((ratio - 1.0) / (ratio + 1.0)) * 100.0;
+    // Numerically stable formulation: inv = exp(-|ΔΔG‡| / RT) ∈ [0, 1], never overflows to inf/inf = NaN!
+    let inv = (-ddg_kcal.abs() / (R_KCAL * t)).exp();
+    let major_pct = (1.0 / (1.0 + inv)) * 100.0;
+    let ee_pct = ((1.0 - inv) / (1.0 + inv)) * 100.0;
     (major_pct, ee_pct)
 }
 
@@ -696,8 +697,8 @@ pub fn build_cisplatin(blen: f64) -> ChemMolecule {
     for a in [pt, cl1, cl2, n1, n2] { m.add_atom(a); }
     m.add_bond(10, 0, 1, 1, BondDisplay::Solid);
     m.add_bond(11, 0, 2, 1, BondDisplay::Solid);
-    m.add_bond(12, 0, 3, 1, BondDisplay::Dative);
-    m.add_bond(13, 0, 4, 1, BondDisplay::Dative);
+    m.add_bond(12, 3, 0, 5, BondDisplay::Dative);
+    m.add_bond(13, 4, 0, 5, BondDisplay::Dative);
     m
 }
 
@@ -712,7 +713,7 @@ pub fn build_pd_pph3_4(blen: f64) -> ChemMolecule {
         p.y = dy * blen;
         p.label = Some("PPh3".into());
         m.add_atom(p);
-        m.add_bond((10 + k) as u32, 0, k + 1, 1, BondDisplay::Dative);
+        m.add_bond((10 + k) as u32, k + 1, 0, 5, BondDisplay::Dative);
     }
     m
 }
@@ -726,9 +727,9 @@ pub fn build_wilkinson_catalyst(blen: f64) -> ChemMolecule {
     let mut p3 = ChemAtom::new(5, 15); p3.x = 0.0; p3.y = blen * 1.1; p3.label = Some("PPh3".into());
     for a in [rh, cl, p1, p2, p3] { m.add_atom(a); }
     m.add_bond(10, 0, 1, 1, BondDisplay::Solid);
-    m.add_bond(11, 0, 2, 1, BondDisplay::Dative);
-    m.add_bond(12, 0, 3, 1, BondDisplay::Dative);
-    m.add_bond(13, 0, 4, 1, BondDisplay::Dative);
+    m.add_bond(11, 2, 0, 5, BondDisplay::Dative);
+    m.add_bond(12, 3, 0, 5, BondDisplay::Dative);
+    m.add_bond(13, 4, 0, 5, BondDisplay::Dative);
     m
 }
 
@@ -741,9 +742,9 @@ pub fn build_vaska_complex(blen: f64) -> ChemMolecule {
     let mut p2 = ChemAtom::new(5, 15); p2.x = 0.0; p2.y = blen * 1.1; p2.label = Some("PPh3".into());
     for a in [ir, cl, co, p1, p2] { m.add_atom(a); }
     m.add_bond(10, 0, 1, 1, BondDisplay::Solid);
-    m.add_bond(11, 0, 2, 1, BondDisplay::Dative);
-    m.add_bond(12, 0, 3, 1, BondDisplay::Dative);
-    m.add_bond(13, 0, 4, 1, BondDisplay::Dative);
+    m.add_bond(11, 2, 0, 5, BondDisplay::Dative);
+    m.add_bond(12, 3, 0, 5, BondDisplay::Dative);
+    m.add_bond(13, 4, 0, 5, BondDisplay::Dative);
     m
 }
 
@@ -769,8 +770,8 @@ pub fn build_grubbs_core(blen: f64) -> ChemMolecule {
     for a in [ru, cl1, cl2, p1, p2, carb] { m.add_atom(a); }
     m.add_bond(10, 0, 1, 1, BondDisplay::Solid);
     m.add_bond(11, 0, 2, 1, BondDisplay::Solid);
-    m.add_bond(12, 0, 3, 1, BondDisplay::Dative);
-    m.add_bond(13, 0, 4, 1, BondDisplay::Dative);
+    m.add_bond(12, 3, 0, 5, BondDisplay::Dative);
+    m.add_bond(13, 4, 0, 5, BondDisplay::Dative);
     m.add_bond(14, 0, 5, 2, BondDisplay::Solid);
     m
 }
@@ -783,17 +784,36 @@ pub fn build_grubbs_core(blen: f64) -> ChemMolecule {
 fn esc_field(s: &str) -> String {
     s.replace('%', "%25")
         .replace('|', "%7C")
+        .replace('\r', "%0D")
         .replace('\n', "%0A")
         .replace(';', "%3B")
         .replace(',', "%2C")
 }
 
 fn unesc_field(s: &str) -> String {
-    s.replace("%2C", ",")
-        .replace("%3B", ";")
-        .replace("%0A", "\n")
-        .replace("%7C", "|")
-        .replace("%25", "%")
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            match &s[i..i + 3] {
+                "%25" => { out.push('%'); i += 3; continue; }
+                "%7C" => { out.push('|'); i += 3; continue; }
+                "%0D" => { out.push('\r'); i += 3; continue; }
+                "%0A" => { out.push('\n'); i += 3; continue; }
+                "%3B" => { out.push(';'); i += 3; continue; }
+                "%2C" => { out.push(','); i += 3; continue; }
+                _ => {}
+            }
+        }
+        if let Some(ch) = s[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Serializes `energy_profiles`, `tables` (with cell text), and `tlc_plates` (with labels, colors, solvent)
@@ -941,12 +961,16 @@ pub fn restore_chiralcraft_extensions_from_cdxml(
                     parts[3].parse::<usize>(),
                     parse_bbox(parts[4]),
                 ) {
+                    if rows > 256 || cols > 256 || rows.saturating_mul(cols) > 16_384 {
+                        continue;
+                    }
                     let cells: Vec<Vec<String>> = if parts[5].is_empty() {
                         vec![vec![String::new(); cols]; rows]
                     } else {
                         parts[5]
                             .split(';')
-                            .map(|r| r.split(',').map(unesc_field).collect())
+                            .take(rows)
+                            .map(|r| r.split(',').take(cols).map(unesc_field).collect())
                             .collect()
                     };
                     let mut tbl = crate::SceneTable { id, rows, cols, bbox, cells };

@@ -37,8 +37,8 @@ fn json_escape(s: &str) -> String {
 
 fn format_id(id: Option<&JsonValue>) -> String {
     match id {
-        Some(JsonValue::Number(n)) => {
-            if n.fract().abs() < 1e-9 {
+        Some(JsonValue::Number(n)) if n.is_finite() => {
+            if n.fract().abs() < 1e-9 && n.abs() < 9.0e15 {
                 format!("{}", *n as i64)
             } else {
                 format!("{n}")
@@ -118,11 +118,19 @@ pub fn handle_mcp_request(line: &str) -> Option<String> {
         Ok(v) => v,
         Err(e) => return Some(rpc_err(None, -32700, &format!("Parse error: {e}"))),
     };
+    if !matches!(root, JsonValue::Object(_)) {
+        return Some(rpc_err(None, -32600, "Invalid Request: expected JSON object"));
+    }
     let id = root.get("id");
-    let method = root.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let Some(method) = root.get("method").and_then(|m| m.as_str()).filter(|m| !m.is_empty()) else {
+        return Some(rpc_err(id, -32600, "Invalid Request: missing or invalid method"));
+    };
+    // JSON-RPC 2.0: notifications have no `id` and MUST NOT receive a response.
+    if id.is_none() {
+        return None;
+    }
 
     match method {
-        "notifications/initialized" | "notifications/cancelled" => None,
         "initialize" => Some(rpc_ok(
             id,
             concat!(
@@ -134,20 +142,31 @@ pub fn handle_mcp_request(line: &str) -> Option<String> {
         "ping" => Some(rpc_ok(id, "{}")),
         "tools/list" => Some(rpc_ok(id, tools_list_json())),
         "tools/call" => {
-            let params = root.get("params");
-            let tname = params
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            let args = params.and_then(|p| p.get("arguments"));
-            let res = dispatch_tool(tname, args);
-            Some(rpc_ok(id, &res))
+            let Some(params) = root.get("params") else {
+                return Some(rpc_err(id, -32602, "Invalid params: missing params object"));
+            };
+            if !matches!(params, JsonValue::Object(_)) {
+                return Some(rpc_err(id, -32602, "Invalid params: expected object"));
+            }
+            let Some(tname) = params.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()) else {
+                return Some(rpc_err(id, -32602, "Invalid params: missing tool name"));
+            };
+            let args = params.get("arguments");
+            if let Some(a) = args {
+                if !matches!(a, JsonValue::Object(_)) {
+                    return Some(rpc_err(id, -32602, "Invalid params: arguments must be an object"));
+                }
+            }
+            match dispatch_tool(tname, args) {
+                Ok(res) => Some(rpc_ok(id, &res)),
+                Err(msg) => Some(rpc_err(id, -32602, &msg)),
+            }
         }
         other => Some(rpc_err(id, -32601, &format!("Method not found: {other}"))),
     }
 }
 
-fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
+fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> Result<String, String> {
     let get_s = |k: &str| -> Option<&str> { args?.get(k)?.as_str() };
     let get_b = |k: &str, default: bool| -> bool {
         match args.and_then(|a| a.get(k)) {
@@ -157,10 +176,10 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
     };
     let dict = NameDictionary::with_builtins();
 
-    match name {
+    Ok(match name {
         "analyze_smiles" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             match smiles_to_molecule(smi) {
                 Ok(mut mol) => {
@@ -171,10 +190,14 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
                     let mut doc = InteractiveDocument::new_saved_seed("mcp", DocumentSettings::acs_document_1996());
                     doc.scene.molecules.push(mol);
                     let warns = doc.check_structure_with_preferences();
+                    let pka_str = props
+                        .pka
+                        .map(|v| format!("{v:.2}"))
+                        .unwrap_or_else(|| "N/A".to_string());
                     let summary = format!(
-                        "Name: {iupac}\nFormula: {}\nExact Mass: {:.4}\nMol. Wt.: {:.2}\nElem. Anal.: {}\nLogP: {:.2} | tPSA: {:.2} | LogS: {:.3} | pKa: {:?}\nWarnings: {}",
+                        "Name: {iupac}\nFormula: {}\nExact Mass: {:.4}\nMol. Wt.: {:.2}\nElem. Anal.: {}\nLogP: {:.2} | tPSA: {:.2} | LogS: {:.3} | pKa: {pka_str}\nWarnings: {}",
                         rep.formula, rep.exact_mass, rep.mol_weight, rep.elem_analysis,
-                        props.log_p, props.tpsa, props.log_s, props.pka, warns.len()
+                        props.log_p, props.tpsa, props.log_s, warns.len()
                     );
                     tool_text_result(&summary, false)
                 }
@@ -183,9 +206,19 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "predict_nmr" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
-            let is_13c = get_s("nucleus").map(|n| n.eq_ignore_ascii_case("13c")).unwrap_or(false);
+            let is_13c = match get_s("nucleus") {
+                None => false,
+                Some(n) if n.eq_ignore_ascii_case("1h") => false,
+                Some(n) if n.eq_ignore_ascii_case("13c") => true,
+                Some(other) => {
+                    return Ok(tool_text_result(
+                        &format!("Invalid nucleus '{other}': expected '1H' or '13C'"),
+                        true,
+                    ));
+                }
+            };
             match smiles_to_molecule(smi) {
                 Ok(mut mol) => {
                     clean_up_structure_preserving_stereo(&mut mol, &[], 14.40);
@@ -197,7 +230,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "name_to_structure" => {
             let Some(nm) = get_s("name") else {
-                return tool_text_result("Missing required argument: name", true);
+                return Ok(tool_text_result("Missing required argument: name", true));
             };
             let st = resolve_stylesheet(get_s("stylesheet"));
             match dict.name_to_smiles(nm).and_then(|s| Ok((s.clone(), smiles_to_molecule(&s)?))) {
@@ -215,7 +248,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "render_editable_svg" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             let st = resolve_stylesheet(get_s("stylesheet"));
             let transparent = get_b("transparent", true);
@@ -223,14 +256,22 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
             match smiles_to_molecule(smi) {
                 Ok(mut mol) => {
                     clean_up_structure_preserving_stereo(&mut mol, &[], st.bond_length_pt);
+                    let (cap_x, cap_y) = if mol.atoms.is_empty() {
+                        (0.0, 42.0)
+                    } else {
+                        let min_x = mol.atoms.iter().map(|a| a.x).fold(f64::INFINITY, f64::min);
+                        let max_x = mol.atoms.iter().map(|a| a.x).fold(f64::NEG_INFINITY, f64::max);
+                        let max_y = mol.atoms.iter().map(|a| a.y).fold(f64::NEG_INFINITY, f64::max);
+                        (0.5 * (min_x + max_x), max_y + 18.0)
+                    };
                     let mut doc = InteractiveDocument::new_saved_seed("render.svg", st);
                     doc.scene.molecules.push(mol);
                     if let Some(cap_txt) = get_s("caption") {
                         doc.scene.captions.push(chiralcraft_doc::CaptionNode {
                             id: 900,
                             text: cap_txt.to_string(),
-                            x: 0.0,
-                            y: 42.0,
+                            x: cap_x,
+                            y: cap_y,
                             element: None,
                             generic_nickname: None,
                             warning: None,
@@ -239,10 +280,10 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
                     }
                     let svg = doc.to_svg_styled(transparent, dark_ink, 1.0, 3.6);
                     if let Some(out_p) = get_s("output_path") {
-                        if let Err(e) = fs::write(out_p, &svg) {
-                            return tool_text_result(&format!("Write error for {out_p}: {e}"), true);
+                        if let Err(e) = crate::io_bridge::atomic_write_text(out_p, &svg) {
+                            return Ok(tool_text_result(&format!("Write error for {out_p}: {e}"), true));
                         }
-                        return tool_text_result(&format!("Wrote editable ChiralCraft SVG ({} bytes) to {out_p}", svg.len()), false);
+                        return Ok(tool_text_result(&format!("Wrote editable ChiralCraft SVG ({} bytes) to {out_p}", svg.len()), false));
                     }
                     tool_text_result(&svg, false)
                 }
@@ -251,34 +292,51 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "search_chem_db" => {
             let Some(q) = get_s("query") else {
-                return tool_text_result("Missing required argument: query", true);
+                return Ok(tool_text_result("Missing required argument: query", true));
             };
             let src = get_s("source").unwrap_or("both").to_ascii_lowercase();
+            if !matches!(src.as_str(), "both" | "pubchem" | "chembl") {
+                return Ok(tool_text_result(
+                    &format!("Invalid source '{src}': expected 'both', 'pubchem', or 'chembl'"),
+                    true,
+                ));
+            }
             let mut lines = Vec::new();
+            let mut errs = Vec::new();
             if src == "both" || src == "pubchem" {
-                if let Ok(hits) = query_pubchem_public(q, DbSearchMode::NameOrId, 85) {
-                    for h in hits.into_iter().take(5) {
-                        lines.push(format!("[PubChem] {} | {} | {} | MW {} | SMILES: {}", h.id, h.name, h.formula, h.molecular_weight, h.smiles));
+                match query_pubchem_public(q, DbSearchMode::NameOrId, 85) {
+                    Ok(hits) => {
+                        for h in hits.into_iter().take(5) {
+                            lines.push(format!("[PubChem] {} | {} | {} | MW {} | SMILES: {}", h.id, h.name, h.formula, h.molecular_weight, h.smiles));
+                        }
                     }
+                    Err(e) => errs.push(format!("PubChem: {e}")),
                 }
             }
             if src == "both" || src == "chembl" {
-                if let Ok(hits) = query_chembl_public(q, DbSearchMode::NameOrId, 85) {
-                    for h in hits.into_iter().take(5) {
-                        let ph = h.max_phase.as_deref().unwrap_or("—");
-                        lines.push(format!("[ChEMBL] {} | {} | {} | MW {} | Phase: {} | SMILES: {}", h.id, h.name, h.formula, h.molecular_weight, ph, h.smiles));
+                match query_chembl_public(q, DbSearchMode::NameOrId, 85) {
+                    Ok(hits) => {
+                        for h in hits.into_iter().take(5) {
+                            let ph = h.max_phase.as_deref().unwrap_or("—");
+                            lines.push(format!("[ChEMBL] {} | {} | {} | MW {} | Phase: {} | SMILES: {}", h.id, h.name, h.formula, h.molecular_weight, ph, h.smiles));
+                        }
                     }
+                    Err(e) => errs.push(format!("ChEMBL: {e}")),
                 }
             }
             if lines.is_empty() {
-                tool_text_result("No matching compounds found.", false)
+                if !errs.is_empty() {
+                    tool_text_result(&format!("Database search failed: {}", errs.join("; ")), true)
+                } else {
+                    tool_text_result("No matching compounds found.", false)
+                }
             } else {
                 tool_text_result(&lines.join("\n"), false)
             }
         }
         "inspect_file" => {
             let Some(path) = get_s("path") else {
-                return tool_text_result("Missing required argument: path", true);
+                return Ok(tool_text_result("Missing required argument: path", true));
             };
             match load_document_any(path) {
                 Ok(doc) => {
@@ -302,7 +360,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "convert_file" => {
             let (Some(inp), Some(outp)) = (get_s("input_path"), get_s("output_path")) else {
-                return tool_text_result("Missing input_path or output_path", true);
+                return Ok(tool_text_result("Missing input_path or output_path", true));
             };
             match load_document_any(inp).and_then(|d| save_document_any(&d, outp)) {
                 Ok(()) => tool_text_result(&format!("Converted {inp} -> {outp}"), false),
@@ -311,7 +369,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "diff_files" => {
             let (Some(lp), Some(rp)) = (get_s("left_path"), get_s("right_path")) else {
-                return tool_text_result("Missing left_path or right_path", true);
+                return Ok(tool_text_result("Missing left_path or right_path", true));
             };
             match (load_document_any(lp), load_document_any(rp)) {
                 (Ok(ld), Ok(rd)) => {
@@ -324,7 +382,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "medchem_scorecard" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             match smiles_to_molecule(smi) {
                 Ok(mol) => {
@@ -349,7 +407,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "simulate_hrms" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             let adduct = get_s("adduct").unwrap_or("[M+H]+");
             match smiles_to_molecule(smi) {
@@ -371,7 +429,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "retrosynthesis_suggest" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             match smiles_to_molecule(smi) {
                 Ok(mut mol) => {
@@ -393,18 +451,19 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "predict_spectroscopy" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             match smiles_to_molecule(smi) {
                 Ok(mol) => {
                     let ir = chiralcraft_chem::predict_ir_spectrum(&mol);
                     let uv = chiralcraft_chem::predict_uv_vis(&mol);
+                    let cosy = chiralcraft_chem::predict_2d_nmr(&mol, chiralcraft_chem::Nmr2dKind::Cosy);
                     let hsqc = chiralcraft_chem::predict_2d_nmr(&mol, chiralcraft_chem::Nmr2dKind::Hsqc);
                     let hmbc = chiralcraft_chem::predict_2d_nmr(&mol, chiralcraft_chem::Nmr2dKind::Hmbc);
                     let txt = format!(
-                        "{}\nUV-Vis: λmax ≈ {:.0} nm (ε ≈ {:.0}), {} — {}\n2D NMR: {} HSQC cross-peaks, {} HMBC cross-peaks",
+                        "{}\nUV-Vis: λmax ≈ {:.0} nm (ε ≈ {:.0}), {} — {}\n2D NMR: {} COSY cross-peaks, {} HSQC cross-peaks, {} HMBC cross-peaks",
                         ir.report_text, uv.lambda_max_nm, uv.epsilon_est, uv.transition, uv.perceived_color_name,
-                        hsqc.peaks.len(), hmbc.peaks.len()
+                        cosy.peaks.len(), hsqc.peaks.len(), hmbc.peaks.len()
                     );
                     tool_text_result(&txt, false)
                 }
@@ -413,7 +472,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "analyze_organometallic" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             match smiles_to_molecule(smi) {
                 Ok(mol) => {
@@ -433,7 +492,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "export_latex" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             match smiles_to_molecule(smi) {
                 Ok(mut mol) => {
@@ -449,14 +508,20 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "generate_si_procedure" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             let cname = get_s("name").unwrap_or("Target Compound");
             let solv = get_s("solvent").unwrap_or("THF");
-            let yld = args
-                .and_then(|a| a.get("yield_pct"))
-                .and_then(|v| match v { JsonValue::Number(n) => Some(*n), _ => None })
-                .unwrap_or(90.0);
+            let yld = match args.and_then(|a| a.get("yield_pct")) {
+                None => 90.0,
+                Some(JsonValue::Number(n)) if n.is_finite() && *n > 0.0 && *n <= 100.0 => *n,
+                _ => {
+                    return Ok(tool_text_result(
+                        "Invalid yield_pct: expected a finite number in (0, 100]",
+                        true,
+                    ));
+                }
+            };
             match smiles_to_molecule(smi) {
                 Ok(mol) => {
                     let si = chiralcraft_doc::generate_si_experimental_block(&mol, cname, &[], solv, 5.0, "80 °C", "12 h", yld);
@@ -467,13 +532,19 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "export_quantum_input" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
             let mut spec = chiralcraft_formats::QuantumJobSpec::default();
             spec.program = match get_s("program").unwrap_or("orca").to_ascii_lowercase().as_str() {
                 "gaussian" | "gjf" => chiralcraft_formats::QuantumProgram::Gaussian,
                 "xtb" => chiralcraft_formats::QuantumProgram::Xtb,
-                _ => chiralcraft_formats::QuantumProgram::Orca,
+                "orca" => chiralcraft_formats::QuantumProgram::Orca,
+                other => {
+                    return Ok(tool_text_result(
+                        &format!("Invalid program '{other}': expected 'orca', 'gaussian', or 'xtb'"),
+                        true,
+                    ));
+                }
             };
             if let Some(m) = get_s("method") { spec.method = m.to_string(); }
             if let Some(b) = get_s("basis") { spec.basis = b.to_string(); }
@@ -490,7 +561,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "parse_quantum_output" => {
             let Some(path) = get_s("path") else {
-                return tool_text_result("Missing required argument: path", true);
+                return Ok(tool_text_result("Missing required argument: path", true));
             };
             match fs::read_to_string(path)
                 .map_err(|e| e.to_string())
@@ -532,7 +603,7 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "parse_jcamp_ir" => {
             let Some(path) = get_s("path") else {
-                return tool_text_result("Missing required argument: path", true);
+                return Ok(tool_text_result("Missing required argument: path", true));
             };
             match fs::read_to_string(path)
                 .map_err(|e| e.to_string())
@@ -568,15 +639,22 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
         }
         "run_xtb_ir" => {
             let Some(smi) = get_s("smiles") else {
-                return tool_text_result("Missing required argument: smiles", true);
+                return Ok(tool_text_result("Missing required argument: smiles", true));
             };
-            let bins = crate::quantum_runner::detect_qc_binaries("", "", "");
+            let cfg = crate::config_dock::UserConfig::load();
+            let bins = crate::quantum_runner::detect_qc_binaries(&cfg.xtb_path, &cfg.orca_path, &cfg.gaussian_path);
             let Some(xtb_bin) = bins.xtb_path else {
-                return tool_text_result("xtb binary not found on PATH. Install via `conda install -c conda-forge xtb` or export an input deck with `export_quantum_input`.", true);
+                return Ok(tool_text_result("xtb binary not found on PATH. Install via `conda install -c conda-forge xtb` or export an input deck with `export_quantum_input`.", true));
             };
             let backend = match get_s("method").unwrap_or("gfn2").to_ascii_lowercase().as_str() {
                 "gfnff" | "gfn-ff" => crate::quantum_runner::QcRunBackend::XtbGfnFf,
-                _ => crate::quantum_runner::QcRunBackend::XtbGfn2,
+                "gfn2" | "gfn2-xtb" => crate::quantum_runner::QcRunBackend::XtbGfn2,
+                other => {
+                    return Ok(tool_text_result(
+                        &format!("Invalid xTB method '{other}': expected 'gfn2' or 'gfnff'"),
+                        true,
+                    ));
+                }
             };
             let mut spec = chiralcraft_formats::QuantumJobSpec::default();
             if let Some(s) = get_s("solvent") {
@@ -622,8 +700,8 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> String {
                 Err(e) => tool_text_result(&format!("Invalid SMILES: {e}"), true),
             }
         }
-        other => tool_text_result(&format!("Unknown tool: {other}"), true),
-    }
+        other => return Err(format!("Unknown tool: {other}")),
+    })
 }
 
 /// Runs the line-delimited JSON-RPC 2.0 MCP server on stdin/stdout (`chiralcraft --mcp`).

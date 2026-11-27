@@ -223,15 +223,29 @@ pub fn expand_generic_structure_from_cdxml(cdxml: &CdxmlDocument) -> Vec<ChemMol
             continue;
         };
         if let Some(el_list) = el.attr("ElementList") {
-            let zs: Vec<i32> = el_list
+            let tokens: Vec<&str> = el_list
                 .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-                .filter(|t| !t.is_empty() && *t != "NOT")
+                .filter(|t| !t.is_empty())
+                .collect();
+            let is_not = tokens.first().map(|t| t.eq_ignore_ascii_case("NOT")).unwrap_or(false);
+            let parsed: Vec<i32> = tokens
+                .into_iter()
+                .skip(usize::from(is_not))
                 .filter_map(|tok| {
                     tok.parse::<i32>()
                         .ok()
                         .or_else(|| get_element_by_symbol(tok).map(|r| r.z))
                 })
                 .collect();
+            let zs: Vec<i32> = if is_not {
+                // Standard organic/medicinal complement set excluding negated elements
+                [6, 7, 8, 9, 15, 16, 17, 35, 53]
+                    .into_iter()
+                    .filter(|z| !parsed.contains(z))
+                    .collect()
+            } else {
+                parsed
+            };
             if !zs.is_empty() {
                 site_lists.push((atom_idx, zs));
             }
@@ -240,15 +254,19 @@ pub fn expand_generic_structure_from_cdxml(cdxml: &CdxmlDocument) -> Vec<ChemMol
     expand_generic_structure(&base_mol, &site_lists)
 }
 
-/// Combinatorial `Structure > Expand Generic Structure` (`P22`, `P25`, `P27`).
+/// Combinatorial `Structure > Expand Generic Structure` (`P22`, `P25`, `P27`), bounded to 512 products for safety.
 pub fn expand_generic_structure(
     base: &ChemMolecule,
     site_element_lists: &[(usize, Vec<i32>)],
 ) -> Vec<ChemMolecule> {
+    const MAX_EXPANDED: usize = 512;
     let mut results = vec![base.clone()];
     for (atom_idx, z_list) in site_element_lists {
+        if z_list.is_empty() {
+            continue;
+        }
         let mut next = Vec::new();
-        for mol in &results {
+        'outer: for mol in &results {
             for &z in z_list {
                 let mut m = mol.clone();
                 if let Some(a) = m.atoms.get_mut(*atom_idx) {
@@ -256,6 +274,9 @@ pub fn expand_generic_structure(
                     a.is_query = false;
                 }
                 next.push(m);
+                if next.len() >= MAX_EXPANDED {
+                    break 'outer;
+                }
             }
         }
         results = next;
@@ -1111,21 +1132,27 @@ pub fn serialize_scene_ext_cdxml(
     tlc_plates: &[SceneTlcPlate],
     out: &mut String,
 ) {
+    let esc = |s: &str| -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
     for a in arrows {
         let tail_attr = a
             .arrowhead_tail
             .as_deref()
-            .map(|t| format!(" ArrowheadTail=\"{t}\""))
+            .map(|t| format!(" ArrowheadTail=\"{}\"", esc(t)))
             .unwrap_or_default();
         let nogo_attr = a
             .no_go
             .as_deref()
-            .map(|n| format!(" NoGo=\"{n}\""))
+            .map(|n| format!(" NoGo=\"{}\"", esc(n)))
             .unwrap_or_default();
         let dip_attr = if a.dipole { " Dipole=\"yes\"" } else { "" };
         out.push_str(&format!(
             "<arrow id=\"{}\" Tail3D=\"{:.2} {:.2} 0\" Head3D=\"{:.2} {:.2} 0\" ArrowheadType=\"Solid\" ArrowheadHead=\"{}\"{}{}{}/>",
-            a.id, a.tail.0, a.tail.1, a.head.0, a.head.1, a.arrowhead_head, tail_attr, nogo_attr, dip_attr
+            a.id, a.tail.0, a.tail.1, a.head.0, a.head.1, esc(&a.arrowhead_head), tail_attr, nogo_attr, dip_attr
         ));
     }
     for c in curves {
@@ -1140,15 +1167,15 @@ pub fn serialize_scene_ext_cdxml(
     }
     for g in graphics {
         let sub = match (g.graphic_type.as_str(), g.sub_type.as_deref()) {
-            ("Orbital", Some(s)) => format!(" OrbitalType=\"{s}\""),
-            ("Rectangle", Some(s)) => format!(" RectangleType=\"{s}\""),
-            ("Symbol", Some(s)) => format!(" SymbolType=\"{s}\""),
-            ("Bracket", Some(s)) => format!(" BracketType=\"{s}\""),
+            ("Orbital", Some(s)) => format!(" OrbitalType=\"{}\"", esc(s)),
+            ("Rectangle", Some(s)) => format!(" RectangleType=\"{}\"", esc(s)),
+            ("Symbol", Some(s)) => format!(" SymbolType=\"{}\"", esc(s)),
+            ("Bracket", Some(s)) => format!(" BracketType=\"{}\"", esc(s)),
             _ => String::new(),
         };
         out.push_str(&format!(
             "<graphic id=\"{}\" GraphicType=\"{}\"{} BoundingBox=\"{:.2} {:.2} {:.2} {:.2}\"/>",
-            g.id, g.graphic_type, sub, g.bbox.0, g.bbox.1, g.bbox.2, g.bbox.3
+            g.id, esc(&g.graphic_type), sub, g.bbox.0, g.bbox.1, g.bbox.2, g.bbox.3
         ));
     }
     for tlc in tlc_plates {
@@ -1455,9 +1482,9 @@ pub fn build_haworth_pyranose(blen: f64) -> ChemMolecule {
         m.add_atom(a);
     }
     let bonds = [
-        (0, 1, 1, BondDisplay::WedgeEnd),
+        (0, 1, 1, BondDisplay::WedgeBegin),
         (1, 2, 1, BondDisplay::Bold),
-        (2, 3, 1, BondDisplay::WedgeBegin),
+        (2, 3, 1, BondDisplay::WedgeEnd),
         (3, 4, 1, BondDisplay::Solid),
         (4, 5, 1, BondDisplay::Solid),
         (5, 0, 1, BondDisplay::Solid),
@@ -1498,9 +1525,9 @@ pub fn build_haworth_furanose(blen: f64) -> ChemMolecule {
     }
     let bonds = [
         (0, 1, 1, BondDisplay::Solid),
-        (1, 2, 1, BondDisplay::WedgeEnd),
+        (1, 2, 1, BondDisplay::WedgeBegin),
         (2, 3, 1, BondDisplay::Bold),
-        (3, 4, 1, BondDisplay::WedgeBegin),
+        (3, 4, 1, BondDisplay::WedgeEnd),
         (4, 0, 1, BondDisplay::Solid),
         (1, 5, 1, BondDisplay::Solid),
         (2, 6, 1, BondDisplay::Solid),
@@ -1547,21 +1574,20 @@ pub fn build_porphine_core(blen: f64) -> ChemMolecule {
         }
         quad_a[q] = base + 1;
         quad_b[q] = base + 4;
-        // Pyrrole bonds (alternating conjugation)
-        let is_nh = q % 2 == 0;
-        let ring_b = [
-            (0, 1, 1),
-            (1, 2, if is_nh { 2 } else { 1 }),
-            (2, 3, if is_nh { 1 } else { 2 }),
-            (3, 4, if is_nh { 2 } else { 1 }),
-            (4, 0, if is_nh { 1 } else { 2 }),
-        ];
+        // Valid 11-double-bond 18π Kekulé assignment for free-base porphine (C20H14N4, 0 valence warnings):
+        // q=0 (NH): 1=2, 3=4 | q=1 (N): 2=3, 4=0 | q=2 (NH): 2=3 | q=3 (N): 0=1, 2=3
+        let ring_b = match q {
+            0 => [(0, 1, 1), (1, 2, 2), (2, 3, 1), (3, 4, 2), (4, 0, 1)],
+            1 => [(0, 1, 1), (1, 2, 1), (2, 3, 2), (3, 4, 1), (4, 0, 2)],
+            2 => [(0, 1, 1), (1, 2, 1), (2, 3, 2), (3, 4, 1), (4, 0, 1)],
+            _ => [(0, 1, 2), (1, 2, 1), (2, 3, 2), (3, 4, 1), (4, 0, 1)],
+        };
         for &(u, v, ord) in &ring_b {
             m.add_bond(next_bid, base + u, base + v, ord, BondDisplay::Solid);
             next_bid += 1;
         }
     }
-    // Meso methine bridges connecting quadrant q's bottom alpha to (q+1)'s top alpha
+    // Meso methine bridges: meso0=a1, meso1=a2, b2=meso2, b3=meso3
     for q in 0..4 {
         let ang = (q as f64) * std::f64::consts::FRAC_PI_2 + std::f64::consts::FRAC_PI_4;
         let mut meso = ChemAtom::new(next_aid, 6);
@@ -1569,9 +1595,10 @@ pub fn build_porphine_core(blen: f64) -> ChemMolecule {
         meso.x = 2.02 * s * ang.cos();
         meso.y = 2.02 * s * ang.sin();
         let mi = m.add_atom(meso);
-        m.add_bond(next_bid, quad_b[q], mi, if q % 2 == 0 { 2 } else { 1 }, BondDisplay::Solid);
+        let (ord_in, ord_out) = if q < 2 { (1, 2) } else { (2, 1) };
+        m.add_bond(next_bid, quad_b[q], mi, ord_in, BondDisplay::Solid);
         next_bid += 1;
-        m.add_bond(next_bid, mi, quad_a[(q + 1) % 4], if q % 2 == 0 { 1 } else { 2 }, BondDisplay::Solid);
+        m.add_bond(next_bid, mi, quad_a[(q + 1) % 4], ord_out, BondDisplay::Solid);
         next_bid += 1;
     }
     m

@@ -28,7 +28,12 @@ pub fn default_export_dir() -> PathBuf {
 
 /// Builds a cross-platform fallback file path for `suggested_name` inside `default_export_dir()`.
 pub fn fallback_export_path(suggested_name: &str) -> PathBuf {
-    default_export_dir().join(suggested_name)
+    let safe_name = std::path::Path::new(suggested_name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("chiralcraft-export");
+    default_export_dir().join(safe_name)
 }
 
 /// Opens a native OS "Open File" dialog and returns the selected path, or `None` if cancelled / headless.
@@ -39,24 +44,26 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
-        let filter_pats: Vec<String> = extensions.iter().map(|e| format!("*.{e}")).collect();
+        let filter_pats: Vec<String> = extensions
+            .iter()
+            .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .map(|e| format!("*.{e}"))
+            .collect();
         let filter = if filter_pats.is_empty() {
             "All files (*.*)|*.*".to_string()
         } else {
             let joined = filter_pats.join(";");
             format!("Supported ({joined})|{joined}|All files (*.*)|*.*")
         };
-        let ps = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             $d = New-Object System.Windows.Forms.OpenFileDialog; \
-             $d.Title = '{}'; \
-             $d.Filter = '{}'; \
-             if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
-            title.replace('\'', "''"),
-            filter.replace('\'', "''")
-        );
+        const PS_OPEN: &str = "Add-Type -AssemblyName System.Windows.Forms; \
+            $d = New-Object System.Windows.Forms.OpenFileDialog; \
+            $d.Title = $env:CC_DLG_TITLE; \
+            $d.Filter = $env:CC_DLG_FILTER; \
+            if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }";
         if let Ok(out) = Command::new("powershell")
-            .args(["-NoProfile", "-STA", "-Command", &ps])
+            .args(["-NoProfile", "-STA", "-Command", PS_OPEN])
+            .env("CC_DLG_TITLE", title)
+            .env("CC_DLG_FILTER", &filter)
             .stdin(Stdio::null())
             .output()
         {
@@ -72,12 +79,9 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
 
     #[cfg(target_os = "macos")]
     {
-        let script = format!(
-            "POSIX path of (choose file with prompt \"{}\")",
-            title.replace('"', "\\\"")
-        );
+        const OSA_OPEN: &str = "on run argv\nPOSIX path of (choose file with prompt (item 1 of argv))\nend run";
         if let Ok(out) = Command::new("osascript")
-            .args(["-e", &script])
+            .args(["-e", OSA_OPEN, "--", title])
             .stdin(Stdio::null())
             .output()
         {
@@ -98,9 +102,15 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
         let mut zcmd = Command::new("zenity");
         zcmd.args(["--file-selection", "--title", title]);
         if !extensions.is_empty() {
-            let pats: Vec<String> = extensions.iter().map(|e| format!("*.{e}")).collect();
-            zcmd.arg(format!("--file-filter=Supported | {}", pats.join(" ")));
-            zcmd.arg("--file-filter=All files | *");
+            let pats: Vec<String> = extensions
+                .iter()
+                .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()))
+                .map(|e| format!("*.{e}"))
+                .collect();
+            if !pats.is_empty() {
+                zcmd.arg(format!("--file-filter=Supported | {}", pats.join(" ")));
+                zcmd.arg("--file-filter=All files | *");
+            }
         }
         if let Ok(out) = zcmd.stdin(Stdio::null()).output() {
             if out.status.success() {
@@ -109,7 +119,9 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
                     return Some(s);
                 }
             }
-            return None; // User cancelled zenity
+            if out.status.code() == Some(1) {
+                return None; // User cancelled zenity
+            }
         }
 
         // 2. Fallback to kdialog (KDE / Plasma)
@@ -118,6 +130,7 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
         } else {
             extensions
                 .iter()
+                .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()))
                 .map(|e| format!("*.{e}"))
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -144,22 +157,25 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
     if cfg!(test) {
         return None;
     }
-    let default_path = fallback_export_path(suggested_name);
+    let safe_name = std::path::Path::new(suggested_name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("chiralcraft-export");
+    let default_path = fallback_export_path(safe_name);
     let default_str = default_path.to_string_lossy().to_string();
 
     #[cfg(target_os = "windows")]
     {
-        let ps = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             $d = New-Object System.Windows.Forms.SaveFileDialog; \
-             $d.Title = '{}'; \
-             $d.FileName = '{}'; \
-             if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
-            title.replace('\'', "''"),
-            suggested_name.replace('\'', "''")
-        );
+        const PS_SAVE: &str = "Add-Type -AssemblyName System.Windows.Forms; \
+            $d = New-Object System.Windows.Forms.SaveFileDialog; \
+            $d.Title = $env:CC_DLG_TITLE; \
+            $d.FileName = $env:CC_DLG_FILENAME; \
+            if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }";
         if let Ok(out) = Command::new("powershell")
-            .args(["-NoProfile", "-STA", "-Command", &ps])
+            .args(["-NoProfile", "-STA", "-Command", PS_SAVE])
+            .env("CC_DLG_TITLE", title)
+            .env("CC_DLG_FILENAME", safe_name)
             .stdin(Stdio::null())
             .output()
         {
@@ -176,13 +192,9 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
 
     #[cfg(target_os = "macos")]
     {
-        let script = format!(
-            "POSIX path of (choose file name with prompt \"{}\" default name \"{}\")",
-            title.replace('"', "\\\""),
-            suggested_name.replace('"', "\\\"")
-        );
+        const OSA_SAVE: &str = "on run argv\nPOSIX path of (choose file name with prompt (item 1 of argv) default name (item 2 of argv))\nend run";
         if let Ok(out) = Command::new("osascript")
-            .args(["-e", &script])
+            .args(["-e", OSA_SAVE, "--", title, safe_name])
             .stdin(Stdio::null())
             .output()
         {
@@ -218,7 +230,9 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
                     return Some(s);
                 }
             }
-            return None;
+            if out.status.code() == Some(1) {
+                return None; // User cancelled zenity
+            }
         }
         if let Ok(out) = Command::new("kdialog")
             .args(["--title", title, "--getsavefilename", &default_str])

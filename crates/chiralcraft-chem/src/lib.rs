@@ -493,19 +493,7 @@ impl CsFormulaProperties {
     /// Populates `CsFormulaProperties` directly from a `ChemMolecule`, adding explicit atoms,
     /// isotopes, formal charges, and inferred implicit hydrogens (`CcVal::compute`).
     pub fn from_molecule(mol: &ChemMolecule) -> Self {
-        let mut props = Self::new();
-        let val = CcVal::compute(mol);
-        for (i, atom) in mol.atoms.iter().enumerate() {
-            props.increment_atom(atom.z, atom.isotope, 1.0);
-            if atom.charge != 0 {
-                props.increment_charge(atom.charge as f64);
-            }
-            let imp_h = val.implicit_h_counts[i] as f64;
-            if imp_h > 0.0 {
-                props.increment_atom(1, 0, imp_h);
-            }
-        }
-        props
+        mol.compute_formula_properties()
     }
 
     /// Standard average molecular weight (IUPAC atomic weights, or explicit isotope mass where specified).
@@ -691,7 +679,7 @@ impl ChemAtom {
     /// Clamps charge (`+0x30`) as in `AnalyzeAtomsExpectedValence` (`> 0xffd -> 0`).
     #[inline]
     pub fn clamped_charge(&self) -> i32 {
-        if self.charge.abs() > 0xffd {
+        if self.charge.unsigned_abs() > 0xffd {
             0
         } else {
             self.charge
@@ -745,8 +733,15 @@ impl ChemMolecule {
     }
 
     pub fn neighbors(&self, atom_idx: usize) -> Vec<(usize, usize)> {
+        let n = self.atoms.len();
         let mut out = Vec::new();
+        if atom_idx >= n {
+            return out;
+        }
         for (bi, b) in self.bonds.iter().enumerate() {
+            if b.begin_atom >= n || b.end_atom >= n || b.begin_atom == b.end_atom {
+                continue;
+            }
             if b.begin_atom == atom_idx {
                 out.push((b.end_atom, bi));
             } else if b.end_atom == atom_idx {
@@ -984,9 +979,10 @@ impl CcVal {
 
             let atom = &mol.atoms[i];
             let iso_z = atom.z - atom.clamped_charge();
-            let ovr_raw = atom.valence_override.map(|v| v + 1).unwrap_or(0);
+            let ovr_raw = atom.valence_override.map(|v| v.saturating_add(1)).unwrap_or(0);
 
             if has_non_chalcogen_arom {
+                let is_explicit_nh = atom.explicit_num_hydrogens.map(|nh| nh >= 1).unwrap_or(false);
                 if ovr_raw == sum + 1 {
                     if sum == 5
                         && nbrs
@@ -995,6 +991,8 @@ impl CcVal {
                     {
                         sum = 4;
                     }
+                } else if is_explicit_nh && is_pnictogen_or_b(iso_z) && sum == 2 {
+                    // Explicit pyrrole-like [nH]: two aromatic single bonds + 1 H (no extra Kekulé double bond)
                 } else if (sum == 2 || sum == 4 || sum >= 6) && is_chalcogen_like(iso_z) {
                     if sum == 2 {
                         if iso_z != 8 && (ovr_raw == 5 || ovr_raw == 7) {
@@ -1002,10 +1000,6 @@ impl CcVal {
                         }
                     } else if sum == 4 {
                         if iso_z != 8 && ovr_raw == 7 {
-                            sum += 1;
-                        }
-                    } else if is_pnictogen_or_b(iso_z) {
-                        if nbrs.iter().any(|&(nbr, _)| is_bridging_h_or_halogen(mol, nbr)) {
                             sum += 1;
                         }
                     } else {
@@ -1164,8 +1158,10 @@ impl CcVal {
                 }
             }
             let z = atom.z;
-            let imp_h = if (1..=118).contains(&z) || z == 222 || z == 225 || z == 226 {
-                (expected_valence[i] - sbo[i]).max(0) as u8
+            let imp_h = if let Some(nh) = atom.explicit_num_hydrogens {
+                nh.saturating_sub(i32::from(exp_h)).clamp(0, 255) as u8
+            } else if (1..=118).contains(&z) || z == 222 || z == 225 || z == 226 {
+                expected_valence[i].saturating_sub(sbo[i]).clamp(0, 255) as u8
             } else {
                 0
             };
@@ -1443,15 +1439,35 @@ fn find_simple_cycles_subset(
     let mut results = Vec::new();
     let mut seen_bond_sets = BTreeSet::new();
     let n = mol.atoms.len();
+    let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for &bi in allowed_bonds {
+        if let Some(b) = mol.bonds.get(bi) {
+            if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
+                adj[b.begin_atom].push((b.end_atom, bi));
+                adj[b.end_atom].push((b.begin_atom, bi));
+            }
+        }
+    }
+
+    const MAX_CYCLES: usize = 256;
+    const MAX_STEPS: usize = 20_000;
+    let mut steps = 0usize;
 
     for start in 0..n {
+        if adj[start].len() < 2 || results.len() >= MAX_CYCLES || steps >= MAX_STEPS {
+            continue;
+        }
         let mut stack: Vec<(usize, Vec<usize>, Vec<usize>)> = vec![(start, vec![start], Vec::new())];
         while let Some((curr, path_atoms, path_bonds)) = stack.pop() {
+            steps += 1;
+            if steps >= MAX_STEPS || results.len() >= MAX_CYCLES {
+                break;
+            }
             if path_atoms.len() > max_len {
                 continue;
             }
-            for (nbr, bi) in mol.neighbors(curr) {
-                if !allowed_bonds.contains(&bi) || path_bonds.last() == Some(&bi) {
+            for &(nbr, bi) in &adj[curr] {
+                if path_bonds.last() == Some(&bi) {
                     continue;
                 }
                 if nbr == start && path_atoms.len() >= 3 {
@@ -1462,7 +1478,7 @@ fn find_simple_cycles_subset(
                     if seen_bond_sets.insert(sorted_bonds) {
                         results.push((path_atoms.clone(), c_bonds));
                     }
-                } else if nbr > start && !path_atoms.contains(&nbr) {
+                } else if nbr > start && path_atoms.len() < max_len && !path_atoms.contains(&nbr) {
                     let mut next_atoms = path_atoms.clone();
                     next_atoms.push(nbr);
                     let mut next_bonds = path_bonds.clone();
@@ -1494,8 +1510,10 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
     let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for &bi in &arom_edges {
         let b = &mol.bonds[bi];
-        adj[b.begin_atom].push((b.end_atom, bi));
-        adj[b.end_atom].push((b.begin_atom, bi));
+        if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
+            adj[b.begin_atom].push((b.end_atom, bi));
+            adj[b.end_atom].push((b.begin_atom, bi));
+        }
     }
 
     for i in 0..n {
@@ -1503,10 +1521,11 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
             continue;
         }
         let z = mol.atoms[i].z;
+        let chg = mol.atoms[i].clamped_charge();
         let has_exocyclic_double = mol
             .neighbors(i)
             .into_iter()
-            .any(|(_, bi)| mol.bonds[bi].order >= 2 && mol.bonds[bi].order != 6);
+            .any(|(_, bi)| matches!(mol.bonds[bi].order, 2 | 3 | 4));
         if has_exocyclic_double {
             continue;
         }
@@ -1514,13 +1533,33 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
             .neighbors(i)
             .into_iter()
             .filter(|&(_, bi)| mol.bonds[bi].order != 6)
-            .map(|(_, bi)| mol.bonds[bi].order)
+            .map(|(_, bi)| match mol.bonds[bi].order {
+                1..=4 => mol.bonds[bi].order,
+                _ => 1,
+            })
             .sum();
         let total_non_arom_deg = ext_sbo + i32::from(val.implicit_h_counts[i]);
-        // Atoms donating a lone pair (O, S, N-H pyrrole-like with 2 aromatic neighbors + total non-arom 1) need 0 double bonds
         let atom_needs_dbl = match z {
-            6 | 14 | 32 => total_non_arom_deg <= 1 && adj[i].len() >= 2,
-            7 | 15 | 33 => adj[i].len() == 2 && total_non_arom_deg == 0 && mol.atoms[i].charge == 0,
+            6 | 14 | 32 => {
+                // Carbanion [c-] / carbocation [c+] in Cp-/tropylium donates 2/0 e- without a ring double bond if total deg == 1 and chg != 0
+                if chg != 0 {
+                    false
+                } else {
+                    total_non_arom_deg <= 1 && adj[i].len() >= 2
+                }
+            }
+            7 | 15 | 33 => {
+                if chg == 1 {
+                    // Pyridinium [n+] / quinolizinium [n+] needs 1 double bond when total non-arom deg <= 1 (or bridgehead deg 3 with 0 ext)
+                    (adj[i].len() == 2 && total_non_arom_deg <= 1)
+                        || (adj[i].len() == 3 && total_non_arom_deg == 0)
+                } else if chg == 0 {
+                    adj[i].len() == 2 && total_non_arom_deg == 0
+                } else {
+                    false
+                }
+            }
+            8 | 16 | 34 => chg == 1 && adj[i].len() == 2 && total_non_arom_deg == 0,
             _ => false,
         };
         needs_double[i] = atom_needs_dbl;
@@ -1529,6 +1568,7 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
     let nodes: Vec<usize> = (0..n).filter(|&i| needs_double[i]).collect();
     let mut matched_double = vec![false; mol.bonds.len()];
     let mut covered = vec![false; n];
+    let mut steps = 0usize;
 
     fn backtrack(
         pos: usize,
@@ -1537,7 +1577,12 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
         needs_double: &[bool],
         covered: &mut [bool],
         matched_double: &mut [bool],
+        steps: &mut usize,
     ) -> bool {
+        *steps += 1;
+        if *steps > 50_000 {
+            return false;
+        }
         let mut p = pos;
         while p < nodes.len() && covered[nodes[p]] {
             p += 1;
@@ -1551,7 +1596,7 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
                 covered[u] = true;
                 covered[v] = true;
                 matched_double[bi] = true;
-                if backtrack(p + 1, nodes, adj, needs_double, covered, matched_double) {
+                if backtrack(p + 1, nodes, adj, needs_double, covered, matched_double, steps) {
                     return true;
                 }
                 matched_double[bi] = false;
@@ -1562,7 +1607,7 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
         false
     }
 
-    if !backtrack(0, &nodes, &adj, &needs_double, &mut covered, &mut matched_double) {
+    if !backtrack(0, &nodes, &adj, &needs_double, &mut covered, &mut matched_double, &mut steps) {
         return false;
     }
     for &bi in &arom_edges {
@@ -1574,7 +1619,19 @@ pub fn kekulize_aromatic_bonds(mol: &mut ChemMolecule) -> bool {
 /// Converts perceived aromatic ring bonds (`CcAromaticityInfo`) to `order == 6` (analogous to `ccDekekulize`),
 /// returning the number of converted bonds.
 pub fn dekekulize_aromatic_bonds(mol: &mut ChemMolecule) -> usize {
+    let val = CcVal::compute(mol);
     let arom = CcAromaticityInfo::perceive(mol);
+    // Preserve pyrrole-like [nH]/[pH] hydrogen count before removing Kekulé bond orders
+    for &ai in &arom.aromatic_atoms {
+        if let Some(a) = mol.atoms.get_mut(ai) {
+            if matches!(a.z, 7 | 15 | 33) && a.clamped_charge() == 0 && a.explicit_num_hydrogens.is_none() {
+                let total_h = val.implicit_h(ai).saturating_add(val.explicit_h(ai));
+                if total_h > 0 {
+                    a.explicit_num_hydrogens = Some(i32::from(total_h));
+                }
+            }
+        }
+    }
     let mut count = 0usize;
     for &bi in &arom.aromatic_bonds {
         if let Some(b) = mol.bonds.get_mut(bi) {
@@ -1988,6 +2045,13 @@ fn effective_cip_isotope(atom: &ChemAtom) -> i32 {
         2
     } else if atom.z == 226 {
         3
+    } else if (1..=118).contains(&atom.z) {
+        let m = get_element_exact_mass(atom.z).val;
+        if m > 0.0 {
+            m.round() as i32
+        } else {
+            1
+        }
     } else {
         1
     }
@@ -2054,18 +2118,23 @@ fn build_cip_digraph(
     val: &CcVal,
     visited: &mut Vec<usize>,
     curr_atom: usize,
+    incoming_bond_order: i32,
     max_depth: usize,
+    budget: &mut usize,
 ) -> CipNode {
-    let a = &mol.atoms[curr_atom];
+    let Some(a) = mol.atoms.get(curr_atom) else {
+        return CipNode { z: 0, iso: 0, children: Vec::new() };
+    };
     let z = effective_cip_z(a);
     let iso = effective_cip_isotope(a);
-    if max_depth == 0 || visited.contains(&curr_atom) {
+    if max_depth == 0 || *budget == 0 || visited.contains(&curr_atom) {
         return CipNode {
             z,
             iso,
             children: Vec::new(),
         };
     }
+    *budget -= 1;
     visited.push(curr_atom);
     let mut children: Vec<CipNode> = Vec::new();
     let parent = if visited.len() >= 2 {
@@ -2073,6 +2142,21 @@ fn build_cip_digraph(
     } else {
         None
     };
+
+    // CIP Rule 1a: duplicate (parent) leaf atoms for incoming multiple bond (A=B -> B carries duplicate (A))
+    if incoming_bond_order > 1 {
+        if let Some(p_idx) = parent {
+            if let Some(pa) = mol.atoms.get(p_idx) {
+                for _ in 1..incoming_bond_order {
+                    children.push(CipNode {
+                        z: effective_cip_z(pa),
+                        iso: effective_cip_isotope(pa),
+                        children: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
 
     for (nbr, bi) in mol.neighbors(curr_atom) {
         if Some(nbr) == parent {
@@ -2095,7 +2179,7 @@ fn build_cip_digraph(
                 });
             }
         } else {
-            children.push(build_cip_digraph(mol, val, visited, nbr, max_depth - 1));
+            children.push(build_cip_digraph(mol, val, visited, nbr, ord, max_depth - 1, budget));
             // CIP Rule 1a: duplicate atoms for multiple bonds
             let na = &mol.atoms[nbr];
             for _ in 1..ord {
@@ -2126,15 +2210,39 @@ fn build_ligand_digraph(
     sub_idx: i32,
     max_depth: usize,
 ) -> CipNode {
-    if sub_idx < 0 {
+    if sub_idx < 0 || (sub_idx as usize) >= mol.atoms.len() {
         return CipNode {
             z: 1,
             iso: 1,
             children: Vec::new(),
         };
     }
+    let sub_u = sub_idx as usize;
+    let has_arom6 = mol.bonds.iter().any(|b| b.order == 6);
+    if has_arom6 {
+        let mut kek = mol.clone();
+        if kekulize_aromatic_bonds(&mut kek) {
+            let kek_val = CcVal::compute(&kek);
+            let inc_ord = kek
+                .neighbors(center_atom)
+                .into_iter()
+                .find(|&(nb, _)| nb == sub_u)
+                .map(|(_, bi)| match kek.bonds[bi].order { 2 => 2, 3 => 3, 4 => 4, _ => 1 })
+                .unwrap_or(1);
+            let mut visited = vec![center_atom];
+            let mut budget = 4096usize;
+            return build_cip_digraph(&kek, &kek_val, &mut visited, sub_u, inc_ord, max_depth, &mut budget);
+        }
+    }
+    let inc_ord = mol
+        .neighbors(center_atom)
+        .into_iter()
+        .find(|&(nb, _)| nb == sub_u)
+        .map(|(_, bi)| match mol.bonds[bi].order { 2 => 2, 3 => 3, 4 => 4, _ => 1 })
+        .unwrap_or(1);
     let mut visited = vec![center_atom];
-    build_cip_digraph(mol, val, &mut visited, sub_idx as usize, max_depth)
+    let mut budget = 4096usize;
+    build_cip_digraph(mol, val, &mut visited, sub_u, inc_ord, max_depth, &mut budget)
 }
 
 /// Computes the CIP descriptor (`2` = R, `3` = S, `4` = r, `5` = s) for a tetrahedral stereocenter.
@@ -2566,6 +2674,8 @@ pub struct ReactionCenterSlot {
     pub atom_bits: BTreeSet<usize>,
     pub bond_bits: BTreeSet<usize>,
     pub center_types: Vec<u32>,
+    pub atom_center_types: Vec<u32>,
+    pub bond_center_types: Vec<u32>,
 }
 
 impl ReactionCenterSlot {
@@ -2574,6 +2684,8 @@ impl ReactionCenterSlot {
             atom_bits: BTreeSet::new(),
             bond_bits: BTreeSet::new(),
             center_types: vec![0; num_items],
+            atom_center_types: vec![0; num_items],
+            bond_center_types: vec![0; num_items],
         }
     }
 }
@@ -2650,15 +2762,18 @@ impl CcReaction {
 
             // Phase A: bond-map loop -> center type 3
             for (&rb, &pb) in &step.bond_map {
-                let b_a = &step.reactant.bonds[rb];
-                let b_b = &step.product.bonds[pb];
+                let (Some(b_a), Some(b_b)) = (step.reactant.bonds.get(rb), step.product.bonds.get(pb)) else {
+                    continue;
+                };
                 if b_a.order != b_b.order {
                     slot_a.bond_bits.insert(rb);
                     slot_b.bond_bits.insert(pb);
-                    if rb < slot_a.center_types.len() {
+                    if rb < slot_a.bond_center_types.len() {
+                        slot_a.bond_center_types[rb] = 3;
                         slot_a.center_types[rb] = 3;
                     }
-                    if pb < slot_b.center_types.len() {
+                    if pb < slot_b.bond_center_types.len() {
+                        slot_b.bond_center_types[pb] = 3;
                         slot_b.center_types[pb] = 3;
                     }
                 }
@@ -2666,8 +2781,9 @@ impl CcReaction {
 
             // Phase B: atom-map loop -> center type 2
             for (&ra, &pa) in &step.atom_map {
-                let a_a = &step.reactant.atoms[ra];
-                let a_b = &step.product.atoms[pa];
+                let (Some(a_a), Some(a_b)) = (step.reactant.atoms.get(ra), step.product.atoms.get(pa)) else {
+                    continue;
+                };
                 if a_a.charge != a_b.charge
                     || a_a.radical != a_b.radical
                     || a_a.z != a_b.z
@@ -2675,25 +2791,37 @@ impl CcReaction {
                 {
                     slot_a.atom_bits.insert(ra);
                     slot_b.atom_bits.insert(pa);
-                    if ra < slot_a.center_types.len() {
-                        slot_a.center_types[ra] = 2;
+                    if ra < slot_a.atom_center_types.len() {
+                        slot_a.atom_center_types[ra] = 2;
+                        if slot_a.center_types[ra] == 0 {
+                            slot_a.center_types[ra] = 2;
+                        }
                     }
-                    if pa < slot_b.center_types.len() {
-                        slot_b.center_types[pa] = 2;
+                    if pa < slot_b.atom_center_types.len() {
+                        slot_b.atom_center_types[pa] = 2;
+                        if slot_b.center_types[pa] == 0 {
+                            slot_b.center_types[pa] = 2;
+                        }
                     }
                 }
             }
 
             // Phase C: unmapped atoms -> center type 7; formed/broken unmapped bonds between mapped endpoints -> center type 1
             for ra in 0..step.reactant.atoms.len() {
-                if !step.atom_map.contains_key(&ra) && ra < slot_a.center_types.len() {
-                    slot_a.center_types[ra] = 7;
+                if !step.atom_map.contains_key(&ra) && ra < slot_a.atom_center_types.len() {
+                    slot_a.atom_center_types[ra] = 7;
+                    if slot_a.center_types[ra] == 0 {
+                        slot_a.center_types[ra] = 7;
+                    }
                 }
             }
             let mapped_prod: BTreeSet<usize> = step.atom_map.values().copied().collect();
             for pa in 0..step.product.atoms.len() {
-                if !mapped_prod.contains(&pa) && pa < slot_b.center_types.len() {
-                    slot_b.center_types[pa] = 7;
+                if !mapped_prod.contains(&pa) && pa < slot_b.atom_center_types.len() {
+                    slot_b.atom_center_types[pa] = 7;
+                    if slot_b.center_types[pa] == 0 {
+                        slot_b.center_types[pa] = 7;
+                    }
                 }
             }
 
@@ -2718,8 +2846,11 @@ impl CcReaction {
                     if let (Some(&pu), Some(&pv)) = (step.atom_map.get(&b.begin_atom), step.atom_map.get(&b.end_atom)) {
                         if !prod_edge_exists(pu, pv) {
                             slot_a.bond_bits.insert(rb);
-                            if rb < slot_a.center_types.len() && slot_a.center_types[rb] == 0 {
-                                slot_a.center_types[rb] = 1;
+                            if rb < slot_a.bond_center_types.len() && slot_a.bond_center_types[rb] == 0 {
+                                slot_a.bond_center_types[rb] = 1;
+                                if slot_a.center_types[rb] == 0 {
+                                    slot_a.center_types[rb] = 1;
+                                }
                             }
                         }
                     }
@@ -2731,8 +2862,11 @@ impl CcReaction {
                     if let (Some(&ru), Some(&rv)) = (rev_atom_map.get(&b.begin_atom), rev_atom_map.get(&b.end_atom)) {
                         if !react_edge_exists(ru, rv) {
                             slot_b.bond_bits.insert(pb);
-                            if pb < slot_b.center_types.len() && slot_b.center_types[pb] == 0 {
-                                slot_b.center_types[pb] = 1;
+                            if pb < slot_b.bond_center_types.len() && slot_b.bond_center_types[pb] == 0 {
+                                slot_b.bond_center_types[pb] = 1;
+                                if slot_b.center_types[pb] == 0 {
+                                    slot_b.center_types[pb] = 1;
+                                }
                             }
                         }
                     }
@@ -3209,5 +3343,90 @@ mod tests {
         assert_eq!(arom_b.compute_formula_properties().get_formula(), "C6H6");
         assert_eq!(dekekulize_aromatic_bonds(&mut arom_b), 6);
         assert!(arom_b.bonds.iter().all(|b| b.order == 6));
+    }
+
+    #[test]
+    fn test_comprehensive_audit_chem_regressions() {
+        // 1. CIP Rule 1a reverse duplicate: -CH=CH2 (vinyl, attached to (C,C,H)) > -CH(CH3)2 (isopropyl, attached to (C,C,H) where C has H,H,H vs duplicate (C) having (0,0,0) -> wait: vinyl C1 has C2 + (C2) + H, C2 has (C1),(C1),H so C2 has (C,C,H) > isopropyl C's methyl (H,H,H)!).
+        // Build 3-methylpent-1-ene chiral center C(H)(vinyl)(isopropyl)(F) and verify vinyl != isopropyl tie-break.
+        let mut cip_m = ChemMolecule::new();
+        let mut c0 = ChemAtom::new(1, 6); c0.x = 0.0; c0.y = 0.0; // chiral C
+        let mut f1 = ChemAtom::new(2, 9); f1.x = 0.0; f1.y = 14.4; // F (prio 1)
+        let mut c_vin1 = ChemAtom::new(3, 6); c_vin1.x = 14.4; c_vin1.y = 0.0;
+        let mut c_vin2 = ChemAtom::new(4, 6); c_vin2.x = 28.8; c_vin2.y = 0.0;
+        let mut c_iso = ChemAtom::new(5, 6); c_iso.x = -14.4; c_iso.y = 0.0;
+        let mut c_me1 = ChemAtom::new(6, 6); c_me1.x = -24.0; c_me1.y = 10.0;
+        let mut c_me2 = ChemAtom::new(7, 6); c_me2.x = -24.0; c_me2.y = -10.0;
+        for a in [c0, f1, c_vin1, c_vin2, c_iso, c_me1, c_me2] { cip_m.add_atom(a); }
+        cip_m.add_bond(1, 0, 1, 1, BondDisplay::WedgeBegin);
+        cip_m.add_bond(2, 0, 2, 1, BondDisplay::Solid);
+        cip_m.add_bond(3, 2, 3, 2, BondDisplay::Solid);
+        cip_m.add_bond(4, 0, 4, 1, BondDisplay::Solid);
+        cip_m.add_bond(5, 4, 5, 1, BondDisplay::Solid);
+        cip_m.add_bond(6, 4, 6, 1, BondDisplay::Solid);
+        let code = compute_tetrahedral_cip_code(&cip_m, 0);
+        assert!(code == 2 || code == 3, "Vinyl vs isopropyl CIP must resolve unambiguously, got {code}");
+
+        // 2. CIP isotope natural mass: 11C < natural C (mass 12), NOT 11C > natural C (old buggy mass 1)!
+        let mut iso_m = ChemMolecule::new();
+        let mut ic0 = ChemAtom::new(1, 6); ic0.x = 0.0; ic0.y = 0.0;
+        let mut if1 = ChemAtom::new(2, 9); if1.x = 0.0; if1.y = 14.4;
+        let mut ic11 = ChemAtom::new(3, 6); ic11.x = 14.4; ic11.y = 0.0; ic11.isotope = 11;
+        let mut ic12 = ChemAtom::new(4, 6); ic12.x = -14.4; ic12.y = 0.0; // natural C (12)
+        for a in [ic0, if1, ic11, ic12] { iso_m.add_atom(a); }
+        iso_m.add_bond(1, 0, 1, 1, BondDisplay::WedgeBegin);
+        iso_m.add_bond(2, 0, 2, 1, BondDisplay::Solid);
+        iso_m.add_bond(3, 0, 3, 1, BondDisplay::Solid);
+        let mut iso_m_13 = iso_m.clone();
+        iso_m_13.atoms[2].isotope = 13; // 13C > natural C (12), opposite stereochemistry to 11C!
+        let c11 = compute_tetrahedral_cip_code(&iso_m, 0);
+        let c13 = compute_tetrahedral_cip_code(&iso_m_13, 0);
+        assert!(matches!((c11, c13), (2, 3) | (3, 2)), "11C and 13C vs natural 12C must give opposite CIP codes: ({c11}, {c13})");
+
+        // 3. HRMS exact mass for boric acid B(OH)3: 11B peak is base peak, 10B peak is ~25% at M-1 (no bogus mono_raw shift!)
+        let mut boric = ChemMolecule::new();
+        boric.add_atom(ChemAtom::new(1, 5));
+        boric.add_atom(ChemAtom::new(2, 8));
+        boric.add_atom(ChemAtom::new(3, 8));
+        boric.add_atom(ChemAtom::new(4, 8));
+        boric.add_bond(1, 0, 1, 1, BondDisplay::Solid);
+        boric.add_bond(2, 0, 2, 1, BondDisplay::Solid);
+        boric.add_bond(3, 0, 3, 1, BondDisplay::Solid);
+        let hrms = simulate_hrms(&boric, "[M+H]+");
+        let base_mz = hrms.peaks.iter().max_by(|a, b| a.rel_intensity.partial_cmp(&b.rel_intensity).unwrap()).unwrap().mz;
+        // 11B (11.009305) + 3*16O (47.984744) + 4*1H (4.031300) - e- (0.000549) = 63.0248
+        assert!((base_mz - 63.0248).abs() < 0.005, "Boric acid [M+H]+ 11B base peak expected ~63.0248, got {base_mz:.4}");
+        assert!(hrms.peaks.iter().any(|p| (p.mz - 62.0284).abs() < 0.01 && p.rel_intensity > 20.0), "10B peak expected ~62.0284");
+
+        // 4. Ethanol 1H-NMR must NOT merge -CH2- and -OH into a 3H quartet
+        let mut eth = ChemMolecule::new();
+        eth.add_atom(ChemAtom::new(1, 6));
+        eth.add_atom(ChemAtom::new(2, 6));
+        eth.add_atom(ChemAtom::new(3, 8));
+        eth.add_bond(1, 0, 1, 1, BondDisplay::Solid);
+        eth.add_bond(2, 1, 2, 1, BondDisplay::Solid);
+        let nmr1h = predict_1h_nmr(&eth);
+        assert!(nmr1h.report_text.contains("2H") && nmr1h.report_text.contains("1H") && nmr1h.report_text.contains("3H"),
+            "Ethanol 1H-NMR must keep CH3 (3H), CH2 (2H), and OH (1H) separate: {}", nmr1h.report_text);
+
+        // 5. Aldehyde Brenk alert must NOT fire on acetic acid (CC(=O)O)
+        let mut acoh = ChemMolecule::new();
+        acoh.add_atom(ChemAtom::new(1, 6));
+        acoh.add_atom(ChemAtom::new(2, 6));
+        acoh.add_atom(ChemAtom::new(3, 8));
+        acoh.add_atom(ChemAtom::new(4, 8));
+        acoh.add_bond(1, 0, 1, 1, BondDisplay::Solid);
+        acoh.add_bond(2, 1, 2, 2, BondDisplay::Solid);
+        acoh.add_bond(3, 1, 3, 1, BondDisplay::Solid);
+        let mc = compute_medchem_report(&acoh);
+        assert!(!mc.alerts.iter().any(|a| a.name.to_ascii_lowercase().contains("aldehyde")), "Acetic acid must not trigger aldehyde alert");
+
+        // 6. Rotatable bonds = 0 for cyclohexane, 1 for butane; extreme pH stays finite
+        let mut cyc = ChemMolecule::new();
+        for i in 0..6u32 { cyc.add_atom(ChemAtom::new(i + 1, 6)); }
+        for i in 0..6usize { cyc.add_bond((i + 1) as u32, i, (i + 1) % 6, 1, BondDisplay::Solid); }
+        assert_eq!(compute_medchem_report(&cyc).rotatable_bonds, 0);
+        assert!(compute_microspecies_at_ph(&acoh, -20.0).net_charge.is_finite());
+        assert!(compute_microspecies_at_ph(&acoh, 40.0).net_charge.is_finite());
     }
 }

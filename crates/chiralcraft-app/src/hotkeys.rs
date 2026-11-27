@@ -150,7 +150,7 @@ fn attach_ring_to_atom(
         id: bid,
         begin_atom: prev,
         end_atom: root,
-        order: if aromatic { 2 } else { 1 },
+        order: 1,
         display: BondDisplay::Solid,
         visible: true,
         ignore_warnings: false,
@@ -176,11 +176,15 @@ fn fuse_ring_to_bond(
     let p2 = (mol.atoms[b.end_atom].x, mol.atoms[b.end_atom].y);
     let mx = 0.5 * (p1.0 + p2.0);
     let my = 0.5 * (p1.1 + p2.1);
-    let edge_len = (p2.0 - p1.0).hypot(p2.1 - p1.1).max(blen);
+    let raw_len = (p2.0 - p1.0).hypot(p2.1 - p1.1);
+    let edge_len = raw_len.max(blen);
     let cx = mol.atoms.iter().map(|a| a.x).sum::<f64>() / (mol.atoms.len().max(1) as f64);
     let cy = mol.atoms.iter().map(|a| a.y).sum::<f64>() / (mol.atoms.len().max(1) as f64);
-    let ex = (p2.0 - p1.0) / edge_len;
-    let ey = (p2.1 - p1.1) / edge_len;
+    let (ex, ey) = if raw_len > 1e-6 {
+        ((p2.0 - p1.0) / raw_len, (p2.1 - p1.1) / raw_len)
+    } else {
+        (1.0, 0.0)
+    };
     let mut nx = -ey;
     let mut ny = ex;
     if (mx + nx - cx).hypot(my + ny - cy) < (mx - nx - cx).hypot(my - ny - cy) {
@@ -197,6 +201,14 @@ fn fuse_ring_to_bond(
     if (rcx + r * test_ang.cos() - p1.0).hypot(rcy + r * test_ang.sin() - p1.1) < 1.0 {
         step = -step;
     }
+    let shared_or_adj_double = b.order >= 2
+        || mol.bonds.iter().any(|ob| {
+            ob.order >= 2
+                && (ob.begin_atom == b.begin_atom
+                    || ob.end_atom == b.begin_atom
+                    || ob.begin_atom == b.end_atom
+                    || ob.end_atom == b.end_atom)
+        });
     let mut prev_idx = b.end_atom;
     for k in 1..=(n_sides - 2) {
         let ang = a_start + (k as f64) * step;
@@ -209,8 +221,14 @@ fn fuse_ring_to_bond(
         mol.atoms.push(na);
         let bid = *next_id;
         *next_id += 1;
-        let ord = if aromatic && (k % 2 == 0) {
-            2
+        let ord = if aromatic {
+            if shared_or_adj_double {
+                if k % 2 == 0 { 2 } else { 1 }
+            } else if k % 2 == 1 {
+                2
+            } else {
+                1
+            }
         } else if cpd && k == 2 {
             2
         } else {
@@ -229,11 +247,16 @@ fn fuse_ring_to_bond(
     }
     let bid = *next_id;
     *next_id += 1;
+    let closing_ord = if aromatic && !shared_or_adj_double && n_sides % 2 == 0 {
+        2
+    } else {
+        1
+    };
     mol.bonds.push(ChemBond {
         id: bid,
         begin_atom: prev_idx,
         end_atom: b.begin_atom,
-        order: 1,
+        order: closing_ord,
         display: BondDisplay::Solid,
         visible: true,
         ignore_warnings: false,
@@ -285,10 +308,17 @@ pub fn apply_atom_hotkey(doc: &mut InteractiveDocument, mi: usize, ai: usize, ch
                     a.z = 1;
                     a.isotope = 2;
                     a.label = Some("D".to_string());
+                } else if lbl == "Ac" {
+                    // ChemDraw 'A' hotkey inserts Acetyl ("Ac") nickname, NOT Actinium (Z=89)
+                    a.z = 6;
+                    a.isotope = 0;
+                    a.label = Some("Ac".to_string());
                 } else if let Some(el) = get_element_by_symbol(lbl) {
                     a.z = el.z;
+                    a.isotope = 0;
                     a.label = None;
                 } else {
+                    a.isotope = 0;
                     a.label = Some(lbl.to_string());
                 }
             }

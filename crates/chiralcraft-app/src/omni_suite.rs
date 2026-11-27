@@ -216,11 +216,21 @@ pub fn render_ir_spectrum_svg(
     let x_max = params.x_max_cm1.max(params.x_min_cm1 + 50.0);
     let x_min = params.x_min_cm1.min(x_max - 50.0);
     let curve = ir.simulate_curve(params, 480);
-    let max_abs = curve
+    let mut max_abs = curve
         .iter()
         .map(|p| p.1)
+        .filter(|y| y.is_finite())
         .fold(1.0_f64, f64::max)
         .max(0.2);
+    if matches!(params.y_axis, IrYAxis::Absorbance) {
+        if let Some(sp) = exp {
+            for &(_, y) in &sp.ir_absorbance_curve() {
+                if y.is_finite() {
+                    max_abs = max_abs.max(y);
+                }
+            }
+        }
+    }
 
     let wn_to_x = |wn: f64| ml + ((x_max - wn) / (x_max - x_min)).clamp(0.0, 1.0) * pw;
     let y_to_px = |y: f64| match params.y_axis {
@@ -228,13 +238,20 @@ pub fn render_ir_spectrum_svg(
         IrYAxis::Absorbance => mt + (1.0 - (y / max_abs).clamp(0.0, 1.0)) * ph,
     };
 
+    let xml_esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
     let mut svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">\n\
          <rect width=\"100%\" height=\"100%\" fill=\"#FFFFFF\"/>\n\
-         <text x=\"{}\" y=\"18\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"600\" fill=\"#111\">{title} — {} (scale {:.3})</text>\n\
+         <text x=\"{}\" y=\"18\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"600\" fill=\"#111\">{} — {} (scale {:.3})</text>\n\
          <rect x=\"{ml}\" y=\"{mt}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" stroke=\"#222\" stroke-width=\"1.2\"/>\n",
         w * 0.5,
-        ir.source.label(),
+        xml_esc(title),
+        xml_esc(&ir.source.label()),
         params.scale_factor
     );
 
@@ -958,9 +975,11 @@ pub fn show_spectroscopy_window(
                     p.rect_filled(rect, 2.0, Color32::WHITE);
                     p.rect_stroke(rect, 2.0, Stroke::new(1.0_f32, Color32::from_gray(140)), egui::StrokeKind::Inside);
                     let plot = rect.shrink2(Vec2::new(26.0, 18.0));
-                    let x_to_px = |ppm: f64| plot.min.x + (((pred2d.x_range.1 - ppm) / (pred2d.x_range.1 - pred2d.x_range.0)).clamp(0.0, 1.0) as f32) * plot.width();
-                    let y_to_px = |ppm: f64| plot.min.y + (((ppm - pred2d.y_range.0) / (pred2d.y_range.1 - pred2d.y_range.0)).clamp(0.0, 1.0) as f32) * plot.height();
-                    // Reversed NMR axes: high ppm top-left / bottom-left standard
+                    let x_span = (pred2d.x_range.1 - pred2d.x_range.0).abs().max(1e-6);
+                    let y_span = (pred2d.y_range.1 - pred2d.y_range.0).abs().max(1e-6);
+                    let x_to_px = |ppm: f64| plot.min.x + (((pred2d.x_range.1 - ppm) / x_span).clamp(0.0, 1.0) as f32) * plot.width();
+                    let y_to_px = |ppm: f64| plot.min.y + (((pred2d.y_range.1 - ppm) / y_span).clamp(0.0, 1.0) as f32) * plot.height();
+                    // Reversed NMR axes: high ppm at top-left, low ppm at bottom-right (COSY diagonal plot.min -> plot.max)
                     p.rect_stroke(plot, 0.0, Stroke::new(0.9_f32, Color32::BLACK), egui::StrokeKind::Inside);
                     if state.nmr2d_kind == Nmr2dKind::Cosy {
                         p.line_segment([plot.min, plot.max], Stroke::new(0.6_f32, Color32::from_gray(200)));
@@ -1202,6 +1221,7 @@ pub fn show_energy_profile_window(
                         ui.add(egui::TextEdit::singleline(&mut st.label).desired_width(85.0));
                         ui.add(egui::DragValue::new(&mut st.energy).speed(0.2).fixed_decimals(1));
                         ui.label(unit_s);
+                        ui.checkbox(&mut st.is_ts, "TS");
                         if len_b > 2 && ui.small_button("×").clicked() {
                             rem_b = Some(i);
                         }
@@ -1350,13 +1370,14 @@ pub fn show_latex_export_window(
                 ui.selectable_value(&mut state.latex_mode, LatexMode::ChemfigScheme, "\\schemestart (Full Scheme)");
                 ui.selectable_value(&mut state.latex_mode, LatexMode::TikzVector, "TikZ Vector");
             });
-            let mut code = match state.latex_mode {
+            let code = match state.latex_mode {
                 LatexMode::ChemfigSingle => active_mol.map(molecule_to_chemfig).unwrap_or_else(|| "% Draw a molecule first".into()),
                 LatexMode::ChemfigScheme => document_to_chemfig_scheme(doc),
                 LatexMode::TikzVector => document_to_tikz(doc),
             };
             egui::ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
-                ui.add(egui::TextEdit::multiline(&mut code).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(10));
+                let mut view_str = code.as_str();
+                ui.add(egui::TextEdit::multiline(&mut view_str).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(10));
             });
             ui.horizontal(|ui| {
                 if ui.button("Copy LaTeX Code").clicked() {

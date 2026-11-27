@@ -138,8 +138,16 @@ pub fn parse_direct_palette_command(input: &str) -> Option<PaletteCommandAction>
     let cmd = parts.next()?.to_ascii_lowercase();
     let arg = parts.next().unwrap_or("").trim();
     match cmd.as_str() {
-        "rotate" | "rot" => arg.parse::<f64>().ok().map(PaletteCommandAction::RotateDeg),
-        "scale" => arg.parse::<f64>().ok().map(PaletteCommandAction::ScalePct),
+        "rotate" | "rot" => arg
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(PaletteCommandAction::RotateDeg),
+        "scale" => arg
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && (1.0..=10_000.0).contains(v))
+            .map(PaletteCommandAction::ScalePct),
         "smiles" | "smi" if !arg.is_empty() => Some(PaletteCommandAction::InsertSmiles(arg.to_string())),
         "name" | "iupac" if !arg.is_empty() => Some(PaletteCommandAction::InsertName(arg.to_string())),
         "style" | "stylesheet" if !arg.is_empty() => Some(PaletteCommandAction::ApplyStyle(arg.to_string())),

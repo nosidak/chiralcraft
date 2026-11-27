@@ -291,13 +291,16 @@ pub struct RetrosyntheticHit {
 fn split_molecule_at_bond(
     mol: &ChemMolecule,
     cut_bi: usize,
-    cap_u_z: Option<i32>,
-    cap_v_z: Option<i32>,
+    cap_u: Option<(i32, i32)>,
+    cap_v: Option<(i32, i32)>,
     bond_len: f64,
 ) -> Option<(ChemMolecule, ChemMolecule)> {
     let n = mol.atoms.len();
     let bcut = mol.bonds.get(cut_bi)?;
     let (u0, v0) = (bcut.begin_atom, bcut.end_atom);
+    if u0 >= n || v0 >= n || u0 == v0 {
+        return None;
+    }
 
     // BFS from u0 without traversing cut_bi; if v0 is reachable, bond is in a ring (skip simple 2-piece split)
     let mut adj = vec![Vec::new(); n];
@@ -323,7 +326,7 @@ fn split_molecule_at_bond(
         return None; // Ring bond; keep acyclic strategic disconnections crisp
     }
 
-    let build_half = |want_a: bool, attach_orig: usize, other_orig: usize, cap_z: Option<i32>| -> ChemMolecule {
+    let build_half = |want_a: bool, attach_orig: usize, other_orig: usize, cap_spec: Option<(i32, i32)>| -> ChemMolecule {
         let mut out = ChemMolecule::new();
         let mut map = vec![usize::MAX; n];
         for (i, a) in mol.atoms.iter().enumerate() {
@@ -342,11 +345,12 @@ fn split_molecule_at_bond(
                 next_bid += 1;
             }
         }
-        if let Some(cz) = cap_z {
+        if let Some((cz, cap_order)) = cap_spec {
             let att = map[attach_orig];
             if att < out.atoms.len() {
-                let nid = out.atoms.iter().map(|a| a.id).max().unwrap_or(1) + 1;
+                let mut nid = out.atoms.iter().map(|a| a.id).max().unwrap_or(1).saturating_add(1);
                 let mut ca = ChemAtom::new(nid, cz);
+                nid = nid.saturating_add(1);
                 // Place cap atom along the severed bond vector (toward `other_orig`) so it never collides with existing substituents
                 let dx = mol.atoms[other_orig].x - mol.atoms[attach_orig].x;
                 let dy = mol.atoms[other_orig].y - mol.atoms[attach_orig].y;
@@ -354,20 +358,33 @@ fn split_molecule_at_bond(
                 let (ux, uy) = if d > 1e-6 { (dx / d, dy / d) } else { (1.0, 0.0) };
                 ca.x = out.atoms[att].x + bond_len * ux;
                 ca.y = out.atoms[att].y + bond_len * uy;
-                if cz == 5 {
-                    ca.label = Some("B(OH)₂".to_string());
-                }
                 let ci = out.atoms.len();
                 out.add_atom(ca);
-                out.add_bond(next_bid, att, ci, 1, BondDisplay::Solid);
+                out.add_bond(next_bid, att, ci, cap_order, BondDisplay::Solid);
+                next_bid = next_bid.saturating_add(1);
+                if cz == 5 {
+                    // Explicit boronic acid -B(OH)2 atoms so formula is C6H7BO2 and valence is valid!
+                    let bx = out.atoms[ci].x;
+                    let by = out.atoms[ci].y;
+                    let ang0 = uy.atan2(ux);
+                    for d_ang in [std::f64::consts::FRAC_PI_3, -std::f64::consts::FRAC_PI_3] {
+                        let mut oh = ChemAtom::new(nid, 8);
+                        nid = nid.saturating_add(1);
+                        oh.x = bx + bond_len * (ang0 + d_ang).cos();
+                        oh.y = by + bond_len * (ang0 + d_ang).sin();
+                        let oi = out.add_atom(oh);
+                        out.add_bond(next_bid, ci, oi, 1, BondDisplay::Solid);
+                        next_bid = next_bid.saturating_add(1);
+                    }
+                }
             }
         }
         clean_up_structure_preserving_stereo(&mut out, &[], bond_len);
         out
     };
 
-    let ma = build_half(true, u0, v0, cap_u_z);
-    let mb = build_half(false, v0, u0, cap_v_z);
+    let ma = build_half(true, u0, v0, cap_u);
+    let mb = build_half(false, v0, u0, cap_v);
     if ma.atoms.is_empty() || mb.atoms.is_empty() {
         return None;
     }
@@ -381,7 +398,7 @@ pub fn suggest_disconnections(mol: &ChemMolecule, bond_len: f64) -> Vec<Retrosyn
     let arom = CcAromaticityInfo::perceive(mol);
     let mut adj = vec![Vec::new(); n];
     for (bi, b) in mol.bonds.iter().enumerate() {
-        if b.begin_atom < n && b.end_atom < n {
+        if b.begin_atom < n && b.end_atom < n && b.begin_atom != b.end_atom {
             adj[b.begin_atom].push((b.end_atom, bi, b.order));
             adj[b.end_atom].push((b.begin_atom, bi, b.order));
         }
@@ -393,51 +410,54 @@ pub fn suggest_disconnections(mol: &ChemMolecule, bond_len: f64) -> Vec<Retrosyn
         mol.atoms[idx].z == 16
             && adj[idx].iter().filter(|&&(k, _, o)| mol.atoms[k].z == 8 && o == 2).count() >= 2
     };
+    let heavy_deg = |idx: usize| -> usize {
+        adj[idx].iter().filter(|&&(k, _, _)| mol.atoms[k].z > 1).count()
+    };
 
     let mut hits = Vec::new();
     for (bi, b) in mol.bonds.iter().enumerate() {
-        if b.begin_atom >= n || b.end_atom >= n {
+        if b.begin_atom >= n || b.end_atom >= n || b.begin_atom == b.end_atom {
             continue;
         }
         let (u, v) = (b.begin_atom, b.end_atom);
         let (zu, zv) = (mol.atoms[u].z, mol.atoms[v].z);
 
-        let rule: Option<(&'static str, &'static str, u8, Option<i32>, Option<i32>)> = if b.order == 1 {
+        let rule: Option<(&'static str, &'static str, u8, Option<(i32, i32)>, Option<(i32, i32)>)> = if b.order == 1 {
             if has_carbonyl(u) && zv == 7 {
-                Some(("Amide Coupling (HATU / EDC)", "HATU, DIPEA, DMF, rt", 98, Some(8), None))
+                Some(("Amide Coupling (HATU / EDC)", "HATU, DIPEA, DMF, rt", 98, Some((8, 1)), None))
             } else if has_carbonyl(v) && zu == 7 {
-                Some(("Amide Coupling (HATU / EDC)", "HATU, DIPEA, DMF, rt", 98, None, Some(8)))
+                Some(("Amide Coupling (HATU / EDC)", "HATU, DIPEA, DMF, rt", 98, None, Some((8, 1))))
             } else if has_carbonyl(u) && zv == 8 {
-                Some(("Esterification (EDC / DMAP)", "EDC·HCl, DMAP, DCM, rt", 94, Some(8), None))
+                Some(("Esterification (EDC / DMAP)", "EDC·HCl, DMAP, DCM, rt", 94, Some((8, 1)), None))
             } else if has_carbonyl(v) && zu == 8 {
-                Some(("Esterification (EDC / DMAP)", "EDC·HCl, DMAP, DCM, rt", 94, None, Some(8)))
+                Some(("Esterification (EDC / DMAP)", "EDC·HCl, DMAP, DCM, rt", 94, None, Some((8, 1))))
             } else if has_sulfonyl(u) && zv == 7 {
-                Some(("Sulfonamide Coupling", "Et3N or Pyridine, DCM, 0 °C → rt", 95, Some(17), None))
+                Some(("Sulfonamide Coupling", "Et3N or Pyridine, DCM, 0 °C → rt", 95, Some((17, 1)), None))
             } else if has_sulfonyl(v) && zu == 7 {
-                Some(("Sulfonamide Coupling", "Et3N or Pyridine, DCM, 0 °C → rt", 95, None, Some(17)))
+                Some(("Sulfonamide Coupling", "Et3N or Pyridine, DCM, 0 °C → rt", 95, None, Some((17, 1))))
             } else if zu == 6 && zv == 6 && arom.is_atom_aromatic(u) && arom.is_atom_aromatic(v) {
-                Some(("Suzuki–Miyaura Biaryl Cross-Coupling", "Pd(PPh3)4 (5 mol%), K2CO3, THF/H2O, 80 °C", 96, Some(35), Some(5)))
+                Some(("Suzuki–Miyaura Biaryl Cross-Coupling", "Pd(PPh3)4 (5 mol%), K2CO3, THF/H2O, 80 °C", 96, Some((35, 1)), Some((5, 1))))
             } else if zu == 6 && arom.is_atom_aromatic(u) && zv == 7 && !has_carbonyl(u) {
-                Some(("Buchwald–Hartwig C–N Amination", "Pd2(dba)3, BrettPhos, NaOtBu, dioxane, 100 °C", 90, Some(35), None))
+                Some(("Buchwald–Hartwig C–N Amination", "Pd2(dba)3, BrettPhos, NaOtBu, dioxane, 100 °C", 90, Some((35, 1)), None))
             } else if zv == 6 && arom.is_atom_aromatic(v) && zu == 7 && !has_carbonyl(v) {
-                Some(("Buchwald–Hartwig C–N Amination", "Pd2(dba)3, BrettPhos, NaOtBu, dioxane, 100 °C", 90, None, Some(35)))
+                Some(("Buchwald–Hartwig C–N Amination", "Pd2(dba)3, BrettPhos, NaOtBu, dioxane, 100 °C", 90, None, Some((35, 1))))
             } else if zu == 8 && zv == 6 && !has_carbonyl(v) && !arom.is_atom_aromatic(v) {
-                Some(("Williamson Ether Synthesis", "NaH or K2CO3, DMF, 60 °C", 85, None, Some(35)))
+                Some(("Williamson Ether Synthesis", "NaH or K2CO3, DMF, 60 °C", 85, None, Some((35, 1))))
             } else if zv == 8 && zu == 6 && !has_carbonyl(u) && !arom.is_atom_aromatic(u) {
-                Some(("Williamson Ether Synthesis", "NaH or K2CO3, DMF, 60 °C", 85, Some(35), None))
-            } else if zu == 7 && zv == 6 && !has_carbonyl(v) && !arom.is_atom_aromatic(v) {
-                Some(("Reductive Amination", "NaBH(OAc)3, AcOH, DCE, rt", 82, None, Some(8)))
-            } else if zv == 7 && zu == 6 && !has_carbonyl(u) && !arom.is_atom_aromatic(u) {
-                Some(("Reductive Amination", "NaBH(OAc)3, AcOH, DCE, rt", 82, Some(8), None))
+                Some(("Williamson Ether Synthesis", "NaH or K2CO3, DMF, 60 °C", 85, Some((35, 1)), None))
+            } else if zu == 7 && zv == 6 && !has_carbonyl(v) && !arom.is_atom_aromatic(v) && heavy_deg(v) <= 3 {
+                Some(("Reductive Amination", "NaBH(OAc)3, AcOH, DCE, rt", 82, None, Some((8, 2))))
+            } else if zv == 7 && zu == 6 && !has_carbonyl(u) && !arom.is_atom_aromatic(u) && heavy_deg(u) <= 3 {
+                Some(("Reductive Amination", "NaBH(OAc)3, AcOH, DCE, rt", 82, Some((8, 2)), None))
             } else if has_carbonyl(u) && zv == 6 && arom.is_atom_aromatic(v) {
-                Some(("Friedel–Crafts Acylation", "AlCl3, DCM, 0 °C → rt", 80, Some(17), None))
+                Some(("Friedel–Crafts Acylation", "AlCl3, DCM, 0 °C → rt", 80, Some((17, 1)), None))
             } else if has_carbonyl(v) && zu == 6 && arom.is_atom_aromatic(u) {
-                Some(("Friedel–Crafts Acylation", "AlCl3, DCM, 0 °C → rt", 80, None, Some(17)))
+                Some(("Friedel–Crafts Acylation", "AlCl3, DCM, 0 °C → rt", 80, None, Some((17, 1))))
             } else {
                 None
             }
         } else if b.order == 2 && zu == 6 && zv == 6 && !arom.is_atom_aromatic(u) && !arom.is_atom_aromatic(v) {
-            Some(("Wittig Olefination / Cross-Metathesis", "Grubbs II (3 mol%), DCM, 40 °C  or  Ph3P=CHR", 78, Some(8), Some(8)))
+            Some(("Wittig Olefination / Cross-Metathesis", "Grubbs II (3 mol%), DCM, 40 °C  or  Ph3P=CHR", 78, Some((8, 2)), Some((8, 2))))
         } else {
             None
         };
