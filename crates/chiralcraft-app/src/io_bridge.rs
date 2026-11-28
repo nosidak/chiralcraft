@@ -40,7 +40,8 @@ pub fn atomic_write_bytes(path: &str, bytes: &[u8]) -> Result<(), String> {
         let tmp = format!("{path}.tmp.{}.{nanos}.{seq}.{attempt}", std::process::id());
         match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
             Ok(mut f) => {
-                if let Err(e) = f.write_all(bytes) {
+                // Flush to disk before the rename so a crash cannot leave a truncated file in place.
+                if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
                     drop(f);
                     let _ = fs::remove_file(&tmp);
                     return Err(e.to_string());
@@ -153,6 +154,16 @@ pub fn paste_svg_from_os_clipboard() -> Option<String> {
 pub fn load_document_any_with_cell(
     path: &str,
 ) -> Result<(InteractiveDocument, Option<CrystalUnitCell>), String> {
+    // The window title / default Save As name follow the file actually opened, not a stale
+    // name stored inside it (CDXML `Name`) or the full path.
+    let (mut doc, cell) = load_document_raw(path)?;
+    if let Some(f) = std::path::Path::new(path).file_name().and_then(|s| s.to_str()) {
+        doc.name = f.to_string();
+    }
+    Ok((doc, cell))
+}
+
+fn load_document_raw(path: &str) -> Result<(InteractiveDocument, Option<CrystalUnitCell>), String> {
     let low = path.to_ascii_lowercase();
     let fname = std::path::Path::new(path)
         .file_name()
@@ -257,9 +268,15 @@ pub fn load_document_any_with_cell(
         } else {
             return Err("Unsupported input format".to_string());
         };
-        for m in mols {
-            doc.scene.molecules.push(m);
+        let mut mols = mols;
+        chiralcraft_doc::rescale_angstrom_molecules(&mut mols, doc.settings.bond_length_pt);
+        // Crystal cells keep their fractional frame aligned with the atoms; don't move those.
+        if cell_opt.is_none() {
+            chiralcraft_doc::layout_imported_molecules(&mut mols, 540.0, 719.75);
         }
+        chiralcraft_doc::renumber_molecule_ids(&mut mols, 1);
+        doc.scene.molecules.extend(mols);
+        mark_loaded(&mut doc);
         Ok((doc, cell_opt))
     }
 }
@@ -280,9 +297,11 @@ pub fn load_document_or_smiles(input: &str) -> Result<InteractiveDocument, Strin
         || input.starts_with("./")
         || input.starts_with("../")
         || input.starts_with("~/")
-        || (input.len() >= 2
+        // Windows drive path needs `X:\` or `X:/`; bare `c:c` is an aromatic-bond SMILES.
+        || (input.len() >= 3
             && input.as_bytes()[0].is_ascii_alphabetic()
-            && input.as_bytes()[1] == b':');
+            && input.as_bytes()[1] == b':'
+            && matches!(input.as_bytes()[2], b'\\' | b'/'));
     let has_known_ext = [
         ".cdxml", ".cdx", ".cds", ".mol", ".sdf", ".sd", ".rxn", ".ct", ".cml", ".tgf",
         ".skc", ".xyz", ".cif", ".pdb", ".svg", ".png", ".pdf", ".out", ".log", ".inp",
@@ -297,7 +316,14 @@ pub fn load_document_or_smiles(input: &str) -> Result<InteractiveDocument, Strin
     clean_up_structure_preserving_stereo(&mut mol, &[], 14.40);
     let mut doc = InteractiveDocument::new_saved_seed(input, DocumentSettings::acs_document_1996());
     doc.scene.molecules.push(mol);
+    mark_loaded(&mut doc);
     Ok(doc)
+}
+
+/// The loaded structures are the saved state, so `File > Revert` returns to them, not to a blank page.
+fn mark_loaded(doc: &mut InteractiveDocument) {
+    doc.save();
+    doc.last_repeat_label = None;
 }
 
 pub fn save_document_any_with_opts(
@@ -437,4 +463,51 @@ pub fn save_document_any_styled(
 
 pub fn save_document_any(doc: &InteractiveDocument, out_path: &str) -> Result<(), String> {
     save_document_any_with_opts(doc, out_path, ExportOptions::default(), false)
+}
+
+#[cfg(test)]
+mod audit_b_io_tests {
+    use super::*;
+
+    #[test]
+    fn test_aromatic_bond_smiles_is_not_mistaken_for_windows_drive_path() {
+        let doc = load_document_or_smiles("c:c").expect("c:c must parse as SMILES, not a path");
+        assert_eq!(doc.scene.molecules.first().map(|m| m.atoms.len()), Some(2));
+    }
+
+    #[test]
+    fn test_atomic_write_bytes_overwrites_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("cc_audit_b_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("out.txt");
+        let ps = p.to_string_lossy().to_string();
+        atomic_write_text(&ps, "first").unwrap();
+        atomic_write_text(&ps, "second").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "second");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_multi_record_import_has_unique_ids_and_reverts_to_loaded_structures() {
+        let dir = std::env::temp_dir().join(format!("cc_ids_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("m.smi");
+        fs::write(&p, "c1ccccc1\nCCO\nc1ccncc1\n").unwrap();
+        let mut doc = load_document_any(&p.to_string_lossy()).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let mut ids: Vec<u32> = doc.scene.molecules.iter()
+            .flat_map(|m| m.atoms.iter().map(|a| a.id).chain(m.bonds.iter().map(|b| b.id)))
+            .collect();
+        let n = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "atom/bond ids must be unique across imported records");
+        doc.apply_scene_tx("Bond", |s, next_id| {
+            assert!(*next_id as usize > n, "new ids must not reuse imported ones");
+            s.molecules.remove(0);
+        });
+        assert!(doc.revert());
+        assert_eq!(doc.scene.molecules.len(), 3, "Revert must restore the opened file, not a blank page");
+    }
 }

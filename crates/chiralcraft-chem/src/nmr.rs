@@ -45,14 +45,18 @@ impl NmrPrediction {
                 let sublines: Vec<(f64, f64)> = if self.nucleus == "1H" && !pk.j_hz.is_empty() {
                     let dj = pk.j_hz[0] / self.freq_mhz;
                     match pk.multiplicity.as_str() {
-                        "d" => vec![(-0.5 * dj, 0.5), (0.5 * dj, 0.5)],
-                        "t" => vec![(-dj, 0.25), (0.0, 0.5), (dj, 0.25)],
-                        "q" => vec![
-                            (-1.5 * dj, 0.125),
-                            (-0.5 * dj, 0.375),
-                            (0.5 * dj, 0.375),
-                            (1.5 * dj, 0.125),
-                        ],
+                        m if binomial_lines(m).is_some() => {
+                            let lines = binomial_lines(m).unwrap_or(1);
+                            let total = (1u64 << (lines - 1)) as f64;
+                            let mut coeff = 1.0_f64;
+                            (0..lines)
+                                .map(|k| {
+                                    let w = coeff / total;
+                                    coeff = coeff * ((lines - 1 - k) as f64) / ((k + 1) as f64);
+                                    ((k as f64 - (lines - 1) as f64 * 0.5) * dj, w)
+                                })
+                                .collect()
+                        }
                         "dd" => {
                             let dj2 = pk.j_hz.get(1).copied().unwrap_or(2.2) / self.freq_mhz;
                             vec![
@@ -88,6 +92,34 @@ impl NmrPrediction {
             p.1 /= max_i;
         }
         pts
+    }
+}
+
+/// First-order n+1 rule (equal ³J): `n` vicinal protons give n+1 lines.
+fn n_plus_one_multiplicity(n: i32, aromatic: bool) -> (String, Vec<f64>) {
+    let name = match n {
+        i32::MIN..=0 => return ("s".to_string(), Vec::new()),
+        1 => "d",
+        2 => "t",
+        3 => "q",
+        4 => "quint",
+        5 => "sext",
+        6 => "sept",
+        _ => "m",
+    };
+    (name.to_string(), vec![if aromatic { 7.8 } else { 7.1 }])
+}
+
+/// Binomial (Pascal) line count for first-order multiplicity labels; `None` for others.
+fn binomial_lines(mult: &str) -> Option<usize> {
+    match mult {
+        "d" => Some(2),
+        "t" => Some(3),
+        "q" => Some(4),
+        "quint" => Some(5),
+        "sext" => Some(6),
+        "sept" => Some(7),
+        _ => None,
     }
 }
 
@@ -410,17 +442,7 @@ pub fn predict_1h_nmr(mol: &ChemMolecule) -> NmrPrediction {
                     }
                 }
             }
-            let total_vic: i32 = vicinal_groups.iter().sum();
-            let j_typ = if arom.is_atom_aromatic(i) { 7.8 } else { 7.1 };
-            match (vicinal_groups.len(), total_vic) {
-                (0, _) | (_, 0) => ("s".to_string(), Vec::new()),
-                (1, 1) => ("d".to_string(), vec![j_typ]),
-                (1, 2) => ("t".to_string(), vec![j_typ]),
-                (1, 3) => ("q".to_string(), vec![j_typ]),
-                (2, 2) if arom.is_atom_aromatic(i) => ("t".to_string(), vec![7.8]),
-                (_, 2) => ("t".to_string(), vec![j_typ]),
-                _ => ("m".to_string(), vec![j_typ]),
-            }
+            n_plus_one_multiplicity(vicinal_groups.iter().sum(), arom.is_atom_aromatic(i))
         };
 
         peaks.push(NmrPeak {
@@ -457,17 +479,7 @@ pub fn predict_1h_nmr(mol: &ChemMolecule) -> NmrPrediction {
                 }
             }
         }
-        let total_vic: i32 = non_equiv_vic.iter().sum();
-        let j_typ = if arom.is_atom_aromatic(p.atom_idx) { 7.8 } else { 7.1 };
-        let (m, js) = match (non_equiv_vic.len(), total_vic) {
-            (0, _) | (_, 0) => ("s".to_string(), Vec::new()),
-            (1, 1) => ("d".to_string(), vec![j_typ]),
-            (1, 2) => ("t".to_string(), vec![j_typ]),
-            (1, 3) => ("q".to_string(), vec![j_typ]),
-            (2, 2) if arom.is_atom_aromatic(p.atom_idx) => ("t".to_string(), vec![7.8]),
-            (_, 2) => ("t".to_string(), vec![j_typ]),
-            _ => ("m".to_string(), vec![j_typ]),
-        };
+        let (m, js) = n_plus_one_multiplicity(non_equiv_vic.iter().sum(), arom.is_atom_aromatic(p.atom_idx));
         p.multiplicity = m;
         p.j_hz = js;
     }
@@ -773,5 +785,22 @@ mod tests {
         let cb = predict_13c_nmr(&benz);
         assert!((cb.peaks[0].shift_ppm - 128.5).abs() < 0.2);
         assert!(!hb.simulate_spectrum(0.0, 12.0, 128).is_empty());
+    }
+
+    #[test]
+    fn test_n_plus_one_septet_for_propane_ch2() {
+        let mut m = ChemMolecule::default();
+        for i in 0..3 {
+            m.atoms.push(ChemAtom::new((i + 1) as u32, 6));
+        }
+        for i in 0..2 {
+            m.bonds.push(ChemBond { id: (10 + i) as u32, begin_atom: i, end_atom: i + 1, order: 1, display: BondDisplay::Solid, visible: true, ignore_warnings: false });
+        }
+        let h = predict_1h_nmr(&m);
+        let ch2 = h.peaks.iter().find(|p| p.atom_idx == 1).unwrap();
+        assert_eq!(ch2.multiplicity, "sept", "CH2 flanked by 6 H must be a septet");
+        assert_eq!(h.peaks.iter().find(|p| p.atom_idx == 0).unwrap().multiplicity, "t");
+        let spec = h.simulate_spectrum(0.0, 3.0, 2000);
+        assert!(spec.iter().all(|p| p.1.is_finite() && p.1 <= 1.0 + 1e-12));
     }
 }

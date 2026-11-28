@@ -36,6 +36,14 @@ pub fn fallback_export_path(suggested_name: &str) -> PathBuf {
     default_export_dir().join(safe_name)
 }
 
+/// Extracts the chosen path from a dialog helper's stdout. Only the trailing line terminator is
+/// stripped: leading/trailing spaces are legal in file names and must be preserved.
+fn dialog_stdout_path(stdout: &[u8]) -> String {
+    let s = String::from_utf8_lossy(stdout);
+    let first = s.lines().next().unwrap_or("");
+    first.trim_end_matches(['\r', '\n']).to_string()
+}
+
 /// Opens a native OS "Open File" dialog and returns the selected path, or `None` if cancelled / headless.
 pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
     if cfg!(test) {
@@ -55,7 +63,9 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
             let joined = filter_pats.join(";");
             format!("Supported ({joined})|{joined}|All files (*.*)|*.*")
         };
-        const PS_OPEN: &str = "Add-Type -AssemblyName System.Windows.Forms; \
+        // UTF-8 stdout: the default OEM code page mangles non-ASCII paths.
+        const PS_OPEN: &str = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+            Add-Type -AssemblyName System.Windows.Forms; \
             $d = New-Object System.Windows.Forms.OpenFileDialog; \
             $d.Title = $env:CC_DLG_TITLE; \
             $d.Filter = $env:CC_DLG_FILTER; \
@@ -68,7 +78,7 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
             .output()
         {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -86,7 +96,7 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
             .output()
         {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -114,7 +124,7 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
         }
         if let Ok(out) = zcmd.stdin(Stdio::null()).output() {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -141,7 +151,7 @@ pub fn pick_open_file(title: &str, extensions: &[&str]) -> Option<String> {
             .output()
         {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -167,7 +177,8 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
-        const PS_SAVE: &str = "Add-Type -AssemblyName System.Windows.Forms; \
+        const PS_SAVE: &str = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+            Add-Type -AssemblyName System.Windows.Forms; \
             $d = New-Object System.Windows.Forms.SaveFileDialog; \
             $d.Title = $env:CC_DLG_TITLE; \
             $d.FileName = $env:CC_DLG_FILENAME; \
@@ -180,7 +191,7 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
             .output()
         {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -199,7 +210,7 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
             .output()
         {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -225,7 +236,7 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
             .output()
         {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -240,7 +251,7 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
             .output()
         {
             if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let s = dialog_stdout_path(&out.stdout);
                 if !s.is_empty() {
                     return Some(s);
                 }
@@ -254,12 +265,17 @@ pub fn pick_save_file(title: &str, suggested_name: &str) -> Option<String> {
 /// only when running headless/without a native dialog binary, never `/tmp/...`).
 pub fn save_text_with_dialog(title: &str, suggested_name: &str, content: &str) -> Result<Option<String>, String> {
     if cfg!(test) {
-        let p = std::env::temp_dir().join(suggested_name);
-        std::fs::write(&p, content).map_err(|e| e.to_string())?;
-        return Ok(Some(p.to_string_lossy().to_string()));
+        let safe_name = fallback_export_path(suggested_name)
+            .file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_else(|| "chiralcraft-export".into());
+        let p = std::env::temp_dir().join(safe_name);
+        let ps = p.to_string_lossy().to_string();
+        crate::io_bridge::atomic_write_text(&ps, content)?;
+        return Ok(Some(ps));
     }
     if let Some(chosen) = pick_save_file(title, suggested_name) {
-        std::fs::write(&chosen, content).map_err(|e| e.to_string())?;
+        crate::io_bridge::atomic_write_text(&chosen, content)?;
         Ok(Some(chosen))
     } else {
         Ok(None)
@@ -276,5 +292,20 @@ mod tests {
         assert!(!dir.as_os_str().is_empty());
         let p = fallback_export_path("aspirin-ftir.svg");
         assert!(p.file_name().and_then(|s| s.to_str()) == Some("aspirin-ftir.svg"));
+    }
+
+    #[test]
+    fn test_dialog_stdout_path_keeps_spaces_and_strips_newline() {
+        assert_eq!(dialog_stdout_path(b"/home/u/ my file .mol \n"), "/home/u/ my file .mol ");
+        assert_eq!(dialog_stdout_path(b"C:\\x\\a.cdxml\r\n"), "C:\\x\\a.cdxml");
+        assert_eq!(dialog_stdout_path(b""), "");
+    }
+
+    #[test]
+    fn test_save_text_with_dialog_rejects_traversal_in_suggested_name() {
+        let p = save_text_with_dialog("t", "../../audit_b_traversal.txt", "x").unwrap().unwrap();
+        let pb = std::path::PathBuf::from(&p);
+        assert_eq!(pb.parent(), Some(std::env::temp_dir().as_path()));
+        let _ = std::fs::remove_file(pb);
     }
 }

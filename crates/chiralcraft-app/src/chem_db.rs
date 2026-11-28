@@ -254,6 +254,10 @@ impl<'a> JsonParser<'a> {
                                 .get(self.pos..self.pos + 4)
                                 .ok_or_else(|| "Truncated \\u escape".to_string())?;
                             let hex_s = std::str::from_utf8(hex).map_err(|_| "Bad \\u UTF-8")?;
+                            // from_str_radix alone would accept a leading '+' (e.g. "\u+041")
+                            if !hex.iter().all(|c| c.is_ascii_hexdigit()) {
+                                return Err(format!("Bad \\u hex {hex_s}"));
+                            }
                             let code = u32::from_str_radix(hex_s, 16)
                                 .map_err(|_| format!("Bad \\u hex {hex_s}"))?;
                             self.pos += 4;
@@ -277,9 +281,8 @@ impl<'a> JsonParser<'a> {
                                     }
                                 }
                             }
-                            if let Some(ch) = char::from_u32(code) {
-                                out.push(ch);
-                            }
+                            // Unpaired surrogates are not scalar values: substitute U+FFFD instead of dropping them
+                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
                         }
                         other => out.push(other as char),
                     }
@@ -624,6 +627,9 @@ fn format_chembl_phase(raw: Option<&JsonValue>) -> Option<String> {
         Some("Phase I".to_string())
     } else if v > 0.0 {
         Some("Early Phase I".to_string())
+    } else if v < 0.0 {
+        // ChEMBL uses -1 for "clinical phase unknown"
+        Some("Unknown Phase".to_string())
     } else {
         Some("Preclinical".to_string())
     }
@@ -961,9 +967,9 @@ fn query_pubchem(query: &str, mode: DbSearchMode, sim_threshold: u32) -> Result<
                 let body = http_get(&url, "application/json", 14)?;
                 parse_pubchem_properties_json(&body)?
             } else {
-                // Exact name / synonym / CAS match first
+                // Exact name / synonym / CAS match first (query param: PubChem rejects %2F in path segments)
                 let url = format!(
-                    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{enc}/property/{PUBCHEM_PROPS}/JSON"
+                    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/property/{PUBCHEM_PROPS}/JSON?name={enc}"
                 );
                 let mut res = match http_get(&url, "application/json", 12) {
                     Ok(body) => parse_pubchem_properties_json(&body).unwrap_or_default(),
@@ -979,7 +985,7 @@ fn query_pubchem(query: &str, mode: DbSearchMode, sim_threshold: u32) -> Result<
                         let mut seen_cids = HashSet::new();
                         for term in terms.into_iter().take(5) {
                             let t_url = format!(
-                                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{}/property/{PUBCHEM_PROPS}/JSON",
+                                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/property/{PUBCHEM_PROPS}/JSON?name={}",
                                 url_encode(&term)
                             );
                             if let Ok(tb) = http_get(&t_url, "application/json", 8) {
@@ -999,7 +1005,7 @@ fn query_pubchem(query: &str, mode: DbSearchMode, sim_threshold: u32) -> Result<
         }
         DbSearchMode::ExactSmiles => {
             let url = format!(
-                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/{enc}/property/{PUBCHEM_PROPS}/JSON"
+                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/property/{PUBCHEM_PROPS}/JSON?smiles={enc}"
             );
             let body = http_get(&url, "application/json", 12)?;
             parse_pubchem_properties_json(&body)?
@@ -1007,14 +1013,14 @@ fn query_pubchem(query: &str, mode: DbSearchMode, sim_threshold: u32) -> Result<
         DbSearchMode::Similarity2D => {
             let thr = sim_threshold.clamp(60, 99);
             let url = format!(
-                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastsimilarity_2d/smiles/{enc}/property/{PUBCHEM_PROPS}/JSON?Threshold={thr}&MaxRecords=15"
+                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastsimilarity_2d/smiles/property/{PUBCHEM_PROPS}/JSON?smiles={enc}&Threshold={thr}&MaxRecords=15"
             );
             let body = http_get(&url, "application/json", 15)?;
             parse_pubchem_properties_json(&body)?
         }
         DbSearchMode::Substructure => {
             let url = format!(
-                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastsubstructure/smiles/{enc}/property/{PUBCHEM_PROPS}/JSON?MaxRecords=15"
+                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastsubstructure/smiles/property/{PUBCHEM_PROPS}/JSON?smiles={enc}&MaxRecords=15"
             );
             let body = http_get(&url, "application/json", 15)?;
             parse_pubchem_properties_json(&body)?
@@ -1899,7 +1905,7 @@ impl LiveNameResolver {
         thread::spawn(move || {
             let enc = url_encode(&key);
             let url = format!(
-                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/{enc}/property/Title,IUPACName/JSON"
+                "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/property/Title,IUPACName/JSON?smiles={enc}"
             );
             let resolved = match http_get(&url, "application/json", 8)
                 .and_then(|body| parse_pubchem_properties_json(&body))
@@ -2210,5 +2216,31 @@ $$$$
             failed: false,
         };
         assert_eq!(same.format_display().as_deref(), Some("ethanol"));
+    }
+
+    #[test]
+    fn test_json_unicode_escape_edge_cases() {
+        // Valid surrogate pair -> U+1F600
+        let v = JsonValue::parse(r#""\uD83D\uDE00""#).unwrap();
+        assert_eq!(v.as_str(), Some("\u{1F600}"));
+        // Lone surrogates become U+FFFD rather than vanishing
+        let v = JsonValue::parse(r#""a\uD83Db""#).unwrap();
+        assert_eq!(v.as_str(), Some("a\u{FFFD}b"));
+        let v = JsonValue::parse(r#""\uDE00""#).unwrap();
+        assert_eq!(v.as_str(), Some("\u{FFFD}"));
+        // Non-hex digits (incl. '+') rejected
+        assert!(JsonValue::parse(r#""\u+041""#).is_err());
+    }
+
+    #[test]
+    fn test_chembl_unknown_phase() {
+        assert_eq!(
+            format_chembl_phase(Some(&JsonValue::Number(-1.0))).as_deref(),
+            Some("Unknown Phase")
+        );
+        assert_eq!(
+            format_chembl_phase(Some(&JsonValue::String("0.5".into()))).as_deref(),
+            Some("Early Phase I")
+        );
     }
 }

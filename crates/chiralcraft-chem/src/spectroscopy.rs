@@ -224,8 +224,10 @@ impl IrPrediction {
         if samples < 2 {
             return Vec::new();
         }
-        let hi = params.x_max_cm1.max(params.x_min_cm1 + 10.0);
-        let lo = params.x_min_cm1.min(hi - 10.0);
+        // Accept a swapped range (min > max) instead of collapsing it to a 10 cm⁻¹ window.
+        let (a, b) = (params.x_min_cm1.min(params.x_max_cm1), params.x_min_cm1.max(params.x_max_cm1));
+        let hi = b.max(a + 10.0);
+        let lo = a.min(hi - 10.0);
         let span = hi - lo;
         let global_hwhm = (params.fwhm_cm1 * 0.5).max(2.0);
         let mut out = Vec::with_capacity(samples);
@@ -1091,10 +1093,11 @@ pub fn predict_uv_vis(mol: &ChemMolecule) -> UvVisPrediction {
             }
         }
         for i in 0..n {
-            if matches!(mol.atoms[i].z, 7 | 8) {
+            // Lone-pair donor (NR2/OR) only: π-atoms (nitro N/O, pyridine N, azo N, C=O) are not donors.
+            if matches!(mol.atoms[i].z, 7 | 8) && !is_pi[i] {
                 // Donor must be attached directly to an aromatic/alkene carbon of best_comp (NOT a carboxylic -OH on C=O)
                 let attached_to_arom_or_alkene = adj[i].iter().any(|&(k, o)| {
-                    if o != 1 || !in_best.contains(&k) {
+                    if o != 1 || !in_best.contains(&k) || mol.atoms[k].z != 6 {
                         return false;
                     }
                     let is_carbonyl_c = mol.atoms[k].z == 6 && adj[k].iter().any(|&(m, mo)| mol.atoms[m].z == 8 && mo == 2);
@@ -1372,5 +1375,44 @@ mod tests {
 
         let jdx = ir.to_jcamp_dx("Cyclobutanone", &params, 120);
         assert!(jdx.contains("##DATA TYPE=INFRARED SPECTRUM") && jdx.contains("##XYDATA=(X++(Y..Y))"));
+
+        let swapped = IrRenderParams { x_min_cm1: params.x_max_cm1, x_max_cm1: params.x_min_cm1, ..params.clone() };
+        let sw = ir.simulate_absorbance(&swapped, 400);
+        assert!((sw[0].0 - sw[sw.len() - 1].0).abs() > 1000.0, "swapped range must not collapse");
+    }
+
+    fn benzene_with(subs: &[(usize, u8)]) -> ChemMolecule {
+        // Kekulé benzene; each (ring_idx, z) adds a substituent atom; z=7 with nitro flag via extra Os below.
+        let mut m = ChemMolecule::new();
+        for id in 0..6 {
+            m.add_atom(ChemAtom::new(id + 1, 6));
+        }
+        for i in 0..6 {
+            m.add_bond(20 + i as u32, i, (i + 1) % 6, if i % 2 == 0 { 2 } else { 1 }, BondDisplay::Solid);
+        }
+        let mut id = 100u32;
+        for &(r, kind) in subs {
+            let nidx = m.add_atom(ChemAtom::new(id, 7));
+            m.add_bond(id + 500, r, nidx, 1, BondDisplay::Solid);
+            id += 1;
+            if kind == 1 {
+                // nitro: N(=O)O
+                for order in [2, 1] {
+                    let o = m.add_atom(ChemAtom::new(id, 8));
+                    m.add_bond(id + 500, nidx, o, order, BondDisplay::Solid);
+                    id += 1;
+                }
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn test_uv_nitro_group_is_acceptor_not_donor() {
+        let nitro = predict_uv_vis(&benzene_with(&[(0, 1)]));
+        let pna = predict_uv_vis(&benzene_with(&[(0, 1), (3, 0)]));
+        assert!(!nitro.chromophore.contains("Push"), "nitrobenzene is not push–pull: {}", nitro.chromophore);
+        assert!(pna.chromophore.contains("Push"), "p-nitroaniline is push–pull: {}", pna.chromophore);
+        assert!(nitro.lambda_max_nm < pna.lambda_max_nm);
     }
 }

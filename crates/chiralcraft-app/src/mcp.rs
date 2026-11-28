@@ -708,8 +708,16 @@ fn dispatch_tool(name: &str, args: Option<&JsonValue>) -> Result<String, String>
 pub fn run_mcp_stdio_server() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    for line_res in stdin.lock().lines() {
-        let Ok(line) = line_res else { break };
+    let mut input = stdin.lock();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // read_until (not lines()) so one non-UTF-8 line yields a parse error instead of killing the server
+        match input.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&buf);
         if let Some(reply) = handle_mcp_request(&line) {
             let _ = writeln!(stdout, "{reply}");
             let _ = stdout.flush();

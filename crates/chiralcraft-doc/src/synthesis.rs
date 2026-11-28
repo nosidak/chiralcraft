@@ -92,9 +92,20 @@ fn replace_r_site(mol: &mut ChemMolecule, r_idx: usize, sub_smiles: &str) {
         return;
     }
     // Replace R atom with atom 0 of substituent, then append remaining substituent atoms & bonds
-    mol.atoms[r_idx].z = sub.atoms[0].z;
-    mol.atoms[r_idx].charge = sub.atoms[0].charge;
-    mol.atoms[r_idx].label = None;
+    {
+        // R placeholders are often query/unspecified pseudo-atoms; clear every R-specific flag so the
+        // substituent's first atom is perceived as a real atom (implicit H, valence) afterwards.
+        let (s0, r) = (&sub.atoms[0], &mut mol.atoms[r_idx]);
+        r.z = s0.z;
+        r.charge = s0.charge;
+        r.isotope = s0.isotope;
+        r.radical = s0.radical;
+        r.valence_override = s0.valence_override;
+        r.explicit_num_hydrogens = s0.explicit_num_hydrogens;
+        r.is_query = false;
+        r.is_unspecified_label = false;
+        r.label = None;
+    }
 
     let mut map = vec![0usize; sub.atoms.len()];
     map[0] = r_idx;
@@ -413,6 +424,14 @@ pub fn suggest_disconnections(mol: &ChemMolecule, bond_len: f64) -> Vec<Retrosyn
     let heavy_deg = |idx: usize| -> usize {
         adj[idx].iter().filter(|&&(k, _, _)| mol.atoms[k].z > 1).count()
     };
+    // Sum of bond orders to heavy neighbours (only used on non-aromatic atoms).
+    let heavy_valence = |idx: usize| -> i32 {
+        adj[idx]
+            .iter()
+            .filter(|&&(k, _, _)| mol.atoms[k].z > 1)
+            .map(|&(_, _, o)| o.max(1))
+            .sum()
+    };
 
     let mut hits = Vec::new();
     for (bi, b) in mol.bonds.iter().enumerate() {
@@ -427,9 +446,10 @@ pub fn suggest_disconnections(mol: &ChemMolecule, bond_len: f64) -> Vec<Retrosyn
                 Some(("Amide Coupling (HATU / EDC)", "HATU, DIPEA, DMF, rt", 98, Some((8, 1)), None))
             } else if has_carbonyl(v) && zu == 7 {
                 Some(("Amide Coupling (HATU / EDC)", "HATU, DIPEA, DMF, rt", 98, None, Some((8, 1))))
-            } else if has_carbonyl(u) && zv == 8 {
+            } else if has_carbonyl(u) && zv == 8 && heavy_deg(v) >= 2 {
+                // Ester O must carry a second heavy atom; C(=O)-OH is a free acid, not an ester.
                 Some(("Esterification (EDC / DMAP)", "EDC·HCl, DMAP, DCM, rt", 94, Some((8, 1)), None))
-            } else if has_carbonyl(v) && zu == 8 {
+            } else if has_carbonyl(v) && zu == 8 && heavy_deg(u) >= 2 {
                 Some(("Esterification (EDC / DMAP)", "EDC·HCl, DMAP, DCM, rt", 94, None, Some((8, 1))))
             } else if has_sulfonyl(u) && zv == 7 {
                 Some(("Sulfonamide Coupling", "Et3N or Pyridine, DCM, 0 °C → rt", 95, Some((17, 1)), None))
@@ -441,13 +461,15 @@ pub fn suggest_disconnections(mol: &ChemMolecule, bond_len: f64) -> Vec<Retrosyn
                 Some(("Buchwald–Hartwig C–N Amination", "Pd2(dba)3, BrettPhos, NaOtBu, dioxane, 100 °C", 90, Some((35, 1)), None))
             } else if zv == 6 && arom.is_atom_aromatic(v) && zu == 7 && !has_carbonyl(v) {
                 Some(("Buchwald–Hartwig C–N Amination", "Pd2(dba)3, BrettPhos, NaOtBu, dioxane, 100 °C", 90, None, Some((35, 1))))
-            } else if zu == 8 && zv == 6 && !has_carbonyl(v) && !arom.is_atom_aromatic(v) {
+            } else if zu == 8 && zv == 6 && heavy_deg(u) >= 2 && !has_carbonyl(v) && !arom.is_atom_aromatic(v) {
+                // Only true ethers (O with two heavy neighbours); C–OH would "disconnect" to R–Br + H2O.
                 Some(("Williamson Ether Synthesis", "NaH or K2CO3, DMF, 60 °C", 85, None, Some((35, 1))))
-            } else if zv == 8 && zu == 6 && !has_carbonyl(u) && !arom.is_atom_aromatic(u) {
+            } else if zv == 8 && zu == 6 && heavy_deg(v) >= 2 && !has_carbonyl(u) && !arom.is_atom_aromatic(u) {
                 Some(("Williamson Ether Synthesis", "NaH or K2CO3, DMF, 60 °C", 85, Some((35, 1)), None))
-            } else if zu == 7 && zv == 6 && !has_carbonyl(v) && !arom.is_atom_aromatic(v) && heavy_deg(v) <= 3 {
+            } else if zu == 7 && zv == 6 && !has_carbonyl(v) && !arom.is_atom_aromatic(v) && heavy_valence(v) <= 3 {
+                // After cutting C–N the carbon gains C=O (2 valences): remaining heavy valence must be ≤ 2.
                 Some(("Reductive Amination", "NaBH(OAc)3, AcOH, DCE, rt", 82, None, Some((8, 2))))
-            } else if zv == 7 && zu == 6 && !has_carbonyl(u) && !arom.is_atom_aromatic(u) && heavy_deg(u) <= 3 {
+            } else if zv == 7 && zu == 6 && !has_carbonyl(u) && !arom.is_atom_aromatic(u) && heavy_valence(u) <= 3 {
                 Some(("Reductive Amination", "NaBH(OAc)3, AcOH, DCE, rt", 82, Some((8, 2)), None))
             } else if has_carbonyl(u) && zv == 6 && arom.is_atom_aromatic(v) {
                 Some(("Friedel–Crafts Acylation", "AlCl3, DCM, 0 °C → rt", 80, Some((17, 1)), None))
@@ -808,5 +830,37 @@ mod tests {
         }
         assert_eq!(wrap_serpentine_reaction_scheme(&mut scene, &mut nid, 2), 4);
         assert_eq!(scene.arrows.len(), 3);
+    }
+
+    #[test]
+    fn test_no_bogus_ester_williamson_or_overvalent_reductive_amination() {
+        // Free acid / alcohol must not be "disconnected" as ester or ether.
+        let acid = smiles_to_molecule("CCC(=O)O").unwrap();
+        assert!(!suggest_disconnections(&acid, 14.4).iter().any(|h| h.reaction_name.contains("Ester")));
+        let alcohol = smiles_to_molecule("CCCO").unwrap();
+        assert!(!suggest_disconnections(&alcohol, 14.4).iter().any(|h| h.reaction_name.contains("Williamson")));
+        // Real ester / ether still found.
+        let ester = smiles_to_molecule("CC(=O)OCC").unwrap();
+        assert!(suggest_disconnections(&ester, 14.4).iter().any(|h| h.reaction_name.contains("Ester")));
+        let ether = smiles_to_molecule("CCOCC").unwrap();
+        assert!(suggest_disconnections(&ether, 14.4).iter().any(|h| h.reaction_name.contains("Williamson")));
+        // Enamine vinyl carbon: C=C + C + N; adding C=O would give a 5-valent carbon.
+        let enamine = smiles_to_molecule("CC(=C)N(C)C").unwrap();
+        let hits = suggest_disconnections(&enamine, 14.4);
+        assert!(!hits.iter().any(|h| h.reaction_name.contains("Reductive") && (h.atom_u == 1 || h.atom_v == 1)));
+    }
+
+    #[test]
+    fn test_rgroup_replacement_clears_query_flags() {
+        let mut core = smiles_to_molecule("c1ccccc1C").unwrap();
+        core.atoms[6].label = Some("R1".to_string());
+        core.atoms[6].is_query = true;
+        core.atoms[6].is_unspecified_label = true;
+        core.atoms[6].explicit_num_hydrogens = Some(0);
+        let analogs = enumerate_rgroup_library(&core, "Me", "", 14.4);
+        assert_eq!(analogs.len(), 1);
+        let a = &analogs[0].molecule.atoms[6];
+        assert!(!a.is_query && !a.is_unspecified_label && a.label.is_none());
+        assert_eq!(a.explicit_num_hydrogens, None);
     }
 }

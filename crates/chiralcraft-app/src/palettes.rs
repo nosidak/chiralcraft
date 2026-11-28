@@ -398,7 +398,9 @@ pub fn show_properties_window(
                             lines.push(format!("{lbl} {val}"));
                         }
                     }
-                    paste_text = Some(lines.join("\n"));
+                    if !lines.is_empty() {
+                        paste_text = Some(lines.join("\n"));
+                    }
                 }
                 if ui.button("   Report   ").clicked() {
                     let mut lines = Vec::new();
@@ -528,7 +530,8 @@ fn draw_molecule_thumbnail(ui: &mut egui::Ui, mol: &ChemMolecule, idx: usize) ->
                     if b.order == 2 {
                         p.line_segment([p1 + n * 1.1, p2 + n * 1.1], Stroke::new(1.0_f32, Color32::BLACK));
                         p.line_segment([p1 - n * 1.1, p2 - n * 1.1], Stroke::new(1.0_f32, Color32::BLACK));
-                    } else if b.order >= 3 {
+                    } else if b.order == 3 || b.order == 4 {
+                        // 5+ codes are dative/aromatic/H-bond/any, not triple bonds
                         p.line_segment([p1 + n * 1.5, p2 + n * 1.5], Stroke::new(0.9_f32, Color32::BLACK));
                         p.line_segment([p1, p2], Stroke::new(0.9_f32, Color32::BLACK));
                         p.line_segment([p1 - n * 1.5, p2 - n * 1.5], Stroke::new(0.9_f32, Color32::BLACK));

@@ -229,7 +229,8 @@ fn fuse_ring_to_bond(
             } else {
                 1
             }
-        } else if cpd && k == 2 {
+        } else if cpd && (if shared_or_adj_double { k == 2 } else { k == 1 || k == 3 }) {
+            // Cyclopentadiene needs two non-adjacent C=C; if the fused atoms already carry one, only k2 is safe
             2
         } else {
             1
@@ -261,6 +262,17 @@ fn fuse_ring_to_bond(
         visible: true,
         ignore_warnings: false,
     });
+}
+
+/// Element of the atom through which a hotkey nickname attaches; `None` for generic labels (R, X, ?).
+fn nickname_attachment_z(lbl: &str) -> Option<i32> {
+    match lbl {
+        "Et" | "Me" | "Ph" | "CF3" | "CO2Me" | "Cbz" | "Boc" | "Fmoc" => Some(6),
+        "NO2" | "N3" => Some(7),
+        "OMe" => Some(8),
+        "MgBr" => Some(12),
+        _ => None,
+    }
 }
 
 /// Applies an exact case-sensitive hotkey character from `hotkeys.xml` for the Atom context.
@@ -318,6 +330,10 @@ pub fn apply_atom_hotkey(doc: &mut InteractiveDocument, mi: usize, ai: usize, ch
                     a.isotope = 0;
                     a.label = None;
                 } else {
+                    // Attachment element of the group, so formula/valence don't inherit the previous atom's element
+                    if let Some(z) = nickname_attachment_z(lbl) {
+                        a.z = z;
+                    }
                     a.isotope = 0;
                     a.label = Some(lbl.to_string());
                 }
@@ -626,5 +642,52 @@ pub fn apply_generic_hotkey(ch: char) -> HotkeyOutcome {
         '=' => HotkeyOutcome::OpenChooseNickname,
         '/' | '?' => HotkeyOutcome::OpenPropertiesDialog,
         _ => HotkeyOutcome::NotMatched,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nickname_hotkeys_set_attachment_element() {
+        assert_eq!(nickname_attachment_z("Et"), Some(6));
+        assert_eq!(nickname_attachment_z("NO2"), Some(7));
+        assert_eq!(nickname_attachment_z("OMe"), Some(8));
+        assert_eq!(nickname_attachment_z("R"), None);
+        // Every hotkey label that is neither an element nor generic must have an attachment element
+        for ch in ('a'..='z').chain('A'..='Z') {
+            let mut doc = InteractiveDocument::new_saved_seed("t", chiralcraft_doc::DocumentSettings::acs_document_1996());
+            let mut mol = ChemMolecule::default();
+            let mut a = ChemAtom::new(1, 16);
+            a.x = 0.0;
+            mol.atoms.push(a);
+            doc.scene.molecules.push(mol);
+            apply_atom_hotkey(&mut doc, 0, 0, ch);
+            let atom = &doc.scene.molecules[0].atoms[0];
+            if let Some(lbl) = atom.label.as_deref() {
+                if !matches!(lbl, "R" | "X" | "?" | "D") {
+                    assert_ne!(atom.z, 16, "hotkey {ch:?} label {lbl} kept previous element S");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_fused_cyclopentadiene_has_two_nonadjacent_double_bonds() {
+        let mut mol = ChemMolecule::default();
+        for (i, x) in [0.0, 14.4].iter().enumerate() {
+            let mut a = ChemAtom::new(i as u32 + 1, 6);
+            a.x = *x;
+            mol.atoms.push(a);
+        }
+        mol.add_bond(3, 0, 1, 1, BondDisplay::Solid);
+        let mut nid = 10;
+        fuse_ring_to_bond(&mut mol, 0, 5, false, true, 14.4, &mut nid);
+        assert_eq!(mol.atoms.len(), 5);
+        let doubles: Vec<&ChemBond> = mol.bonds.iter().filter(|b| b.order == 2).collect();
+        assert_eq!(doubles.len(), 2);
+        let (a, b) = (doubles[0], doubles[1]);
+        assert!(![a.begin_atom, a.end_atom].iter().any(|x| *x == b.begin_atom || *x == b.end_atom));
     }
 }

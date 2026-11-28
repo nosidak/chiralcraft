@@ -361,6 +361,7 @@ pub fn parse_jcamp_dx(text: &str) -> Result<JcampSpectrum, String> {
 
     let mut in_xydata = false;
     let mut in_peak_table = false;
+    let mut peak_group = 2usize;
     let mut raw_xy: Vec<(f64, f64)> = Vec::new();
     let mut row_ys: Vec<(f64, Vec<f64>, bool)> = Vec::new();
 
@@ -372,27 +373,38 @@ pub fn parse_jcamp_dx(text: &str) -> Result<JcampSpectrum, String> {
         if trim.starts_with("##") {
             in_xydata = false;
             in_peak_table = false;
-            let upper = trim.to_ascii_uppercase();
-            let val = trim.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            let (label, val) = match trim[2..].split_once('=') {
+                Some((l, v)) => (l, v.trim()),
+                None => (&trim[2..], ""),
+            };
+            // JCAMP-DX labels ignore case, spaces, dashes, slashes and underscores
+            // (`##DATATYPE=`, `##Data_Type=`, `##DATA TYPE=` are the same label).
+            let key: String = label
+                .chars()
+                .filter(|c| !matches!(c, ' ' | '-' | '/' | '_' | '\t'))
+                .map(|c| c.to_ascii_uppercase())
+                .collect();
+            let upper = format!("##{}=", key);
             let val_up = val.to_ascii_uppercase();
             if upper.starts_with("##TITLE=") {
                 if !val.is_empty() {
                     title = val.to_string();
                 }
-            } else if upper.starts_with("##DATA TYPE=") {
-                if val_up.contains("INFRARED") || val_up.contains("IR") {
+            } else if upper.starts_with("##DATATYPE=") {
+                // Word match for "IR": a substring test would classify e.g. "CIRCULAR DICHROISM" as IR.
+                if val_up.contains("INFRARED") || val_up.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "IR") {
                     data_type = JcampDataType::Infrared;
                 } else if val_up.contains("NMR") {
                     data_type = JcampDataType::Nmr;
                 } else if val_up.contains("UV") {
                     data_type = JcampDataType::UvVis;
                 }
-            } else if upper.starts_with("##.OBSERVE NUCLEUS=") || upper.starts_with("##NUCLEUS=") {
+            } else if upper.starts_with("##.OBSERVENUCLEUS=") || upper.starts_with("##NUCLEUS=") {
                 let clean = val.trim_start_matches('^').trim();
                 if !clean.is_empty() {
                     nucleus = clean.to_string();
                 }
-            } else if upper.starts_with("##.OBSERVE FREQUENCY=") || upper.starts_with("##SF=") {
+            } else if upper.starts_with("##.OBSERVEFREQUENCY=") || upper.starts_with("##SF=") {
                 obs_freq = val.split_whitespace().next().and_then(|s| s.parse().ok());
             } else if upper.starts_with("##XUNITS=") {
                 if val_up.contains("1/CM") || val_up.contains("CM-1") || val_up.contains("WAVENUMBER") {
@@ -437,12 +449,17 @@ pub fn parse_jcamp_dx(text: &str) -> Result<JcampSpectrum, String> {
             } else if upper.starts_with("##XYDATA=") {
                 if val_up.contains("XY..XY") {
                     in_peak_table = true;
+                    peak_group = 2;
                 } else {
                     in_xydata = true;
                 }
-            } else if upper.starts_with("##PEAK TABLE=") || upper.starts_with("##XYPOINTS=") {
+            } else if upper.starts_with("##PEAKTABLE=") || upper.starts_with("##XYPOINTS=") {
                 if row_ys.is_empty() {
                     in_peak_table = true;
+                    // "(XY..XY)" = 2 values per group, "(XYW..XYW)"/"(XYM..XYM)" = 3.
+                    let vars = val_up.trim_start_matches('(').split("..").next().unwrap_or("");
+                    let n = vars.chars().filter(|c| c.is_ascii_alphabetic()).count();
+                    peak_group = if (2..=8).contains(&n) { n } else { 2 };
                 }
             }
             continue;
@@ -463,8 +480,8 @@ pub fn parse_jcamp_dx(text: &str) -> Result<JcampSpectrum, String> {
                     .split(|c: char| c == ',' || c.is_whitespace())
                     .filter_map(|t| t.trim().parse::<f64>().ok())
                     .collect();
-                for pair in parts.chunks(2) {
-                    if pair.len() == 2 {
+                for pair in parts.chunks(peak_group) {
+                    if pair.len() >= 2 {
                         raw_xy.push((pair[0] * x_factor, pair[1] * y_factor));
                     }
                 }
@@ -661,6 +678,23 @@ pub fn parse_experimental_ir_file(path: &str, text: &str) -> Result<JcampSpectru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_jcamp_label_normalization_xyw_peak_table_and_ir_word_match() {
+        let sample = "##TITLE=Peaks\n##DataType=NMR PEAK TABLE\n##X_UNITS=PPM\n##PEAKTABLE=(XYW..XYW)\n1.0,10.0,1.0 2.0,20.0,1.0 3.0,30.0,2.0\n##END=\n";
+        let spec = parse_jcamp_dx(sample).expect("parse");
+        assert_eq!(spec.data_type, JcampDataType::Nmr);
+        assert_eq!(spec.x_units, JcampXUnit::Ppm);
+        assert_eq!(spec.points.len(), 3, "XYW triplets must yield 3 peaks: {:?}", spec.points);
+        let mut ys: Vec<f64> = spec.raw_points.iter().map(|p| p.1).collect();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(ys, vec![10.0, 20.0, 30.0]);
+
+        let cd = "##TITLE=x\n##DATA TYPE=CIRCULAR DICHROISM\n##XYPOINTS=(XY..XY)\n200,1;210,2\n##END=\n";
+        assert_ne!(parse_jcamp_dx(cd).unwrap().data_type, JcampDataType::Infrared);
+        let ir = "##TITLE=x\n##DATA TYPE=IR SPECTRUM\n##XYPOINTS=(XY..XY)\n2000,1;1000,2\n##END=\n";
+        assert_eq!(parse_jcamp_dx(ir).unwrap().data_type, JcampDataType::Infrared);
+    }
 
     #[test]
     fn test_jcamp_dx_xydata_and_peak_table_parsing() {

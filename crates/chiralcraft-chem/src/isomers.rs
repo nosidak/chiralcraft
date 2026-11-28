@@ -93,7 +93,8 @@ pub fn detect_ionizable_sites(mol: &ChemMolecule) -> Vec<IonizableSite> {
                 continue;
             }
             if arom.is_atom_aromatic(i) {
-                if heavy_nbrs.len() == 2 && total_h == 0 {
+                // Neutral pyridine-type N, or its drawn conjugate acid [nH+] (pyridinium)
+                if heavy_nbrs.len() == 2 && (total_h == 0 || (a.charge == 1 && total_h == 1)) {
                     sites.push(IonizableSite { atom_idx: i, label: "Pyridine / Imidazole-like N", pka: 5.3, is_acid: false });
                 }
                 continue;
@@ -109,7 +110,8 @@ pub fn detect_ionizable_sites(mol: &ChemMolecule) -> Vec<IonizableSite> {
                 }
             } else if attached_arom {
                 sites.push(IonizableSite { atom_idx: i, label: "Aniline", pka: 4.6, is_acid: false });
-            } else if heavy_nbrs.len() <= 3 && a.charge <= 0 {
+            } else if heavy_nbrs.len() <= 3 && (a.charge <= 0 || (a.charge == 1 && total_h >= 1)) {
+                // includes a drawn ammonium N+ with H (titratable conjugate acid), not quaternary NR4+
                 sites.push(IonizableSite { atom_idx: i, label: "Aliphatic Amine", pka: 9.8, is_acid: false });
             }
         }
@@ -241,6 +243,9 @@ pub fn enumerate_tautomers(mol: &ChemMolecule, max_count: usize) -> Vec<(String,
                 cand.bonds[bz].order = 2;
                 let sig = bond_signature(&cand);
                 if seen.insert(sig) {
+                    if results.len() >= max_count.max(1) {
+                        return results;
+                    }
                     let desc = match (mol.atoms[x].z, mol.atoms[z].z) {
                         (8, 6) => "Enol tautomer",
                         (6, 8) => "Keto tautomer",
@@ -251,9 +256,6 @@ pub fn enumerate_tautomers(mol: &ChemMolecule, max_count: usize) -> Vec<(String,
                         _ => "1,3-Prototropic tautomer",
                     };
                     results.push((desc.to_string(), cand));
-                    if results.len() >= max_count.max(1) {
-                        return results;
-                    }
                 }
             }
         }
@@ -264,6 +266,15 @@ pub fn enumerate_tautomers(mol: &ChemMolecule, max_count: usize) -> Vec<(String,
 // ============================================================================
 // 3. Stereoisomer Enumerator (2^n Tetrahedral Centers)
 // ============================================================================
+
+/// Atom at the narrow (stereo-defining) end of a wedge/hash bond.
+fn wedge_root(b: &crate::ChemBond) -> Option<usize> {
+    match b.display {
+        BondDisplay::WedgeBegin | BondDisplay::WedgedHashBegin => Some(b.begin_atom),
+        BondDisplay::WedgeEnd | BondDisplay::WedgedHashEnd => Some(b.end_atom),
+        _ => None,
+    }
+}
 
 /// Enumerates tetrahedral stereoisomers by toggling wedged/hashed stereo bonds at perceived
 /// stereocenters (capped at `max_count`, typically 8–16).
@@ -277,9 +288,11 @@ pub fn enumerate_stereoisomers(mol: &ChemMolecule, max_count: usize) -> Vec<(Str
     for (&ai, &code) in &stereo.atom_stereo {
         if code >= 2 && ai < n {
             // Prefer an existing stereo bond, otherwise first single bond from center
+            // (a wedge rooted at a neighbouring center belongs to that center, not this one)
             let chosen = adj[ai]
                 .iter()
-                .find(|&&(_, bi, _)| !matches!(mol.bonds[bi].display, BondDisplay::Solid))
+                .find(|&&(_, bi, _)| wedge_root(&mol.bonds[bi]) == Some(ai))
+                .or_else(|| adj[ai].iter().find(|&&(_, bi, o)| o == 1 && wedge_root(&mol.bonds[bi]).is_none()))
                 .or_else(|| adj[ai].iter().find(|&&(_, _, o)| o == 1))
                 .map(|&(_, bi, _)| bi);
             if let Some(bi) = chosen {
@@ -291,12 +304,11 @@ pub fn enumerate_stereoisomers(mol: &ChemMolecule, max_count: usize) -> Vec<(Str
     }
     // Fallback: also include any explicitly wedged/hashed bond not yet in `center_bonds`
     for (bi, b) in mol.bonds.iter().enumerate() {
-        if matches!(
-            b.display,
-            BondDisplay::WedgeBegin | BondDisplay::WedgeEnd | BondDisplay::WedgedHashBegin | BondDisplay::WedgedHashEnd
-        ) && !center_bonds.iter().any(|&(_, existing)| existing == bi)
-        {
-            center_bonds.push((b.begin_atom, bi));
+        // Root at the narrow end; one toggled bond per center, else toggles would contradict.
+        if let Some(root) = wedge_root(b) {
+            if root < n && !center_bonds.iter().any(|&(c, existing)| existing == bi || c == root) {
+                center_bonds.push((root, bi));
+            }
         }
     }
 
@@ -328,6 +340,8 @@ pub fn enumerate_stereoisomers(mol: &ChemMolecule, max_count: usize) -> Vec<(Str
             .filter_map(|&(ai, _)| match st.atom_stereo.get(&ai).copied() {
                 Some(2) => Some(format!("{}(R)", ai + 1)),
                 Some(3) => Some(format!("{}(S)", ai + 1)),
+                Some(4) => Some(format!("{}(r)", ai + 1)),
+                Some(5) => Some(format!("{}(s)", ai + 1)),
                 _ => None,
             })
             .collect();
@@ -484,7 +498,12 @@ pub fn apply_electron_push_arrow(
         (b.begin_atom == from_atom && b.end_atom == to_atom)
             || (b.begin_atom == to_atom && b.end_atom == from_atom)
     }) {
-        if out.bonds[bi].order >= 2 {
+        let ord = out.bonds[bi].order;
+        if !(1..=4).contains(&ord) {
+            // 5 = dative, 6 = aromatic, 7+ = H-bond/any: decrementing/incrementing would yield a different bond type
+            return Err(format!("Cannot push electrons along a bond of type code {ord}; draw it as a single/double/triple bond"));
+        }
+        if ord >= 2 {
             // Heterolytic π-bond shift onto to_atom: A=B -> A(+)-B(-)
             out.bonds[bi].order -= 1;
             out.atoms[from_atom].charge += 1;
@@ -499,7 +518,7 @@ pub fn apply_electron_push_arrow(
             out.bonds[bi].order += 1;
             out.atoms[from_atom].charge += 1;
             let adj_pi = out.bonds.iter().enumerate().find(|&(k, b)| {
-                k != bi && b.order >= 2 && (b.begin_atom == to_atom || b.end_atom == to_atom)
+                k != bi && (2..=4).contains(&b.order) && (b.begin_atom == to_atom || b.end_atom == to_atom)
             }).map(|(k, b)| (k, if b.begin_atom == to_atom { b.end_atom } else { b.begin_atom }));
             if let Some((pi_idx, sink)) = adj_pi {
                 out.bonds[pi_idx].order -= 1;
@@ -523,7 +542,7 @@ pub fn apply_electron_push_arrow(
     out.atoms[from_atom].charge += 1;
     // If electrophile `to_atom` has a π-bond (e.g. C=O), break it onto its partner!
     let adj_pi = out.bonds.iter().enumerate().find(|&(k, b)| {
-        k + 1 < out.bonds.len() && b.order >= 2 && (b.begin_atom == to_atom || b.end_atom == to_atom)
+        k + 1 < out.bonds.len() && (2..=4).contains(&b.order) && (b.begin_atom == to_atom || b.end_atom == to_atom)
     }).map(|(k, b)| (k, if b.begin_atom == to_atom { b.end_atom } else { b.begin_atom }));
     if let Some((pi_idx, sink)) = adj_pi {
         out.bonds[pi_idx].order -= 1;
@@ -565,6 +584,45 @@ mod tests {
         assert_eq!(phys.formal_charge_sum, 0);
         let pi = phys.isoelectric_point.expect("amphoteric pI");
         assert!((pi - 7.0).abs() < 1.2, "Expected Glycine pI ~6-7, got {pi:.2}");
+    }
+
+    #[test]
+    fn test_drawn_zwitterion_ammonium_is_titratable() {
+        // Glycine drawn as zwitterion: H3N(+)-CH2-C(=O)-O(-)
+        let mut gly = ChemMolecule::new();
+        let mut n = ChemAtom::new(1, 7);
+        n.charge = 1;
+        gly.add_atom(n);
+        gly.add_atom(ChemAtom::new(2, 6));
+        gly.add_atom(ChemAtom::new(3, 6));
+        gly.add_atom(ChemAtom::new(4, 8));
+        let mut o = ChemAtom::new(5, 8);
+        o.charge = -1;
+        gly.add_atom(o);
+        gly.add_bond(10, 0, 1, 1, BondDisplay::Solid);
+        gly.add_bond(11, 1, 2, 1, BondDisplay::Solid);
+        gly.add_bond(12, 2, 3, 2, BondDisplay::Solid);
+        gly.add_bond(13, 2, 4, 1, BondDisplay::Solid);
+        let r = compute_microspecies_at_ph(&gly, 12.0);
+        assert_eq!(r.molecule.atoms[0].charge, 0, "ammonium deprotonates at pH 12");
+        let pi = r.isoelectric_point.expect("pI");
+        assert!((pi - 7.0).abs() < 1.2, "got {pi:.2}");
+    }
+
+    #[test]
+    fn test_counts_respect_max_and_push_rejects_aromatic() {
+        let mut ace = ChemMolecule::new();
+        ace.add_atom(ChemAtom::new(1, 6));
+        ace.add_atom(ChemAtom::new(2, 6));
+        ace.add_atom(ChemAtom::new(3, 8));
+        ace.add_atom(ChemAtom::new(4, 6));
+        ace.add_bond(10, 0, 1, 1, BondDisplay::Solid);
+        ace.add_bond(11, 1, 2, 2, BondDisplay::Solid);
+        ace.add_bond(12, 1, 3, 1, BondDisplay::Solid);
+        assert_eq!(enumerate_tautomers(&ace, 1).len(), 1);
+        let mut arom = ace.clone();
+        arom.bonds[1].order = 6;
+        assert!(apply_electron_push_arrow(&arom, 1, 2).is_err());
     }
 
     #[test]

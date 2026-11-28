@@ -94,13 +94,15 @@ fn perceive_3d_bonds_and_scale_with_transform(
     let mut next_bid = (mol.bonds.len() as u32) + (n as u32) + 1;
     let mut bond_lens_ang = Vec::new();
 
+    // Deuterium/tritium pseudo-atoms (225/226) bond like hydrogen.
+    let eff_z = |z: i32| if z == 225 || z == 226 { 1 } else { z };
     if perceive_bonds {
         for i in 0..n {
-            let zi = mol.atoms[i].z;
+            let zi = eff_z(mol.atoms[i].z);
             let ri = covalent_radius_angstrom(zi);
             let (xi, yi, zci) = coords_ang[i];
             for j in (i + 1)..n {
-                let zj = mol.atoms[j].z;
+                let zj = eff_z(mol.atoms[j].z);
                 if zi == 1 && zj == 1 && n > 2 {
                     continue;
                 }
@@ -197,11 +199,27 @@ pub fn xyz_to_molecule(xyz: &str) -> Result<ChemMolecule, String> {
         if toks.len() < 4 {
             continue;
         }
-        let sym = toks[0].trim_end_matches(|c: char| c.is_ascii_digit() || c == '+' || c == '-');
-        let z = get_element_by_symbol(sym).map(|e| e.z).unwrap_or(6);
-        let x: f64 = toks[1].parse().map_err(|_| format!("Bad X coord at XYZ line {}", idx + 3))?;
-        let y: f64 = toks[2].parse().map_err(|_| format!("Bad Y coord at XYZ line {}", idx + 3))?;
-        let zc: f64 = toks[3].parse().map_err(|_| format!("Bad Z coord at XYZ line {}", idx + 3))?;
+        // Atomic numbers ("6") are a common XYZ element form; otherwise strip label suffixes ("C12", "O2-").
+        let z = match toks[0].parse::<i32>() {
+            Ok(z) if (1..=118).contains(&z) => z,
+            _ => {
+                let sym = toks[0].trim_end_matches(|c: char| c.is_ascii_digit() || c == '+' || c == '-');
+                match sym {
+                    "D" => 225,
+                    "T" => 226,
+                    _ => get_element_by_symbol(sym).map(|e| e.z).unwrap_or(6),
+                }
+            }
+        };
+        let parse_coord = |t: &str, axis: &str| -> Result<f64, String> {
+            t.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| format!("Bad {axis} coord at XYZ line {}", idx + 3))
+        };
+        let x = parse_coord(toks[1], "X")?;
+        let y = parse_coord(toks[2], "Y")?;
+        let zc = parse_coord(toks[3], "Z")?;
         mol.add_atom(ChemAtom::new((coords.len() + 1) as u32, z));
         coords.push((x, y, zc));
     }
@@ -215,7 +233,45 @@ pub fn xyz_to_molecule(xyz: &str) -> Result<ChemMolecule, String> {
 fn parse_cif_float(s: &str) -> Option<f64> {
     // Strip crystallographic standard uncertainty in parentheses, e.g. "12.345(6)" -> 12.345
     let clean = s.split('(').next()?.trim();
-    clean.parse::<f64>().ok()
+    clean.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// CIF data names are case-insensitive, and DDL2/mmCIF writes `_atom_site.fract_x` for `_atom_site_fract_x`.
+fn normalize_cif_tag(tag: &str) -> String {
+    tag.to_ascii_lowercase().replace('.', "_")
+}
+
+/// Splits one CIF line into value tokens: honours `'...'`/`"..."` quoting (a quote only closes when
+/// followed by whitespace) and stops at a `#` comment outside quotes.
+fn cif_line_tokens(line: &str) -> Vec<&str> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] == b'#' {
+            break;
+        }
+        let q = b[i];
+        if q == b'\'' || q == b'"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && !(b[j] == q && (j + 1 == b.len() || b[j + 1].is_ascii_whitespace())) {
+                j += 1;
+            }
+            out.push(&line[start..j.min(b.len())]);
+            i = j + 1;
+        } else {
+            let start = i;
+            while i < b.len() && !b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            out.push(&line[start..i]);
+        }
+    }
+    out
 }
 
 fn extract_cif_element(raw: &str) -> i32 {
@@ -275,6 +331,11 @@ fn extract_pdb_element(line: &str) -> i32 {
         }
     }
     let trimmed = name_col.trim();
+    // 4-character hydrogen names start in column 13 ("HG21", "HE21", "HO5'", "HD11"); a real
+    // two-letter element there (Hg, He, Ho) is at most 2 characters long ("HG  ").
+    if (c0 == b'H' || c0 == b'h') && trimmed.len() > 2 {
+        return 1;
+    }
     // Standard protein/nucleic organic atom names: CA/CB/CG/CD/CE/CZ, NA/NB/ND/NE/NZ, OA/OD/OE/OG/OH/OP, HA/HB/HD/HE/HG/HH/HZ, SD/SG
     if c0 == b' ' {
         if let Some(first_alpha) = trimmed.chars().find(|c| c.is_ascii_alphabetic()) {
@@ -308,7 +369,7 @@ pub fn cif_to_molecule_with_cell(cif: &str) -> Result<(ChemMolecule, CrystalUnit
         let mut parts = t.split_whitespace();
         let Some(key) = parts.next() else { continue };
         let Some(val) = parts.next() else { continue };
-        match key {
+        match normalize_cif_tag(key).as_str() {
             "_cell_length_a" => { if let Some(v) = parse_cif_float(val) { a = v; } }
             "_cell_length_b" => { if let Some(v) = parse_cif_float(val) { b = v; } }
             "_cell_length_c" => { if let Some(v) = parse_cif_float(val) { c = v; } }
@@ -317,6 +378,9 @@ pub fn cif_to_molecule_with_cell(cif: &str) -> Result<(ChemMolecule, CrystalUnit
             "_cell_angle_gamma" => { if let Some(v) = parse_cif_float(val) { gamma = v; } }
             _ => {}
         }
+    }
+    if [a, b, c].iter().any(|&l| l <= 0.0) || [alpha, beta, gamma].iter().any(|&g| g <= 0.0 || g >= 180.0) {
+        return Err(format!("Invalid CIF unit cell: a={a} b={b} c={c} alpha={alpha} beta={beta} gamma={gamma}"));
     }
 
     // Build fractional -> Cartesian orthogonalization matrix (standard crystallographic convention)
@@ -345,7 +409,8 @@ pub fn cif_to_molecule_with_cell(cif: &str) -> Result<(ChemMolecule, CrystalUnit
             i += 1;
             let mut cols = Vec::new();
             while i < lines.len() && lines[i].trim().starts_with('_') {
-                cols.push(lines[i].trim().to_string());
+                // A tag line holds just the data name (anything after it is a comment or stray text).
+                cols.push(normalize_cif_tag(lines[i].split_whitespace().next().unwrap_or("")));
                 i += 1;
             }
             let ix = cols.iter().position(|k| k == "_atom_site_fract_x");
@@ -356,33 +421,33 @@ pub fn cif_to_molecule_with_cell(cif: &str) -> Result<(ChemMolecule, CrystalUnit
                 .position(|k| k == "_atom_site_type_symbol")
                 .or_else(|| cols.iter().position(|k| k == "_atom_site_label"));
             if let (Some(ix), Some(iy), Some(iz), Some(isym)) = (ix, iy, iz, isym) {
+                // Loop values form one token stream (a row may wrap lines; blank/comment lines are allowed);
+                // the loop ends at the next data name or reserved word.
+                let mut toks: Vec<&str> = Vec::new();
                 while i < lines.len() {
                     let row = lines[i].trim();
-                    if row.is_empty()
-                        || row.starts_with('#')
-                        || row.starts_with("loop_")
-                        || row.starts_with('_')
-                        || row.starts_with("data_")
+                    let lower = row.get(..7).unwrap_or(row).to_ascii_lowercase();
+                    if row.starts_with('_')
+                        || ["loop_", "data_", "stop_", "save_", "global_"].iter().any(|w| lower.starts_with(w))
                     {
                         break;
                     }
-                    let toks: Vec<&str> = row.split_whitespace().collect();
-                    let need = ix.max(iy).max(iz).max(isym);
-                    if toks.len() > need {
-                        if let (Some(fx), Some(fy), Some(fz)) = (
-                            parse_cif_float(toks[ix]),
-                            parse_cif_float(toks[iy]),
-                            parse_cif_float(toks[iz]),
-                        ) {
-                            let z = extract_cif_element(toks[isym]);
-                            let cx = m11 * fx + m12 * fy + m13 * fz;
-                            let cy = m22 * fy + m23 * fz;
-                            let cz = m33 * fz;
-                            mol.add_atom(ChemAtom::new((coords.len() + 1) as u32, z));
-                            coords.push((cx, cy, cz));
-                        }
-                    }
+                    toks.extend(cif_line_tokens(lines[i]));
                     i += 1;
+                }
+                for rec in toks.chunks_exact(cols.len()) {
+                    if let (Some(fx), Some(fy), Some(fz)) = (
+                        parse_cif_float(rec[ix]),
+                        parse_cif_float(rec[iy]),
+                        parse_cif_float(rec[iz]),
+                    ) {
+                        let z = extract_cif_element(rec[isym]);
+                        let cx = m11 * fx + m12 * fy + m13 * fz;
+                        let cy = m22 * fy + m23 * fz;
+                        let cz = m33 * fz;
+                        mol.add_atom(ChemAtom::new((coords.len() + 1) as u32, z));
+                        coords.push((cx, cy, cz));
+                    }
                 }
                 if !mol.atoms.is_empty() {
                     break;
@@ -424,6 +489,8 @@ pub fn pdb_to_molecule(pdb: &str) -> Result<ChemMolecule, String> {
     let mut coords = Vec::new();
     let mut serial_to_idx: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
     let mut conect_pairs: Vec<(i32, i32)> = Vec::new();
+    // Alternate locations (col 17): keep blank plus the first altLoc seen, not every conformer.
+    let mut first_alt: Option<u8> = None;
 
     let mut in_first_model = true;
     for line in pdb.lines() {
@@ -448,17 +515,25 @@ pub fn pdb_to_molecule(pdb: &str) -> Result<ChemMolecule, String> {
             if !x.is_finite() || !y.is_finite() || !zc.is_finite() {
                 continue;
             }
+            let alt = line.as_bytes().get(16).copied().unwrap_or(b' ');
+            if alt != b' ' {
+                if *first_alt.get_or_insert(alt) != alt {
+                    continue;
+                }
+            }
             let z = extract_pdb_element(line);
             let idx = mol.atoms.len();
             serial_to_idx.insert(serial, idx);
             mol.add_atom(ChemAtom::new((idx + 1) as u32, z));
             coords.push((x, y, zc));
         } else if line.starts_with("CONECT") {
-            // Fixed-width 5-column PDB CONECT fields (handles >= 10,000 atoms where fields touch)
+            // Fixed-width 5-column PDB CONECT fields (handles >= 10,000 atoms where fields touch).
+            // Only cols 7-31 (atom + 4 bonded atoms) are covalent bonds; legacy cols 32-61 are H-bonds/salt bridges.
             let mut toks: Vec<i32> = Vec::new();
             let mut pos = 6usize;
-            while pos < line.len() {
-                let end = (pos + 5).min(line.len());
+            let lim = line.len().min(31);
+            while pos < lim {
+                let end = (pos + 5).min(lim);
                 if let Some(chunk) = line.get(pos..end) {
                     if let Ok(v) = chunk.trim().parse::<i32>() {
                         toks.push(v);
@@ -468,10 +543,9 @@ pub fn pdb_to_molecule(pdb: &str) -> Result<ChemMolecule, String> {
             }
             if toks.len() >= 2 {
                 let a = toks[0];
+                // Keep both directions: many writers list a bond only on one atom's record.
                 for &b in &toks[1..] {
-                    if a < b {
-                        conect_pairs.push((a, b));
-                    }
+                    conect_pairs.push((a, b));
                 }
             }
         }
@@ -479,20 +553,43 @@ pub fn pdb_to_molecule(pdb: &str) -> Result<ChemMolecule, String> {
     if mol.atoms.is_empty() {
         return Err("No ATOM/HETATM coordinate records found in PDB file".to_string());
     }
-    let mut used_conect = false;
-    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    let mut next_bid = (mol.atoms.len() as u32) + 1;
+    // Repeated entries in one atom's CONECT records encode bond order (count per direction, max of both).
+    let mut directed: std::collections::HashMap<(usize, usize), i32> = std::collections::HashMap::new();
     for (sa, sb) in conect_pairs {
         if let (Some(&ia), Some(&ib)) = (serial_to_idx.get(&sa), serial_to_idx.get(&sb)) {
-            let key = if ia < ib { (ia, ib) } else { (ib, ia) };
-            if ia != ib && seen.insert(key) {
-                mol.add_bond(next_bid, ia, ib, 1, BondDisplay::Solid);
-                next_bid += 1;
-                used_conect = true;
+            if ia != ib {
+                *directed.entry((ia, ib)).or_insert(0) += 1;
             }
         }
     }
-    let _ = perceive_3d_bonds_and_scale_with_transform(&mut mol, &coords, 14.40, !used_conect);
+    let mut conect_bonds: Vec<(usize, usize, i32)> = Vec::new();
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut keys: Vec<(usize, usize)> = directed.keys().copied().collect();
+    keys.sort_unstable();
+    for (ia, ib) in keys {
+        let key = (ia.min(ib), ia.max(ib));
+        if seen.insert(key) {
+            let n1 = directed.get(&(ia, ib)).copied().unwrap_or(0);
+            let n2 = directed.get(&(ib, ia)).copied().unwrap_or(0);
+            conect_bonds.push((key.0, key.1, n1.max(n2).clamp(1, 3)));
+        }
+    }
+    // CONECT usually covers only HETATM/non-standard links; atoms it never mentions (e.g. the protein)
+    // still need distance-based bonds, but perceived bonds touching CONECT atoms are discarded.
+    let mut covered = vec![false; mol.atoms.len()];
+    for &(a, b, _) in &conect_bonds {
+        covered[a] = true;
+        covered[b] = true;
+    }
+    let _ = perceive_3d_bonds_and_scale_with_transform(&mut mol, &coords, 14.40, true);
+    if !conect_bonds.is_empty() {
+        mol.bonds.retain(|b| !covered[b.begin_atom] && !covered[b.end_atom]);
+        let mut next_bid = mol.bonds.iter().map(|b| b.id).max().unwrap_or(0).max(mol.atoms.len() as u32) + 1;
+        for (a, b, ord) in conect_bonds {
+            mol.add_bond(next_bid, a, b, ord, BondDisplay::Solid);
+            next_bid += 1;
+        }
+    }
     Ok(mol)
 }
 
@@ -720,5 +817,42 @@ Direct
         assert_eq!(si_mol.atoms[0].z, 14);
         assert_eq!(si_mol.bonds.len(), 1);
         assert!((si_cell.a - 5.43).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_xyz_cif_pdb_audit_regressions() {
+        // XYZ: numeric atomic numbers, deuterium bonds like H, NaN rejected.
+        let xyz = "3\nwater-d2\n8 0.0 0.0 0.0\nD 0.96 0.0 0.0\nD -0.24 0.93 0.0\n";
+        let m = xyz_to_molecule(xyz).unwrap();
+        assert_eq!((m.atoms[0].z, m.atoms[1].z), (8, 225));
+        assert_eq!(m.bonds.len(), 2, "O-D bonds only (no D-D)");
+        assert!(xyz_to_molecule("1\n\nC nan 0 0\n").is_err());
+        // CIF: mmCIF dotted/uppercase tags, quoted labels, a row wrapped over two lines, blank line inside loop.
+        let cif = "data_x\n_CELL.LENGTH_A 5.0\n_cell.length_b 5.0\n_cell.length_c 5.0\nloop_\n_atom_site.label\n_atom_site.type_symbol\n_atom_site.fract_x\n_atom_site.fract_y\n_atom_site.fract_z\n'C 1' C 0.0 0.0 0.0\n\nO1 O 0.25\n 0.0 0.0\n";
+        let (cm, cell) = cif_to_molecule_with_cell(cif).unwrap();
+        assert_eq!(cm.atoms.len(), 2);
+        assert_eq!(cm.atoms[1].z, 8);
+        assert!((cell.a - 5.0).abs() < 1e-9);
+        assert!(cif_to_molecule("_cell_length_a 0\nloop_\n_atom_site_label\n_atom_site_fract_x\n_atom_site_fract_y\n_atom_site_fract_z\nC1 0 0 0\n").is_err());
+        // PDB: 4-char H names are hydrogen, altLoc B dropped, one-directional CONECT kept,
+        // protein atoms without CONECT still perceived, H-bond columns ignored.
+        let pdb = "\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00
+ATOM      2  CA  ALA A   1       1.460   0.000   0.000  1.00  0.00
+ATOM      3 HG21 ALA A   1       1.800   1.000   0.000  1.00  0.00
+ATOM      4  CB AALA A   1       2.000  -1.400   0.000  0.50  0.00
+ATOM      5  CB BALA A   1       2.100  -1.300   0.200  0.50  0.00
+HETATM    6  C1  LIG B   1      10.000   0.000   0.000  1.00  0.00
+HETATM    7  O1  LIG B   1      11.200   0.000   0.000  1.00  0.00
+CONECT    6    7    7                                  1
+END
+";
+        let p = pdb_to_molecule(pdb).unwrap();
+        assert_eq!(p.atoms.len(), 6, "altLoc B skipped");
+        assert_eq!(p.atoms[2].z, 1, "HG21 is hydrogen, not mercury");
+        let has = |a: usize, b: usize| p.bonds.iter().find(|x| (x.begin_atom, x.end_atom) == (a.min(b), a.max(b)) || (x.begin_atom, x.end_atom) == (a.max(b), a.min(b)));
+        assert!(has(0, 1).is_some(), "protein N-CA perceived even though CONECT exists");
+        assert_eq!(has(4, 5).map(|b| b.order), Some(2), "repeated CONECT entry = double bond");
+        assert!(has(4, 0).is_none(), "H-bond column (atom 1) ignored");
     }
 }

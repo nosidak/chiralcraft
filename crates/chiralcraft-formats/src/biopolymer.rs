@@ -37,41 +37,38 @@ impl MonomerLibrary {
 
     pub fn parse_json(text: &str) -> Self {
         let mut lib = Self::default();
-        // Split top-level objects cleanly by `"id":` field boundaries inside the JSON array
-        let mut pos = 0usize;
+        // One string-aware scan: a monomer is any object that directly owns a `"polymerType":` key.
+        // (Indentation/minification independent; nested `rgroups` objects are never mistaken for it.)
         let bytes = text.as_bytes();
-        while let Some(rel) = text[pos..].find("\"polymerType\"") {
-            let anchor = pos + rel;
-            // Find enclosing `{` before anchor and matching `}` after anchor
-            let obj_start = text[..anchor].rfind("\n  {").or_else(|| text[..anchor].rfind('{')).unwrap_or(0);
-            let mut depth = 0i32;
-            let mut in_str = false;
-            let mut esc = false;
-            let mut obj_end = text.len();
-            for (k, &b) in bytes[obj_start..].iter().enumerate() {
-                if in_str {
-                    if esc {
-                        esc = false;
-                    } else if b == b'\\' {
-                        esc = true;
-                    } else if b == b'"' {
-                        in_str = false;
-                    }
-                } else {
-                    match b {
-                        b'"' => in_str = true,
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                obj_end = obj_start + k + 1;
-                                break;
-                            }
+        let mut stack: Vec<(usize, bool)> = Vec::new();
+        let mut objects: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    let Some((s, used)) = decode_json_string(&text[i + 1..]) else { break };
+                    let end = i + 1 + used;
+                    if s == "polymerType" && text[end..].trim_start().starts_with(':') {
+                        if let Some(top) = stack.last_mut() {
+                            top.1 = true;
                         }
-                        _ => {}
+                    }
+                    i = end;
+                    continue;
+                }
+                b'{' => stack.push((i, false)),
+                b'}' => {
+                    if let Some((start, is_monomer)) = stack.pop() {
+                        if is_monomer {
+                            objects.push((start, i + 1));
+                        }
                     }
                 }
+                _ => {}
             }
+            i += 1;
+        }
+        for (obj_start, obj_end) in objects {
             let chunk = &text[obj_start..obj_end];
             let symbol = extract_json_string(chunk, "symbol").unwrap_or_default();
             let name = extract_json_string(chunk, "name").unwrap_or_else(|| symbol.clone());
@@ -91,10 +88,6 @@ impl MonomerLibrary {
                     });
                     lib.by_symbol.insert(key, idx);
                 }
-            }
-            pos = obj_end.max(anchor + 13);
-            if pos >= text.len() {
-                break;
             }
         }
         if lib.entries.is_empty() {
@@ -129,34 +122,74 @@ impl MonomerLibrary {
     }
 }
 
-fn extract_json_string(obj: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let kpos = obj.find(&pat)?;
-    let rest = &obj[kpos + pat.len()..];
-    let cpos = rest.find(':')?;
-    let val = rest[cpos + 1..].trim_start();
-    if !val.starts_with('"') {
-        return None;
+/// Decodes a JSON string body (`s` starts just after the opening quote). Returns the decoded text and
+/// the byte length consumed including the closing quote, or `None` if unterminated.
+fn decode_json_string(s: &str) -> Option<(String, usize)> {
+    fn hex4(it: &mut std::str::CharIndices<'_>) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            v = v * 16 + it.next()?.1.to_digit(16)?;
+        }
+        Some(v)
     }
     let mut out = String::new();
-    let mut esc = false;
-    for ch in val[1..].chars() {
-        if esc {
-            match ch {
+    let mut it = s.char_indices();
+    while let Some((i, ch)) = it.next() {
+        match ch {
+            '"' => return Some((out, i + 1)),
+            '\\' => match it.next()?.1 {
                 'n' => out.push('\n'),
                 't' => out.push('\t'),
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                other => out.push(other),
-            }
-            esc = false;
-        } else if ch == '\\' {
-            esc = true;
-        } else if ch == '"' {
-            return Some(out);
-        } else {
-            out.push(ch);
+                'r' => out.push('\r'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'u' => {
+                    let hi = hex4(&mut it)?;
+                    let mut c = char::from_u32(hi);
+                    if (0xD800..0xDC00).contains(&hi) {
+                        // UTF-16 surrogate pair `\uD83D\uDE00`
+                        let mut look = it.clone();
+                        c = None;
+                        if look.next().map(|x| x.1) == Some('\\') && look.next().map(|x| x.1) == Some('u') {
+                            if let Some(lo) = hex4(&mut look).filter(|lo| (0xDC00..0xE000).contains(lo)) {
+                                c = char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+                                it = look;
+                            }
+                        }
+                    }
+                    out.push(c.unwrap_or('\u{FFFD}'));
+                }
+                other => out.push(other), // `"`, `\`, `/`
+            },
+            c => out.push(c),
         }
+    }
+    None
+}
+
+/// Returns the string value of a key owned directly by this JSON object (not by nested objects/arrays).
+fn extract_json_string(obj: &str, key: &str) -> Option<String> {
+    let bytes = obj.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let (s, used) = decode_json_string(&obj[i + 1..])?;
+                let end = i + 1 + used;
+                if depth == 1 && s == key {
+                    if let Some(v) = obj[end..].trim_start().strip_prefix(':') {
+                        return v.trim_start().strip_prefix('"').and_then(decode_json_string).map(|x| x.0);
+                    }
+                }
+                i = end;
+                continue;
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
     }
     None
 }
@@ -206,20 +239,43 @@ pub fn sequence_to_biopolymer_molecule(
     kind: PolymerKind,
     bond_length_pt: f64,
 ) -> Result<ChemMolecule, String> {
-    let body: String = seq_input
-        .lines()
-        .filter(|l| !l.trim().starts_with('>'))
-        .collect::<Vec<_>>()
-        .join(" ");
+    // First FASTA record only (a second `>` header starts another sequence); `;` lines are comments.
+    let mut body_lines: Vec<&str> = Vec::new();
+    for l in seq_input.lines().map(str::trim) {
+        if l.starts_with('>') {
+            if body_lines.iter().any(|b| !b.is_empty()) {
+                break;
+            }
+            continue;
+        }
+        if !l.starts_with(';') {
+            body_lines.push(l);
+        }
+    }
+    let body = body_lines.join(" ");
     let trimmed = body.trim();
-    let letters: Vec<String> = if trimmed.contains('-') || trimmed.contains('.') {
-        trimmed
-            .split(|c: char| c == '-' || c == '.' || c.is_whitespace())
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && s.chars().any(|c| c.is_ascii_alphanumeric()))
+    let tokens: Vec<&str> = trimmed
+        .split(|c: char| c == '-' || c == '.' || c.is_whitespace())
+        .filter(|s| s.chars().any(|c| c.is_ascii_alphanumeric()))
+        .collect();
+    // Named-monomer mode ("Ala-Cys", "dA-dC", "ALA.GLY") only when every token is a monomer name;
+    // otherwise `-`/`.` are FASTA alignment gaps ("AC-DE" = A,C,D,E).
+    let is_name = |s: &str| {
+        s.chars().count() == 1
+            || (kind == PolymerKind::Peptide && canonical_three(s).is_some())
+            || (s.chars().any(|c| c.is_ascii_lowercase()) && s.chars().any(|c| c.is_ascii_uppercase()))
+    };
+    let named_mode = (trimmed.contains('-') || trimmed.contains('.'))
+        && tokens.iter().any(|s| s.chars().count() > 1)
+        && tokens.iter().all(|s| is_name(s));
+    let letters: Vec<String> = if named_mode {
+        tokens
+            .iter()
             .map(|s| {
                 if s.len() == 1 {
                     s.to_ascii_uppercase()
+                } else if let Some(c) = canonical_three(s).filter(|_| kind == PolymerKind::Peptide) {
+                    c.to_string()
                 } else {
                     s.to_string()
                 }
@@ -242,7 +298,7 @@ pub fn sequence_to_biopolymer_molecule(
 /// into a linked biopolymer `ChemMolecule` (including cyclic/disulfide cross-links if specified).
 pub fn helm_to_molecule(helm: &str, bond_length_pt: f64) -> Result<ChemMolecule, String> {
     let trimmed = helm.trim();
-    let sections: Vec<&str> = trimmed.split('$').collect();
+    let sections: Vec<&str> = split_helm_top_level(trimmed, '$');
     let poly_part = sections.first().copied().unwrap_or(trimmed);
 
     let mut mol = ChemMolecule::default();
@@ -253,7 +309,7 @@ pub fn helm_to_molecule(helm: &str, bond_length_pt: f64) -> Result<ChemMolecule,
     let per_row = 12usize;
     let mut chain_y_offset = 0.0_f64;
 
-    for poly_str in poly_part.split('|').filter(|s| !s.trim().is_empty()) {
+    for poly_str in split_helm_top_level(poly_part, '|').into_iter().filter(|s| !s.trim().is_empty()) {
         let brace_start = poly_str
             .find('{')
             .ok_or_else(|| "HELM string must contain `{monomers}`".to_string())?;
@@ -272,9 +328,9 @@ pub fn helm_to_molecule(helm: &str, bond_length_pt: f64) -> Result<ChemMolecule,
             PolymerKind::Peptide
         };
         let body = &poly_str[brace_start + 1..brace_end];
-        let monomers: Vec<String> = body
-            .split('.')
-            .map(|m| m.trim().trim_matches(['[', ']']).to_string())
+        let monomers: Vec<String> = split_helm_top_level(body, '.')
+            .into_iter()
+            .map(|m| strip_helm_brackets(m.trim()).to_string())
             .filter(|m| !m.is_empty())
             .collect();
         if monomers.is_empty() {
@@ -338,7 +394,10 @@ pub fn helm_to_molecule(helm: &str, bond_length_pt: f64) -> Result<ChemMolecule,
                         let idx_a = poly_atom_map.get(&(p1, a1)).copied();
                         let idx_b = poly_atom_map.get(&(p2, b1)).copied();
                         if let (Some(ia), Some(ib)) = (idx_a, idx_b) {
-                            if ia != ib {
+                            let dup = mol.bonds.iter().any(|b| {
+                                (b.begin_atom, b.end_atom) == (ia, ib) || (b.begin_atom, b.end_atom) == (ib, ia)
+                            });
+                            if ia != ib && !dup {
                                 mol.bonds.push(ChemBond {
                                     id: next_bid,
                                     begin_atom: ia,
@@ -356,7 +415,53 @@ pub fn helm_to_molecule(helm: &str, bond_length_pt: f64) -> Result<ChemMolecule,
             }
         }
     }
+    // Bond ids follow atom ids (the fixed 1000 base collided with atom ids for >999 monomers).
+    let n_atoms = mol.atoms.len() as u32;
+    for (k, b) in mol.bonds.iter_mut().enumerate() {
+        b.id = n_atoms + k as u32 + 1;
+    }
     Ok(mol)
+}
+
+/// Splits on `sep` outside `[...]` (inline SMILES such as `[C.O]` or `[C$C]` stays one monomer).
+fn split_helm_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = (depth - 1).max(0),
+            _ if c == sep && depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// `[Orn]` → `Orn`, but `[dR](A)P` stays intact (its first bracket closes before the end).
+fn strip_helm_brackets(m: &str) -> &str {
+    if !(m.starts_with('[') && m.ends_with(']')) {
+        return m;
+    }
+    let mut depth = 0i32;
+    for (i, c) in m.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return if i + 1 == m.len() { &m[1..i] } else { m };
+                }
+            }
+            _ => {}
+        }
+    }
+    m
 }
 
 fn build_monomer_chain(
@@ -407,15 +512,37 @@ fn build_monomer_chain(
 pub fn monomer_to_all_atom_molecule(lib: &MonomerLibrary, polymer_type: &str, symbol: &str) -> Option<ChemMolecule> {
     let idx = *lib.by_symbol.get(&(polymer_type.to_string(), symbol.to_string()))?;
     let entry = &lib.entries[idx];
-    // Strip atom-map annotations (`[H:1]`, `[OH:2]`) for clean SMILES parsing
-    let cleaned = entry
-        .smiles
-        .replace("[H:1]", "")
-        .replace("[OH:2]", "O")
-        .replace("[H:3]", "")
-        .replace("[*:1]", "")
-        .replace("[*:2]", "");
-    smiles_to_molecule(&cleaned).ok()
+    smiles_to_molecule(&strip_rgroup_atoms(&entry.smiles)).ok()
+}
+
+/// Removes HELM R-group attachment atoms (`[*:n]`, `[H:n]` for any n; `[OH:n]` → `O`) and the empty
+/// branches `()` they leave behind (`C([*:2])=O` → `C=O`), so the monomer SMILES parses cleanly.
+fn strip_rgroup_atoms(smi: &str) -> String {
+    let mut out = String::with_capacity(smi.len());
+    let mut rest = smi;
+    while let Some(p) = rest.find('[') {
+        out.push_str(&rest[..p]);
+        let after = &rest[p..];
+        let Some(q) = after.find(']') else {
+            out.push_str(after);
+            rest = "";
+            break;
+        };
+        let inner = &after[1..q];
+        let (sym, map) = inner.split_once(':').unwrap_or((inner, ""));
+        let is_map = !map.is_empty() && map.bytes().all(|b| b.is_ascii_digit());
+        match sym {
+            "*" | "H" if is_map => {}
+            "OH" if is_map => out.push('O'),
+            _ => out.push_str(&after[..=q]),
+        }
+        rest = &after[q + 1..];
+    }
+    out.push_str(rest);
+    while out.contains("()") {
+        out = out.replace("()", "");
+    }
+    out
 }
 
 /// Serializes a biopolymer or peptide molecule into **HELM v2.0** notation (`PEPTIDE1{A.C.D}$$$$V2.0`).
@@ -436,7 +563,7 @@ pub fn molecule_to_helm(mol: &ChemMolecule) -> String {
             } else if matches!(lbl.as_str(), "A" | "C" | "G" | "U" | "T") {
                 is_nucleic = true;
                 format!("R({lbl})P")
-            } else if lbl.len() > 1 {
+            } else if lbl.len() > 1 && strip_helm_brackets(lbl).len() == lbl.len() {
                 format!("[{lbl}]")
             } else {
                 lbl.clone()
@@ -474,7 +601,11 @@ pub fn molecule_to_fasta(mol: &ChemMolecule, title: &str) -> String {
                 seq.push_str(&lbl[1..]);
             } else if lbl.len() == 1 && lbl.chars().all(|c| c.is_ascii_alphabetic()) {
                 seq.push_str(&lbl.to_ascii_uppercase());
-            } else if let Some(inner) = lbl.strip_prefix("R(").and_then(|s| s.split(')').next()) {
+            } else if let Some(inner) = ["R(", "dR(", "[dR]("]
+                .iter()
+                .find_map(|p| lbl.strip_prefix(p))
+                .and_then(|s| s.split(')').next())
+            {
                 seq.push_str(inner);
             }
         }
@@ -482,6 +613,8 @@ pub fn molecule_to_fasta(mol: &ChemMolecule, title: &str) -> String {
     if seq.is_empty() {
         seq.push('X');
     }
+    // A newline in the title would turn the rest of it into sequence data.
+    let title = title.replace(['\r', '\n'], " ");
     format!(">{title}\n{seq}\n")
 }
 
@@ -511,7 +644,19 @@ fn one_to_three_aa(s: &str) -> Option<&'static str> {
     }
 }
 
+/// Case-insensitive 3-letter amino-acid code → canonical "Ala" spelling.
+fn canonical_three(s: &str) -> Option<&'static str> {
+    if s.len() != 3 {
+        return None;
+    }
+    "ARNDCEQGHILKMFPSTWYV"
+        .chars()
+        .filter_map(|c| one_to_three_aa(c.encode_utf8(&mut [0u8; 4])))
+        .find(|t| t.eq_ignore_ascii_case(s))
+}
+
 fn three_to_one_aa(s: &str) -> Option<&'static str> {
+    let s = canonical_three(s)?;
     match s {
         "Ala" => Some("A"), "Arg" => Some("R"), "Asn" => Some("N"), "Asp" => Some("D"),
         "Cys" => Some("C"), "Glu" => Some("E"), "Gln" => Some("Q"), "Gly" => Some("G"),
@@ -648,5 +793,45 @@ mod tests {
             let lib = MonomerLibrary::load_from_json_path(&json_path).unwrap();
             assert!(lib.entries.len() >= 20, "natural-monomers.json should load >=20 monomers, got {}", lib.entries.len());
         }
+    }
+
+    #[test]
+    fn test_biopolymer_audit_regressions() {
+        // FASTA alignment gaps are not monomer separators; only the first record; `;` comments skipped.
+        let g = sequence_to_biopolymer_molecule(">s1\n;comment\nAC-DE\n>s2\nWWW", PolymerKind::Peptide, 14.4).unwrap();
+        assert_eq!(g.atoms.len(), 4);
+        assert_eq!(molecule_to_fasta(&g, "a\nb"), ">a b\nACDE\n");
+        // Named mode, case-insensitive 3-letter codes.
+        let n = sequence_to_biopolymer_molecule("ALA-gly-Cys", PolymerKind::Peptide, 14.4).unwrap();
+        assert_eq!(molecule_to_helm(&n), "PEPTIDE1{A.G.C}$$$$V2.0");
+        // DNA round trip: writer emits `[dR](A)P`, reader must not mangle it.
+        let d = sequence_to_biopolymer_molecule("ACG", PolymerKind::Dna, 14.4).unwrap();
+        let helm = molecule_to_helm(&d);
+        assert_eq!(helm, "RNA1{[dR](A)P.[dR](C)P.[dR](G)P}$$$$V2.0");
+        let back = helm_to_molecule(&helm, 14.4).unwrap();
+        assert_eq!(back.atoms[0].label.as_deref(), Some("[dR](A)P"));
+        assert_eq!(molecule_to_helm(&back), helm);
+        assert!(molecule_to_fasta(&back, "x").contains("ACG"));
+        // Bracketed names stripped once; inline SMILES with '.'/'$' kept whole; duplicate link ignored.
+        let h = helm_to_molecule("PEPTIDE1{[Orn].[C.O].[C$C]}$PEPTIDE1,PEPTIDE1,1:R2-2:R1$$$V2.0", 14.4).unwrap();
+        assert_eq!(h.atoms.len(), 3);
+        assert_eq!(h.atoms[0].label.as_deref(), Some("Orn"));
+        assert_eq!(h.atoms[1].label.as_deref(), Some("C.O"));
+        assert_eq!(h.bonds.len(), 2);
+        // Bond ids never collide with atom ids.
+        let long = format!("PEPTIDE1{{{}}}$$$$V2.0", vec!["A"; 1200].join("."));
+        let lm = helm_to_molecule(&long, 14.4).unwrap();
+        let ids: std::collections::HashSet<u32> = lm.atoms.iter().map(|a| a.id).chain(lm.bonds.iter().map(|b| b.id)).collect();
+        assert_eq!(ids.len(), lm.atoms.len() + lm.bonds.len());
+        // JSON: escapes, nested objects, minified layout.
+        let lib = MonomerLibrary::parse_json(
+            r#"[{"rgroups":[{"symbol":"R1"}],"symbol":"X\u00e9\/1","polymerType":"PEPTIDE","smiles":"C([*:3])[*:1]","name":"a\"b\ud83d\ude00"}]"#,
+        );
+        assert_eq!(lib.entries.len(), 1);
+        assert_eq!(lib.entries[0].symbol, "Xé/1");
+        assert_eq!(lib.entries[0].name, "a\"b😀");
+        assert_eq!(strip_rgroup_atoms(&lib.entries[0].smiles), "C");
+        assert_eq!(strip_rgroup_atoms("[*:1]N[C@@H](C)C([*:2])=O"), "N[C@@H](C)C=O");
+        assert_eq!(strip_rgroup_atoms("C(=O)[OH:2]"), "C(=O)O");
     }
 }

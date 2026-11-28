@@ -412,6 +412,8 @@ impl CsFormulaProperties {
     /// Hill system (C=6 first, H=1 second, then remaining elements in map order).
     pub fn get_formula(&self) -> String {
         let mut out = String::new();
+        // Hill system: C then H only when carbon is present; otherwise all symbols alphabetical (HCl -> ClH).
+        let has_c = self.has_carbon();
 
         // 1. Carbon (Z == 6)
         for (k, &cnt) in &self.elements_map {
@@ -421,13 +423,13 @@ impl CsFormulaProperties {
         }
         // 2. Hydrogen (Z == 1)
         for (k, &cnt) in &self.elements_map {
-            if k.z == 1 {
+            if has_c && k.z == 1 {
                 Self::format_element_count(k, &mut out, cnt, self.min_numeral_width_b4, self.flag_b2);
             }
         }
         // 3. All other elements (Z != 1 && Z != 6) in lexicographical symbol + isotope order
         for (k, &cnt) in &self.elements_map {
-            if k.z != 1 && k.z != 6 {
+            if k.z != 6 && (k.z != 1 || !has_c) {
                 Self::format_element_count(k, &mut out, cnt, self.min_numeral_width_b4, self.flag_b2);
             }
         }
@@ -442,6 +444,10 @@ impl CsFormulaProperties {
         }
 
         out
+    }
+
+    fn has_carbon(&self) -> bool {
+        self.elements_map.iter().any(|(k, &cnt)| k.z == 6 && cnt > 0.0)
     }
 
     fn format_element_count(
@@ -533,6 +539,7 @@ impl CsFormulaProperties {
             return Vec::new();
         }
         let mut by_sym: BTreeMap<(u8, String), f64> = BTreeMap::new();
+        let has_c = self.has_carbon();
         for (k, &cnt) in &self.elements_map {
             if cnt <= 0.0 {
                 continue;
@@ -546,7 +553,7 @@ impl CsFormulaProperties {
             };
             let order_bucket = match k.z {
                 6 => 0u8,
-                1 => 1u8,
+                1 if has_c => 1u8,
                 _ => 2u8,
             };
             let sym = if k.isotope != 0 {
@@ -1216,7 +1223,7 @@ impl CcVal {
 
     #[inline]
     pub fn total_h(&self, atom_idx: usize) -> u8 {
-        self.implicit_h_counts[atom_idx] + self.explicit_h_counts[atom_idx]
+        self.implicit_h_counts[atom_idx].saturating_add(self.explicit_h_counts[atom_idx])
     }
 }
 
@@ -2989,6 +2996,18 @@ mod tests {
         fp_d.increment_atom(1, 2, 1.0);
         fp_d.increment_atom(17, 0, 3.0);
         assert_eq!(fp_d.get_formula(), "CDCl3");
+
+        // Hill system without carbon: strictly alphabetical, H not hoisted
+        let mut fp_hcl = CsFormulaProperties::new();
+        fp_hcl.increment_atom(1, 0, 1.0);
+        fp_hcl.increment_atom(17, 0, 1.0);
+        assert_eq!(fp_hcl.get_formula(), "ClH");
+        let ea: Vec<String> = fp_hcl.get_elemental_analysis().into_iter().map(|(s, _)| s).collect();
+        assert_eq!(ea, vec!["Cl".to_string(), "H".to_string()]);
+        let mut fp_w = CsFormulaProperties::new();
+        fp_w.increment_atom(8, 0, 1.0);
+        fp_w.increment_atom(1, 0, 2.0);
+        assert_eq!(fp_w.get_formula(), "H2O");
     }
 
     #[test]
@@ -3073,8 +3092,8 @@ mod tests {
         assert_eq!(val.explicit_dative_in[b], 1);
         assert_eq!(val.implicit_h(n), 3); // N+ like C -> 4 - 1 = 3 H
         assert_eq!(val.implicit_h(b), 3); // B- like C -> 4 - 1 = 3 H
-        // CoreChemistryCommon::GetFormula always emits C, then H, then remaining symbols alphabetically
-        assert_eq!(mol.compute_formula_properties().get_formula(), "H6BN");
+        // Hill system without carbon: all symbols alphabetical (H not hoisted)
+        assert_eq!(mol.compute_formula_properties().get_formula(), "BH6N");
 
         // Charged alkali metal Li+ (Z=3, charge=+1) -> 0 implicit H
         let mut li_mol = ChemMolecule::new();

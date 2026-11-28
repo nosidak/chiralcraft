@@ -498,9 +498,10 @@ impl CdxDocument {
                                     0x0002 => 2,
                                     0x0004 => 3,
                                     0x0008 => 4,
-                                    0x0010 => 5, // Dative
-                                    0x0040 => 7, // Hydrogen
-                                    0x0080 => 6, // Delocalized / 1.5
+                                    // CDX spec: 0x0010 = quintuple, 0x0040 = half; dative/hydrogen are 0x1000/0x4000.
+                                    0x1000 => 5, // Dative
+                                    0x4000 => 7, // Hydrogen
+                                    0x0080 | 0x0100 => 6, // Delocalized 1.5 / 2.5
                                     _ => 1,
                                 };
                                 let display = match display_code {
@@ -695,9 +696,14 @@ impl CdxDocument {
                                 0x0002 => "2",
                                 0x0004 => "3",
                                 0x0008 => "4",
-                                0x0010 => "dative",
-                                0x0040 => "hydrogen",
+                                0x0010 => "5",
+                                0x0020 => "6",
+                                0x0040 => "0.5",
+                                0x1000 => "dative",
+                                0x2000 => "ionic",
+                                0x4000 => "hydrogen",
                                 0x0080 => "1.5",
+                                0x0100 => "2.5",
                                 _ => "1",
                             };
                             attrs.push(("Order".to_string(), s.to_string()));
@@ -1489,9 +1495,14 @@ impl CdxmlDocument {
                     "2" => 0x0002,
                     "3" => 0x0004,
                     "4" => 0x0008,
-                    "dative" => 0x0010,
-                    "hydrogen" => 0x0040,
+                    "5" => 0x0010,
+                    "6" => 0x0020,
+                    "0.5" => 0x0040,
+                    "dative" => 0x1000,
+                    "ionic" => 0x2000,
+                    "hydrogen" => 0x4000,
                     "1.5" => 0x0080,
+                    "2.5" => 0x0100,
                     _ => 0x0001,
                 };
                 children.push(prop(CDX_PROP_BOND_ORDER, code.to_le_bytes().to_vec(), props));
@@ -2110,6 +2121,7 @@ pub fn molfile_v2000_to_molecule(molfile: &str) -> Result<ChemMolecule, String> 
         let order = match ord_code {
             1..=3 => ord_code,
             4 => 6, // Aromatic
+            8 => 8, // Any
             _ => 1,
         };
         let display = match stereo_code {
@@ -2122,23 +2134,20 @@ pub fn molfile_v2000_to_molecule(molfile: &str) -> Result<ChemMolecule, String> 
     }
 
     // Parse M  CHG / M  ISO / M  RAD property block lines (per CTfile spec, presence of M  CHG / M  RAD supersedes atom-block codes)
-    let mut cleared_chg = false;
-    let mut cleared_rad = false;
+    // CTfile spec: any M  CHG *or* M  RAD line supersedes ALL atom-block charge and radical values
+    // (atom-block code 4 = doublet radical is a "charge" field value).
+    let mut cleared_atom_block = false;
     for line in &lines[4 + n_atoms + n_bonds..] {
         if line.starts_with("M  END") {
             break;
         }
         if line.starts_with("M  CHG") || line.starts_with("M  ISO") || line.starts_with("M  RAD") {
-            if line.starts_with("M  CHG") && !cleared_chg {
+            if (line.starts_with("M  CHG") || line.starts_with("M  RAD")) && !cleared_atom_block {
                 for a in &mut mol.atoms {
                     a.charge = 0;
-                }
-                cleared_chg = true;
-            } else if line.starts_with("M  RAD") && !cleared_rad {
-                for a in &mut mol.atoms {
                     a.radical = 0;
                 }
-                cleared_rad = true;
+                cleared_atom_block = true;
             }
             let tokens: Vec<&str> = line[6..].split_whitespace().collect();
             if let Some(cnt_s) = tokens.first() {
@@ -2256,7 +2265,9 @@ pub fn molecule_to_molfile_v2000(mol: &ChemMolecule, title: &str) -> String {
     out.push_str(&clean_title);
     out.push('\n');
     let dim = if mol.has_3d_coords { "3D" } else { "2D" };
-    out.push_str(&format!("  ChiralCraft 1.0 {dim}\n\n"));
+    // CTfile header line 2: IIPPPPPPPPMMDDYYHHmm — program name is 8 chars (cols 3-10), date 10 chars,
+    // dimension code at cols 21-22 where readers look for it.
+    out.push_str(&format!("  ChiralCr{:10}{dim}\n\n", ""));
     let na = mol.atoms.len().min(999);
     let nb = mol
         .bonds
@@ -2300,6 +2311,7 @@ pub fn molecule_to_molfile_v2000(mol: &ChemMolecule, title: &str) -> String {
         let ord_code = match bond.order {
             1..=3 => bond.order,
             6 => 4,
+            8 => 8, // any
             _ => 1,
         };
         let (a1, a2, stereo_code) = match bond.display {
@@ -2320,9 +2332,11 @@ pub fn molecule_to_molfile_v2000(mol: &ChemMolecule, title: &str) -> String {
     }
 
     // Emit M  CHG and M  ISO lines if any non-zero
+    // Only atoms actually written (index <= na) may be referenced by property lines.
     let charges: Vec<(usize, i32)> = mol
         .atoms
         .iter()
+        .take(na)
         .enumerate()
         .filter(|(_, a)| a.charge != 0)
         .map(|(i, a)| (i + 1, a.charge))
@@ -2337,6 +2351,7 @@ pub fn molecule_to_molfile_v2000(mol: &ChemMolecule, title: &str) -> String {
     let isotopes: Vec<(usize, i32)> = mol
         .atoms
         .iter()
+        .take(na)
         .enumerate()
         .filter(|(_, a)| a.isotope != 0)
         .map(|(i, a)| (i + 1, a.isotope))
@@ -2351,6 +2366,7 @@ pub fn molecule_to_molfile_v2000(mol: &ChemMolecule, title: &str) -> String {
     let radicals: Vec<(usize, i32)> = mol
         .atoms
         .iter()
+        .take(na)
         .enumerate()
         .filter(|(_, a)| a.radical != 0)
         .map(|(i, a)| (i + 1, chem_rad_to_mdl(a.radical)))
@@ -2484,7 +2500,8 @@ fn parse_v3000_ctab_lines(lines: &[String]) -> Result<(ChemMolecule, Vec<u32>, V
             };
             let mut atom = ChemAtom::new(aid, z);
             atom.x = parts[2].parse().unwrap_or(0.0);
-            atom.y = parts[3].parse().unwrap_or(0.0);
+            // Molfile Y-up -> ChiralCraft Y-down (same convention as V2000; otherwise stereo is mirrored)
+            atom.y = -parts[3].parse::<f64>().unwrap_or(0.0);
             atom.z_coord = parts[4].parse().unwrap_or(0.0);
             if sym == "D" {
                 atom.isotope = 2;
@@ -2525,9 +2542,14 @@ fn parse_v3000_ctab_lines(lines: &[String]) -> Result<(ChemMolecule, Vec<u32>, V
             }
             let bid: u32 = parts[0].parse().unwrap_or(1);
             let order_code: i32 = parts[1].parse().unwrap_or(1);
+            // V3000 codes: 1-3, 4 aromatic, 5-8 query (8 = any), 9 coordination, 10 hydrogen.
             let order = match order_code {
+                1..=3 => order_code,
                 4 => 6,
-                _ => order_code,
+                8 => 8,
+                9 => 5,
+                10 => 7,
+                _ => 1,
             };
             let a1_id: u32 = parts[2].parse().map_err(|_| format!("Bad V3000 bond begin: {}", parts[2]))?;
             let a2_id: u32 = parts[3].parse().map_err(|_| format!("Bad V3000 bond end: {}", parts[3]))?;
@@ -2572,14 +2594,18 @@ fn write_v3000_ctab_body(
     ));
     out.push_str("M  V30 BEGIN ATOM\n");
     for (idx, atom) in mol.atoms.iter().enumerate() {
-        let sym = get_element(atom.z).map(|e| e.symbol).unwrap_or("*");
+        let sym = match atom.z {
+            225 => "D",
+            226 => "T",
+            _ => get_element(atom.z).map(|e| e.symbol).unwrap_or("*"),
+        };
         let aam = atom_maps.and_then(|m| m.get(idx).copied()).unwrap_or(0);
         out.push_str(&format!(
             "M  V30 {} {} {:.6} {:.6} {:.6} {}",
             idx + 1,
             sym,
             atom.x,
-            atom.y,
+            -atom.y,
             atom.z_coord,
             aam
         ));
@@ -2606,6 +2632,9 @@ fn write_v3000_ctab_body(
         let ord = match bond.order {
             6 => 4,
             1..=3 => bond.order,
+            5 => 9,  // dative -> coordination
+            7 => 10, // hydrogen
+            8 => 8,  // any
             _ => 1,
         };
         let (a1, a2, cfg) = match bond.display {
@@ -2647,9 +2676,11 @@ pub fn molfile_v3000_to_molecule(molfile: &str) -> Result<ChemMolecule, String> 
 /// Serializes a `ChemMolecule` into MDL Molfile V3000 (`CTAB`) format.
 pub fn molecule_to_molfile_v3000(mol: &ChemMolecule, title: &str) -> String {
     let mut out = String::new();
-    out.push_str(title);
+    let clean_title: String = title.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    out.push_str(&clean_title);
     out.push('\n');
-    out.push_str("  ChiralCraft 2D         \n\n");
+    let dim = if mol.has_3d_coords { "3D" } else { "2D" };
+    out.push_str(&format!("  ChiralCr{:10}{dim}\n\n", ""));
     out.push_str("  0  0  0     0  0            999 V3000\n");
     write_v3000_ctab_body(&mut out, mol, None, None);
     out.push_str("M  END\n");
@@ -2659,7 +2690,9 @@ pub fn molecule_to_molfile_v3000(mol: &ChemMolecule, title: &str) -> String {
 
 /// Auto-detects MDL Molfile V2000 vs V3000 (`M  V30 BEGIN CTAB`).
 pub fn molfile_to_molecule(molfile: &str) -> Result<ChemMolecule, String> {
-    if molfile.contains("V3000") || molfile.contains("M  V30") {
+    // Decide from the counts line / V30 records, not the free-text title or comment lines.
+    let counts_v3000 = molfile.lines().nth(3).is_some_and(|l| l.contains("V3000"));
+    if counts_v3000 || molfile.lines().any(|l| l.starts_with("M  V30")) {
         molfile_v3000_to_molecule(molfile)
     } else {
         molfile_v2000_to_molecule(molfile)
@@ -2676,8 +2709,21 @@ pub struct SdfRecord {
 /// Parses an MDL SDfile (`$$$$` delimited records with `> <KEY>` data tags).
 pub fn sdf_to_molecules(sdf: &str) -> Result<Vec<SdfRecord>, String> {
     let mut records = Vec::new();
-    for raw_block in sdf.split("$$$$") {
-        let block = raw_block.trim_start_matches(['\r', '\n']);
+    // Records end at a line that is exactly `$$$$`. Splitting on lines (instead of stripping all
+    // leading newlines) keeps a blank title line, which is common and otherwise shifts the header.
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in sdf.lines() {
+        if line.trim_end() == "$$$$" {
+            blocks.push(std::mem::take(&mut cur));
+        } else {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    blocks.push(cur);
+    for block in &blocks {
+        let block = block.as_str();
         if block.trim().is_empty() {
             continue;
         }
@@ -2693,7 +2739,9 @@ pub fn sdf_to_molecules(sdf: &str) -> Result<Vec<SdfRecord>, String> {
         let mut cur_key: Option<String> = None;
         let mut cur_vals: Vec<String> = Vec::new();
         for line in data_part.lines() {
-            if let Some(rest) = line.trim().strip_prefix('>') {
+            // Data header: `>` in column 1 followed by `<FIELD>`; a value that merely starts with `>` is data.
+            let header = line.strip_prefix('>').filter(|r| r.contains('<') && r.contains('>'));
+            if let Some(rest) = header {
                 if let Some(prev_key) = cur_key.take() {
                     properties.insert(prev_key, cur_vals.join("\n").trim_end().to_string());
                     cur_vals.clear();
@@ -2932,7 +2980,8 @@ pub fn rxn_to_reaction(rxn: &str) -> Result<MdlRxnFile, String> {
 /// Parses a SMILES string into a `ChemMolecule` (supports organic/aromatic subsets, brackets with
 /// isotopes/charges/explicit H, single/double/triple/aromatic bonds, branches, rings `1..=99`, `.` fragments).
 pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
-    let trimmed = smiles.trim();
+    // OpenSMILES: the SMILES token ends at the first whitespace (a title or CXSMILES `|...|` may follow).
+    let trimmed = smiles.split_whitespace().next().unwrap_or("");
     if trimmed.is_empty() {
         return Err("Empty SMILES string".to_string());
     }
@@ -2978,6 +3027,10 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
                 pending_bond = Some(3);
                 i += 1;
             }
+            b'$' => {
+                pending_bond = Some(4);
+                i += 1;
+            }
             b':' => {
                 pending_bond = Some(6);
                 i += 1;
@@ -2991,12 +3044,27 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
             b'%' | b'0'..=b'9' => {
                 let rnum = if bytes[i] == b'%' {
                     i += 1;
+                    if i < bytes.len() && bytes[i] == b'(' {
+                        // OpenSMILES extension `%(nnn)`
+                        let start = i + 1;
+                        let mut j = start;
+                        while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 5 {
+                            j += 1;
+                        }
+                        if j == start || j >= bytes.len() || bytes[j] != b')' {
+                            return Err("Invalid %(nnn) ring closure in SMILES".to_string());
+                        }
+                        let n: usize = trimmed[start..j].parse().map_err(|_| "Invalid %(nnn) ring closure in SMILES".to_string())?;
+                        i = j + 1;
+                        n
+                    } else {
                     if i + 2 > bytes.len() || !bytes[i].is_ascii_digit() || !bytes[i + 1].is_ascii_digit() {
                         return Err("Invalid %nn ring closure in SMILES".to_string());
                     }
                     let n = ((bytes[i] - b'0') as usize) * 10 + ((bytes[i + 1] - b'0') as usize);
                     i += 2;
                     n
+                    }
                 } else {
                     let n = (bytes[i] - b'0') as usize;
                     i += 1;
@@ -3004,6 +3072,14 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
                 };
                 let cur = prev_atom.ok_or_else(|| "Ring digit without preceding atom".to_string())?;
                 if let Some((open_atom, open_order)) = ring_opens.remove(&rnum) {
+                    if open_atom == cur
+                        || mol.bonds.iter().any(|b| {
+                            (b.begin_atom == open_atom && b.end_atom == cur)
+                                || (b.begin_atom == cur && b.end_atom == open_atom)
+                        })
+                    {
+                        return Err(format!("Ring closure {rnum} bonds an atom to itself or duplicates an existing bond"));
+                    }
                     let order = pending_bond.or(open_order).unwrap_or_else(|| {
                         if aromatic_atoms[open_atom] && aromatic_atoms[cur] {
                             6
@@ -3115,6 +3191,28 @@ pub fn smiles_to_molecule(smiles: &str) -> Result<ChemMolecule, String> {
                                 chg = chg.saturating_sub(1);
                             }
                         }
+                        b'@' => {
+                            // Chirality `@`, `@@`, or class form `@TH1`/`@AL2`/`@SP3`/`@TB12`/`@OH25`:
+                            // consume the class letters so the `H` in `TH`/`OH` is not counted as hydrogen.
+                            p += 1;
+                            if p < ib.len() && ib[p] == b'@' {
+                                p += 1;
+                            } else if p + 1 < ib.len()
+                                && matches!(&ib[p..p + 2], b"TH" | b"AL" | b"SP" | b"TB" | b"OH")
+                            {
+                                p += 2;
+                                while p < ib.len() && ib[p].is_ascii_digit() {
+                                    p += 1;
+                                }
+                            }
+                        }
+                        b':' => {
+                            // Atom-map class `:n`
+                            p += 1;
+                            while p < ib.len() && ib[p].is_ascii_digit() {
+                                p += 1;
+                            }
+                        }
                         _ => p += 1,
                     }
                 }
@@ -3214,23 +3312,41 @@ pub fn molecule_to_smiles(mol: &ChemMolecule) -> String {
         .map(|i| adj[i].iter().any(|(_, bi)| arom.aromatic_bonds.contains(bi)))
         .collect();
 
+    // Hydrogen counts a SMILES reader would infer for an unbracketed organic-subset atom
+    // (no explicit H count / valence override); atoms whose actual count differs must be bracketed.
+    let default_val = {
+        let mut bare = mol.clone();
+        for a in &mut bare.atoms {
+            a.explicit_num_hydrogens = None;
+            a.valence_override = None;
+        }
+        CcVal::compute(&bare)
+    };
+
     let format_atom = |i: usize| -> String {
         let a = &mol.atoms[i];
-        let sym = get_element(a.z).map(|e| e.symbol).unwrap_or("*");
+        // Deuterium / tritium pseudo-atoms are written as hydrogen isotopes.
+        let (sym, isotope) = match a.z {
+            225 => ("H", if a.isotope != 0 { a.isotope } else { 2 }),
+            226 => ("H", if a.isotope != 0 { a.isotope } else { 3 }),
+            _ => (get_element(a.z).map(|e| e.symbol).unwrap_or("*"), a.isotope),
+        };
         let is_organic = matches!(a.z, 5 | 6 | 7 | 8 | 9 | 15 | 16 | 17 | 35 | 53);
         let is_arom = atom_is_arom[i];
-        let disp_sym = if is_arom && matches!(a.z, 5 | 6 | 7 | 8 | 15 | 16) {
+        let disp_sym = if is_arom && matches!(a.z, 5 | 6 | 7 | 8 | 15 | 16 | 33 | 34) {
             sym.to_ascii_lowercase()
         } else {
             sym.to_string()
         };
-        let needs_h_in_arom = is_arom && a.z == 7 && val.implicit_h_counts[i] > 0;
-        if is_organic && a.charge == 0 && a.isotope == 0 && a.radical == 0 && !needs_h_in_arom {
+        let h = val.implicit_h_counts[i];
+        let needs_h_in_arom = is_arom && a.z != 6 && h > 0;
+        let nonstandard_h = !is_arom && h != default_val.implicit_h_counts[i];
+        if is_organic && a.charge == 0 && isotope == 0 && a.radical == 0 && !needs_h_in_arom && !nonstandard_h {
             disp_sym
         } else {
             let mut s = String::from("[");
-            if a.isotope != 0 {
-                s.push_str(&a.isotope.to_string());
+            if isotope != 0 {
+                s.push_str(&isotope.to_string());
             }
             s.push_str(&disp_sym);
             if val.implicit_h_counts[i] > 0 {
@@ -3263,6 +3379,8 @@ pub fn molecule_to_smiles(mol: &ChemMolecule) -> String {
         match b.order {
             2 => "=",
             3 => "#",
+            4 => "$",
+            6 => ":",
             _ => {
                 // Explicit single bond between two aromatic atoms (e.g., biphenyl c1ccccc1-c2ccccc2)
                 // MUST emit "-" so parsers do not interpret it as an aromatic bond!
@@ -3279,108 +3397,117 @@ pub fn molecule_to_smiles(mol: &ChemMolecule) -> String {
         }
     };
 
-    // Pass 1: find tree vs back-edges so ring closures get deterministic digits 1..N
+    // Pass 1: DFS spanning tree vs back-edges (ring closures). Iterative so long chains
+    // (polymers, large documents) cannot overflow the thread stack.
     let mut visited = vec![false; n];
     let mut tree_adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    // (back_edge_id, bond_index, other_atom)
     let mut back_edges_at: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n];
-    let mut next_ring = 1usize;
+    let mut next_ring = 0usize;
     let mut roots = Vec::new();
 
-    fn build_tree(
-        u: usize,
-        parent: Option<usize>,
-        adj: &[Vec<(usize, usize)>],
-        visited: &mut [bool],
-        seen_edge: &mut [bool],
-        tree_adj: &mut [Vec<(usize, usize)>],
-        back_edges_at: &mut [Vec<(usize, usize, usize)>],
-        next_ring: &mut usize,
-    ) {
-        visited[u] = true;
-        for &(v, bi) in &adj[u] {
+    let mut seen_edge = vec![false; mol.bonds.len()];
+    for i in 0..n {
+        if visited[i] {
+            continue;
+        }
+        roots.push(i);
+        visited[i] = true;
+        let mut stack: Vec<(usize, Option<usize>, usize)> = vec![(i, None, 0)];
+        while let Some(top) = stack.last_mut() {
+            let (u, parent, k) = *top;
+            if k >= adj[u].len() {
+                stack.pop();
+                continue;
+            }
+            top.2 += 1;
+            let (v, bi) = adj[u][k];
             if Some(v) == parent || seen_edge[bi] {
                 continue;
             }
             seen_edge[bi] = true;
             if !visited[v] {
+                visited[v] = true;
                 tree_adj[u].push((v, bi));
-                build_tree(v, Some(u), adj, visited, seen_edge, tree_adj, back_edges_at, next_ring);
+                stack.push((v, Some(u), 0));
             } else {
-                let r = *next_ring;
-                *next_ring += 1;
-                back_edges_at[u].push((r, bi, v));
-                back_edges_at[v].push((r, bi, u));
+                back_edges_at[u].push((next_ring, bi, v));
+                back_edges_at[v].push((next_ring, bi, u));
+                next_ring += 1;
             }
         }
     }
 
-    let mut seen_edge = vec![false; mol.bonds.len()];
-    for i in 0..n {
-        if !visited[i] {
-            roots.push(i);
-            build_tree(
-                i,
-                None,
-                &adj,
-                &mut visited,
-                &mut seen_edge,
-                &mut tree_adj,
-                &mut back_edges_at,
-                &mut next_ring,
-            );
+    // Pass 2: iterative writer. Ring-closure digits are reused once closed, so any number of
+    // ring bonds fits in 1-9, %10-%99 and %(nnn) without exceeding the reader's range.
+    let mut open_digit: HashMap<usize, usize> = HashMap::new();
+    let mut digit_busy: Vec<bool> = vec![true]; // digit 0 never used
+    let ring_label = |d: usize| -> String {
+        if d < 10 {
+            d.to_string()
+        } else if d < 100 {
+            format!("%{d}")
+        } else {
+            format!("%({d})")
         }
+    };
+    enum Step {
+        Atom(usize, Option<usize>),
+        Text(&'static str),
     }
-
-    let mut emitted_ring: HashMap<usize, bool> = HashMap::new();
-
-    fn write_node(
-        u: usize,
-        format_atom: &dyn Fn(usize) -> String,
-        format_bond: &dyn Fn(usize) -> &'static str,
-        tree_adj: &[Vec<(usize, usize)>],
-        back_edges_at: &[Vec<(usize, usize, usize)>],
-        emitted_ring: &mut HashMap<usize, bool>,
-        out: &mut String,
-    ) {
-        out.push_str(&format_atom(u));
-        for &(rnum, bi, _) in &back_edges_at[u] {
-            if !emitted_ring.contains_key(&rnum) {
-                emitted_ring.insert(rnum, true);
-                out.push_str(format_bond(bi));
-            }
-            if rnum < 10 {
-                out.push_str(&rnum.to_string());
-            } else {
-                out.push_str(&format!("%{rnum}"));
-            }
-        }
-        let children = &tree_adj[u];
-        for (idx, &(v, bi)) in children.iter().enumerate() {
-            let is_last = idx + 1 == children.len();
-            if !is_last {
-                out.push('(');
-            }
-            out.push_str(format_bond(bi));
-            write_node(v, format_atom, format_bond, tree_adj, back_edges_at, emitted_ring, out);
-            if !is_last {
-                out.push(')');
-            }
-        }
-    }
-
     let mut parts = Vec::new();
     for root in roots {
-        let mut part = String::new();
-        write_node(
-            root,
-            &format_atom,
-            &format_bond,
-            &tree_adj,
-            &back_edges_at,
-            &mut emitted_ring,
-            &mut part,
-        );
-        parts.push(part);
+        let mut out = String::new();
+        let mut stack = vec![Step::Atom(root, None)];
+        while let Some(step) = stack.pop() {
+            let (u, in_bond) = match step {
+                Step::Text(t) => {
+                    out.push_str(t);
+                    continue;
+                }
+                Step::Atom(u, b) => (u, b),
+            };
+            if let Some(bi) = in_bond {
+                out.push_str(format_bond(bi));
+            }
+            out.push_str(&format_atom(u));
+            let mut to_free = Vec::new();
+            for &(edge, bi, _) in &back_edges_at[u] {
+                if let Some(d) = open_digit.remove(&edge) {
+                    out.push_str(&ring_label(d));
+                    to_free.push(d);
+                } else {
+                    let d = match digit_busy.iter().position(|b| !b) {
+                        Some(d) => d,
+                        None => {
+                            digit_busy.push(false);
+                            digit_busy.len() - 1
+                        }
+                    };
+                    digit_busy[d] = true;
+                    open_digit.insert(edge, d);
+                    out.push_str(format_bond(bi));
+                    out.push_str(&ring_label(d));
+                }
+            }
+            // Free closed digits only after this atom so it never opens and closes the same digit.
+            for d in to_free {
+                digit_busy[d] = false;
+            }
+            let children = &tree_adj[u];
+            // Push in reverse: branches "(...)" for all but the last child, which continues the chain.
+            for (idx, &(v, bi)) in children.iter().enumerate().rev() {
+                let is_last = idx + 1 == children.len();
+                if !is_last {
+                    stack.push(Step::Text(")"));
+                }
+                stack.push(Step::Atom(v, Some(bi)));
+                if !is_last {
+                    stack.push(Step::Text("("));
+                }
+            }
+        }
+        parts.push(out);
     }
     parts.join(".")
 }
@@ -3618,7 +3745,7 @@ mod tests {
         for &(smi, expected_formula) in &[
             ("c1ccccc1", "C6H6"),
             ("CC(=O)O", "C2H4O2"),
-            ("[NH4+].[Cl-]", "H4ClN"),
+            ("[NH4+].[Cl-]", "ClH4N"), // Hill order: no carbon → strictly alphabetical
             ("CC#N", "C2H3N"),
             ("C12CC1C2", "C4H6"),
         ] {
@@ -3776,5 +3903,91 @@ mod tests {
         assert_eq!(helm.atoms.len(), 4);
         assert_eq!(helm.bonds.len(), 3, "2 intra-chain + 1 inter-chain disulfide bond");
         assert!(helm_to_molecule("PEPTIDE1}A{", 14.4).is_err(), "Inverted braces must return Err, not panic");
+    }
+
+    #[test]
+    fn test_smiles_audit_ring_digits_stereo_classes_and_titles() {
+        // Title / CXSMILES after whitespace is ignored.
+        assert_eq!(smiles_to_molecule("CCO ethanol").unwrap().atoms.len(), 3);
+        // Quadruple bond.
+        let q = smiles_to_molecule("[Re]$[Re]").unwrap();
+        assert_eq!(q.bonds[0].order, 4);
+        assert!(molecule_to_smiles(&q).contains('$'));
+        // Ring closure to self / duplicate bond is an error.
+        assert!(smiles_to_molecule("C11").is_err());
+        assert!(smiles_to_molecule("C1C1").is_err());
+        // Chirality class `@TH1` / `@OH5` must not add hydrogens; atom maps ignored.
+        let th = smiles_to_molecule("F[C@TH1](Cl)(Br)I").unwrap();
+        assert_eq!(th.compute_formula_properties().get_formula(), "CBrClFI");
+        let mapped = smiles_to_molecule("[CH4:12]").unwrap();
+        assert_eq!(mapped.compute_formula_properties().get_formula(), "CH4");
+        // %(nnn) ring closures.
+        assert_eq!(smiles_to_molecule("C%(123)CC%(123)").unwrap().bonds.len(), 3);
+        // Many rings: digits are reused and never exceed the reader's range; deep chain no stack overflow.
+        let mut big = String::new();
+        for _ in 0..150 {
+            big.push_str("C1CC1");
+        }
+        let m = smiles_to_molecule(&big).unwrap();
+        let out = molecule_to_smiles(&m);
+        let back = smiles_to_molecule(&out).unwrap();
+        assert_eq!(back.bonds.len(), m.bonds.len());
+        // shortcut: 10k atoms is enough to overflow a recursive DFS on the 2 MiB test thread;
+        // larger chains are slow because ChemMolecule::neighbors scans every bond (O(n*m)).
+        let chain = "C".repeat(10_000);
+        let cm = smiles_to_molecule(&chain).unwrap();
+        assert_eq!(molecule_to_smiles(&cm).len(), 10_000);
+        // Deuterium pseudo-atom written as [2H]; aromatic NH and nonstandard H counts bracketed.
+        let pyrrole = smiles_to_molecule("c1cc[nH]c1").unwrap();
+        let ps = molecule_to_smiles(&pyrrole);
+        let pb = smiles_to_molecule(&ps).unwrap();
+        assert_eq!(pb.compute_formula_properties().get_formula(), "C4H5N", "{ps}");
+        let mut dmol = smiles_to_molecule("CC").unwrap();
+        dmol.atoms[1].z = 225;
+        assert_eq!(molecule_to_smiles(&dmol), "C[2H]");
+        let carbene = smiles_to_molecule("[CH2]").unwrap();
+        let cs = molecule_to_smiles(&carbene);
+        assert_eq!(smiles_to_molecule(&cs).unwrap().compute_formula_properties().get_formula(), "CH2", "{cs}");
+    }
+
+    #[test]
+    fn test_mdl_sdf_cdx_audit_regressions() {
+        // V2000: an M  RAD line supersedes the atom-block charge field too (code 3 = +1 ignored).
+        let mol = "\n  test\n\n  1  0  0  0  0  0  0  0  0  0999 V2000\n    0.0000    0.0000    0.0000 C   0  3  0  0  0  0  0  0  0  0  0  0\nM  RAD  1   1   2\nM  END\n";
+        let m = molfile_v2000_to_molecule(mol).unwrap();
+        assert_eq!((m.atoms[0].charge, m.atoms[0].radical), (0, 1));
+        // Header dimension code lands in columns 21-22.
+        let mut m3 = smiles_to_molecule("CC").unwrap();
+        m3.has_3d_coords = true;
+        let v2 = molecule_to_molfile_v2000(&m3, "t");
+        assert_eq!(v2.lines().nth(1).unwrap().get(20..22), Some("3D"));
+        // Title mentioning V3000 must not switch the V2000 parser off.
+        let v2_titled = molecule_to_molfile_v2000(&m3, "V3000 export");
+        assert_eq!(molfile_to_molecule(&v2_titled).unwrap().atoms.len(), 2);
+        // V3000: Y axis flipped like V2000 (no mirror image), D written as D, dative/hydrogen codes, query order 5 not dative.
+        let mut s = smiles_to_molecule("CN").unwrap();
+        s.atoms[0].y = 5.0;
+        s.atoms[1].z = 225;
+        s.bonds[0].order = 5;
+        let v3 = molecule_to_molfile_v3000(&s, "t");
+        assert!(v3.contains(" D ") && v3.contains("M  V30 1 9 "), "{v3}");
+        let v2_from_v3 = molfile_v2000_to_molecule(&molecule_to_molfile_v2000(&s, "t")).unwrap();
+        let back = molfile_v3000_to_molecule(&v3).unwrap();
+        assert!((back.atoms[0].y - 5.0).abs() < 1e-6 && (v2_from_v3.atoms[0].y - 5.0).abs() < 1e-6);
+        assert_eq!(back.bonds[0].order, 5);
+        let q = v3.replace("M  V30 1 9 ", "M  V30 1 5 ");
+        assert_eq!(molfile_v3000_to_molecule(&q).unwrap().bonds[0].order, 1);
+        // SDF: blank-title second record and a value starting with '>'.
+        let rec = |t: &str| SdfRecord {
+            title: t.to_string(),
+            molecule: smiles_to_molecule("CO").unwrap(),
+            properties: BTreeMap::from([("NOTE".to_string(), ">5 mg".to_string())]),
+        };
+        let sdf = molecules_to_sdf(&[rec("first"), rec("")]);
+        let recs = sdf_to_molecules(&sdf).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].title, "");
+        assert_eq!(recs[1].molecule.atoms.len(), 2);
+        assert_eq!(recs[1].properties.get("NOTE").map(String::as_str), Some(">5 mg"));
     }
 }

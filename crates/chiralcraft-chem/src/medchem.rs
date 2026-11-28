@@ -397,9 +397,11 @@ pub fn compute_medchem_report(mol: &ChemMolecule) -> MedChemReport {
     if hba > 10 { lipinski_violations += 1; }
     let lipinski_pass = lipinski_violations <= 1;
     let veber_pass = rotatable_bonds <= 10 && tpsa <= 140.0;
+    // Ghose (1999) atom-count window counts ALL atoms, hydrogens included.
+    let total_atoms = mol.atoms.len() + val.implicit_h_counts.iter().map(|&h| h as usize).sum::<usize>();
     let ghose_pass = (160.0..=480.0).contains(&mw)
         && (-0.4..=5.6).contains(&log_p)
-        && (20..=70).contains(&heavy_atoms)
+        && (20..=70).contains(&total_atoms)
         && (40.0..=130.0).contains(&props.molar_refractivity);
 
     // Pfizer Wager CNS MPO (0.0 to 6.0): 6 desirability ramps
@@ -466,7 +468,10 @@ pub fn compute_medchem_report(mol: &ChemMolecule) -> MedChemReport {
         .filter(|b| b.begin_atom < n && b.end_atom < n && mol.atoms[b.begin_atom].z > 1 && mol.atoms[b.end_atom].z > 1)
         .count();
     let ring_complexity = (heavy_bonds as isize - heavy_atoms as isize + 1).max(0) as f64;
-    let bridgehead_like = (0..n).filter(|&i| adj[i].len() >= 4).count() as f64;
+    // Heavy-atom degree only: explicit H must not inflate complexity vs the implicit-H drawing.
+    let bridgehead_like = (0..n)
+        .filter(|&i| adj[i].iter().filter(|&&(k, _)| mol.atoms[k].z > 1).count() >= 4)
+        .count() as f64;
     let sa_score = (1.4
         + (heavy_atoms as f64) * 0.055
         + ring_complexity * 0.42
@@ -815,5 +820,23 @@ mod tests {
         epox.add_bond(12, 2, 0, 1, BondDisplay::Solid);
         let alerts = detect_structural_alerts(&epox);
         assert!(alerts.iter().any(|a| a.name.contains("Epoxide")));
+    }
+
+    #[test]
+    fn test_ghose_counts_hydrogens_and_sa_ignores_explicit_h() {
+        // Bromobenzene C6H5Br: 7 heavy + 5 H = 12 atoms < 20 -> Ghose fails on atom count.
+        let brb = make_bromobenzene();
+        assert!(!compute_medchem_report(&brb).ghose_pass);
+        // Methane drawn implicit vs explicit: SA must not change.
+        let mut ch4 = ChemMolecule::new();
+        ch4.add_atom(ChemAtom::new(1, 6));
+        let mut ch4h = ch4.clone();
+        for k in 0..4 {
+            let h = ch4h.add_atom(ChemAtom::new(2 + k, 1));
+            ch4h.add_bond(10 + k, 0, h, 1, BondDisplay::Solid);
+        }
+        let a = compute_medchem_report(&ch4).sa_score;
+        let b = compute_medchem_report(&ch4h).sa_score;
+        assert!((a - b).abs() < 1e-9, "SA {a} vs {b}");
     }
 }

@@ -87,11 +87,7 @@ pub fn is_valid_quantum_orca_binary(path: &Path) -> bool {
         }
     }
     // Confirm it doesn't identify as GNOME screen reader; in tests, mock scripts may echo ORCA banner
-    let Ok(out) = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-    else {
+    let Some(out) = output_with_timeout(Command::new(path).arg("--version"), VERSION_PROBE_TIMEOUT) else {
         return false;
     };
     let combined = format!(
@@ -129,7 +125,7 @@ pub fn detect_qc_binaries(
         find_on_path("xtb")
     };
     if let Some(p) = xtb_cand.filter(|p| p.is_file()) {
-        if let Ok(out) = Command::new(&p).arg("--version").stdin(Stdio::null()).output() {
+        if let Some(out) = output_with_timeout(Command::new(&p).arg("--version"), VERSION_PROBE_TIMEOUT) {
             let txt = format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -279,6 +275,11 @@ impl QuantumRunnerState {
         bin_path: String,
     ) {
         if let Some(hit) = self.cache.get(&cache_key).cloned() {
+            // Supersede any in-flight job, else its later result would overwrite this cached one.
+            self.cancel_flag.store(true, Ordering::SeqCst);
+            self.rx = None;
+            self.running = false;
+            self.started_at = None;
             self.last_error.clear();
             self.last_outcome = Some(hit);
             return;
@@ -352,6 +353,90 @@ impl QuantumRunnerState {
     }
 }
 
+/// Spawns `cmd` as leader of its own process group (unix) so cancel/timeout can also reach
+/// grandchildren such as ORCA's MPI workers.
+fn spawn_in_own_group(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+}
+
+/// Kills a child spawned by `spawn_in_own_group` and (unix) its whole process group:
+/// SIGTERM, short grace, then SIGKILL; `child.kill()` remains the fallback (and the Windows path).
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = format!("-{}", child.id());
+        let signal_group = |sig: &str| {
+            let _ = Command::new("kill")
+                .args(["-s", sig, "--", &pgid])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        };
+        signal_group("TERM");
+        let grace = Instant::now();
+        while grace.elapsed() < Duration::from_millis(500) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        // Even if the leader exited on TERM, grandchildren may linger in the group.
+        signal_group("KILL");
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Like `Command::output()` but bounded: the process (group) is killed after `timeout`.
+fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+    use std::io::Read;
+    let mut child = spawn_in_own_group(cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())).ok()?;
+    // Drain pipes on threads so a chatty process cannot block on a full pipe.
+    let mut so = child.stdout.take()?;
+    let mut se = child.stderr.take()?;
+    let t_out = thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = so.read_to_end(&mut v);
+        v
+    });
+    let t_err = thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = se.read_to_end(&mut v);
+        v
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if start.elapsed() < timeout => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                kill_process_tree(&mut child);
+                return None;
+            }
+        }
+    };
+    // A lingering grandchild could hold the pipes open; reap the group if they don't close in time.
+    while !(t_out.is_finished() && t_err.is_finished()) && start.elapsed() < timeout {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if !(t_out.is_finished() && t_err.is_finished()) {
+        kill_process_tree(&mut child);
+    }
+    Some(std::process::Output {
+        status,
+        stdout: t_out.join().unwrap_or_default(),
+        stderr: t_err.join().unwrap_or_default(),
+    })
+}
+
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn wait_child_status_cancellable(
     mut child: std::process::Child,
     cancel: &AtomicBool,
@@ -360,13 +445,11 @@ fn wait_child_status_cancellable(
     let start = Instant::now();
     loop {
         if cancel.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_tree(&mut child);
             return Err("Cancelled by user".to_string());
         }
         if start.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_tree(&mut child);
             return Err(format!("Quantum job timed out after {} s", timeout.as_secs()));
         }
         match child.try_wait() {
@@ -389,20 +472,32 @@ fn create_private_qc_workdir() -> Result<PathBuf, String> {
             "chiralcraft-qc-{}-{nanos}-{seq}-{attempt}",
             std::process::id()
         ));
-        match fs::create_dir(&cand) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&cand, fs::Permissions::from_mode(0o700));
-                }
-                return Ok(cand);
-            }
+        // Create with 0o700 atomically (no window where the scratch dir is world-accessible).
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&cand) {
+            Ok(()) => return Ok(cand),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("Failed creating scratch dir: {e}")),
         }
     }
     Err("Failed creating unique quantum scratch dir".to_string())
+}
+
+/// The child runs with `current_dir(workdir)`, so a relative path like `bin/xtb` would be resolved
+/// against the scratch dir. Anchor such paths to our cwd; bare names (`xtb`) still use PATH lookup.
+fn resolve_bin_for_workdir(bin_path: &str) -> PathBuf {
+    let p = PathBuf::from(bin_path.trim());
+    if p.is_relative() && p.components().count() > 1 {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(p);
+        }
+    }
+    p
 }
 
 fn normalize_xtb_solvent(raw: &str) -> Result<Option<String>, String> {
@@ -437,12 +532,12 @@ fn run_command_logged(
     let err_path = workdir.join("stderr.log");
     let out_file = fs::File::create(&out_path).map_err(|e| format!("Create stdout.log: {e}"))?;
     let err_file = fs::File::create(&err_path).map_err(|e| format!("Create stderr.log: {e}"))?;
-    let child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(err_file))
-        .spawn()
-        .map_err(|e| format!("Failed to spawn {label}: {e}"))?;
+    let child = spawn_in_own_group(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file)),
+    )
+    .map_err(|e| format!("Failed to spawn {label}: {e}"))?;
     let status = wait_child_status_cancellable(child, cancel, timeout)?;
     let stdout_s = fs::read_to_string(&out_path).unwrap_or_default();
     let stderr_s = fs::read_to_string(&err_path).unwrap_or_default();
@@ -468,6 +563,9 @@ pub fn run_qc_job_blocking(
     let uhf = spec.multiplicity.saturating_sub(1);
 
     let workdir = create_private_qc_workdir()?;
+    let resolved_bin = resolve_bin_for_workdir(bin_path);
+    let resolved_bin = resolved_bin.to_string_lossy(); // input was &str, so lossless
+    let bin_path: &str = &resolved_bin;
 
     // Guard cleanup on drop
     struct CleanupDir(PathBuf);
@@ -782,6 +880,51 @@ mod tests {
         assert_eq!(idx, "0");
     }
 
+    #[test]
+    fn test_relative_bin_anchored_and_workdir_private() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(resolve_bin_for_workdir("bin/xtb"), cwd.join("bin/xtb"));
+        assert_eq!(resolve_bin_for_workdir("xtb"), PathBuf::from("xtb"));
+        assert_eq!(resolve_bin_for_workdir("/opt/xtb"), PathBuf::from("/opt/xtb"));
+        let wd = create_private_qc_workdir().unwrap();
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&wd).unwrap().permissions().mode() & 0o777, 0o700);
+        let _ = fs::remove_dir(&wd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_version_probe_bounded_and_cancel_kills_grandchildren() {
+        let tmp = std::env::temp_dir().join(format!("chiralcraft-test-pg-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp);
+        // Hanging `--version` must not block detection forever.
+        let hang = tmp.join("hang.sh");
+        fs::write(&hang, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&hang, fs::Permissions::from_mode(0o755)).unwrap();
+        let t0 = Instant::now();
+        assert!(!is_valid_quantum_orca_binary(&hang));
+        assert!(t0.elapsed() < Duration::from_secs(10));
+
+        // Cancel must also kill a backgrounded grandchild (MPI-worker stand-in).
+        let pidfile = tmp.join("gc.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()));
+        let child = spawn_in_own_group(&mut cmd).unwrap();
+        while !fs::read_to_string(&pidfile).map(|s| s.ends_with('\n')).unwrap_or(false) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let gc_pid = fs::read_to_string(&pidfile).unwrap().trim().to_string();
+        let cancel = AtomicBool::new(true);
+        assert!(wait_child_status_cancellable(child, &cancel, Duration::from_secs(60)).is_err());
+        let alive = || Command::new("kill").args(["-0", &gc_pid]).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+        let t1 = Instant::now();
+        while alive() && t1.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "grandchild {gc_pid} survived cancel");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_binary_detection_rejects_gnome_orca_and_runs_mock_xtb() {
@@ -846,6 +989,18 @@ echo "normal termination of xtb"
         assert_eq!(outcome.ir_prediction.bands.len(), 2);
         assert!(outcome.ir_prediction.mode_geometry_3d.is_some());
         assert!(outcome.ir_prediction.bands.iter().all(|b| b.normal_mode_vectors.is_some()));
+
+        // 3. A cache hit while another job is in flight must supersede (cancel) that job.
+        let mut st = QuantumRunnerState::default();
+        st.cache.insert("O|gfn2".to_string(), outcome);
+        let slow = tmp.join("slow.sh");
+        fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+        st.start_ir_job(QcRunBackend::XtbGfn2, &water, "other".into(), QuantumJobSpec::default(), slow.to_string_lossy().into());
+        assert!(st.running);
+        st.start_ir_job(QcRunBackend::XtbGfn2, &water, "O|gfn2".into(), QuantumJobSpec::default(), slow.to_string_lossy().into());
+        assert!(!st.running && st.poll().is_none());
+        assert_eq!(st.last_outcome.as_ref().map(|o| o.cache_key.as_str()), Some("O|gfn2"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

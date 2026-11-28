@@ -173,6 +173,10 @@ enum ActiveDialog {
     Shortcuts,
     Licensing,
     About,
+    /// Active tab has unsaved changes and its close was requested.
+    ConfirmCloseTab,
+    /// The window close was requested while documents have unsaved changes.
+    ConfirmExit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,9 +254,214 @@ struct OpenDocTab {
     scroll: Vec2,
     maximized: bool,
     minimized: bool,
+    /// Side-table state observed at each undo-history position (`side_history[k]` = state at cursor `k`),
+    /// so Undo/Redo/Revert restore fills, maps and links together with the scene they index into.
+    side_history: Vec<Option<MolSideTables>>,
+    side_cursor: usize,
+}
+
+/// Molecule/atom/bond-indexed tables kept beside the document scene (not part of `DocumentScene`).
+#[derive(Clone)]
+struct MolSideTables {
+    groups: Vec<Vec<usize>>,
+    reaction_atom_maps: HashMap<(usize, usize), u32>,
+    reaction_auto_numbers: HashMap<usize, String>,
+    enhanced_stereo: HashMap<(usize, usize), EnhancedStereoKind>,
+    ring_fills: HashMap<usize, Color32>,
+    mol_highlights: HashMap<usize, Color32>,
+    double_bond_align: HashMap<(usize, usize), DoubleBondAlign>,
+    linked_captions: Vec<LinkedCaption>,
+    /// Selection is molecule-indexed too: restoring it keeps Undo from selecting a neighbour.
+    selected_mols: Vec<usize>,
 }
 
 impl OpenDocTab {
+    fn side_tables(&self) -> MolSideTables {
+        MolSideTables {
+            groups: self.groups.clone(),
+            reaction_atom_maps: self.reaction_atom_maps.clone(),
+            reaction_auto_numbers: self.reaction_auto_numbers.clone(),
+            enhanced_stereo: self.enhanced_stereo.clone(),
+            ring_fills: self.ring_fills.clone(),
+            mol_highlights: self.mol_highlights.clone(),
+            double_bond_align: self.double_bond_align.clone(),
+            linked_captions: self.linked_captions.clone(),
+            selected_mols: self.selected_mols.clone(),
+        }
+    }
+
+    fn set_side_tables(&mut self, s: MolSideTables) {
+        self.groups = s.groups;
+        self.reaction_atom_maps = s.reaction_atom_maps;
+        self.reaction_auto_numbers = s.reaction_auto_numbers;
+        self.enhanced_stereo = s.enhanced_stereo;
+        self.ring_fills = s.ring_fills;
+        self.mol_highlights = s.mol_highlights;
+        self.double_bond_align = s.double_bond_align;
+        self.linked_captions = s.linked_captions;
+        self.selected_mols = s.selected_mols;
+    }
+
+    /// Record the side tables for the current undo position. Run once per frame (before input is
+    /// handled), so the entry at the pre-action cursor still holds the pre-action tables.
+    fn sync_side_history(&mut self) {
+        let c = self.doc.undo_cursor();
+        if c < self.side_cursor {
+            // History was reset/replaced outside Undo (e.g. a new document); start over.
+            self.side_history.clear();
+        } else if c > self.side_cursor {
+            // New transaction(s) recorded: the old redo branch is gone.
+            self.side_history.truncate(self.side_cursor + 1);
+        }
+        if self.side_history.len() <= c {
+            self.side_history.resize(c + 1, None);
+        }
+        self.side_history[c] = Some(self.side_tables());
+        self.side_cursor = c;
+    }
+
+    /// `Edit > Undo` / `Edit > Redo` including the side tables. Returns whether the document changed.
+    fn undo_redo(&mut self, redo: bool) -> bool {
+        self.sync_side_history();
+        let changed = if redo { self.doc.redo() } else { self.doc.undo() };
+        if changed {
+            let c = self.doc.undo_cursor();
+            if let Some(Some(s)) = self.side_history.get(c).cloned() {
+                self.set_side_tables(s);
+            }
+            self.side_cursor = c;
+        }
+        changed
+    }
+
+    /// `File > Revert` including the side tables as they were at the last save.
+    fn revert(&mut self) -> bool {
+        self.sync_side_history();
+        let saved = self.doc.saved_undo_cursor().and_then(|sc| self.side_history.get(sc).cloned().flatten());
+        let changed = self.doc.revert();
+        if changed {
+            if let Some(s) = saved {
+                self.set_side_tables(s);
+            }
+            self.side_history.clear();
+            self.side_cursor = 0;
+            self.sync_side_history();
+        }
+        changed
+    }
+
+    /// Re-key molecule-indexed side tables after `removed` molecule indices were deleted from the
+    /// scene, so later molecules keep their fills/maps/linked captions instead of inheriting a neighbour's.
+    fn remap_after_mol_removal(&mut self, removed: &[usize]) {
+        if removed.is_empty() {
+            return;
+        }
+        let mut rm = removed.to_vec();
+        rm.sort_unstable();
+        rm.dedup();
+        self.remap_mol_indices(|mi| match rm.binary_search(&mi) {
+            Ok(_) => None,
+            Err(shift) => Some(mi - shift),
+        });
+    }
+
+    /// Re-key side tables after molecule `from` was removed and re-inserted at index `to`.
+    fn remap_after_mol_move(&mut self, from: usize, to: usize) {
+        self.remap_mol_indices(|mi| {
+            Some(if mi == from {
+                to
+            } else if from < to && mi > from && mi <= to {
+                mi - 1
+            } else if to < from && mi >= to && mi < from {
+                mi + 1
+            } else {
+                mi
+            })
+        });
+    }
+
+    /// Apply a molecule-index mapping (`None` = molecule gone) to every molecule-indexed side table.
+    fn remap_mol_indices(&mut self, map: impl Fn(usize) -> Option<usize> + Copy) {
+        fn rekey<K: Copy + Eq + std::hash::Hash, V>(
+            m: &mut HashMap<K, V>,
+            f: impl Fn(K) -> Option<K>,
+        ) {
+            *m = std::mem::take(m).into_iter().filter_map(|(k, v)| f(k).map(|k| (k, v))).collect();
+        }
+        rekey(&mut self.reaction_atom_maps, |(mi, ai)| map(mi).map(|m| (m, ai)));
+        rekey(&mut self.enhanced_stereo, |(mi, ai)| map(mi).map(|m| (m, ai)));
+        rekey(&mut self.double_bond_align, |(mi, bi)| map(mi).map(|m| (m, bi)));
+        rekey(&mut self.reaction_auto_numbers, map);
+        rekey(&mut self.ring_fills, map);
+        rekey(&mut self.mol_highlights, map);
+        self.selected_mols = self.selected_mols.iter().filter_map(|&mi| map(mi)).collect();
+        for grp in &mut self.groups {
+            *grp = grp.iter().filter_map(|&mi| map(mi)).collect();
+        }
+        self.groups.retain(|g| g.len() >= 2);
+        self.linked_captions.retain_mut(|lc| match map(lc.molecule_idx) {
+            Some(m) => {
+                lc.molecule_idx = m;
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Re-key side tables after molecule `drop` was appended into `keep` (its atoms/bonds offset by
+    /// `atom_off`/`bond_off`) and then removed from the scene.
+    fn remap_after_mol_merge(&mut self, keep: usize, drop: usize, atom_off: usize, bond_off: usize) {
+        fn moveinto<V>(m: &mut HashMap<(usize, usize), V>, keep: usize, drop: usize, off: usize) {
+            *m = std::mem::take(m)
+                .into_iter()
+                .map(|((mi, i), v)| if mi == drop { ((keep, i + off), v) } else { ((mi, i), v) })
+                .collect();
+        }
+        moveinto(&mut self.reaction_atom_maps, keep, drop, atom_off);
+        moveinto(&mut self.enhanced_stereo, keep, drop, atom_off);
+        moveinto(&mut self.double_bond_align, keep, drop, bond_off);
+        for lc in &mut self.linked_captions {
+            if lc.molecule_idx == drop {
+                lc.molecule_idx = keep;
+            }
+        }
+        // The merged structure keeps its own colours, else adopts the absorbed one's.
+        for m in [&mut self.ring_fills, &mut self.mol_highlights] {
+            if let Some(c) = m.get(&drop).copied() {
+                m.entry(keep).or_insert(c);
+            }
+        }
+        self.remap_after_mol_removal(&[drop]);
+    }
+
+    /// Re-key atom-indexed side tables after atom `ai` of molecule `mi` was deleted.
+    fn remap_after_atom_removal(&mut self, mi: usize, ai: usize) {
+        fn shift<V>(m: &mut HashMap<(usize, usize), V>, mi: usize, ai: usize) {
+            *m = std::mem::take(m)
+                .into_iter()
+                .filter_map(|((m0, a), v)| match (m0 == mi, a.cmp(&ai)) {
+                    (true, std::cmp::Ordering::Equal) => None,
+                    (true, std::cmp::Ordering::Greater) => Some(((m0, a - 1), v)),
+                    _ => Some(((m0, a), v)),
+                })
+                .collect();
+        }
+        shift(&mut self.reaction_atom_maps, mi, ai);
+        shift(&mut self.enhanced_stereo, mi, ai);
+    }
+
+    /// Re-key bond-indexed side tables after bond `bi` of molecule `mi` was deleted.
+    fn remap_after_bond_removal(&mut self, mi: usize, bi: usize) {
+        self.double_bond_align = std::mem::take(&mut self.double_bond_align)
+            .into_iter()
+            .filter_map(|((m0, b), v)| match (m0 == mi, b.cmp(&bi)) {
+                (true, std::cmp::Ordering::Equal) => None,
+                (true, std::cmp::Ordering::Greater) => Some(((m0, b - 1), v)),
+                _ => Some(((m0, b), v)),
+            })
+            .collect();
+    }
+
     fn new_at(doc: InteractiveDocument, offset_idx: usize) -> Self {
         let cascade = ((offset_idx % 8) as f32) * 24.0;
         let title = doc.name.clone();
@@ -292,6 +501,8 @@ impl OpenDocTab {
             scroll: Vec2::ZERO,
             maximized: true,
             minimized: false,
+            side_history: Vec::new(),
+            side_cursor: 0,
         }
     }
 
@@ -323,7 +534,11 @@ struct ChiralCraftApp {
     sel_drag_start_mols: Option<Vec<ChemMolecule>>,
     last_desk_size: Vec2,
     pending_pubchem_caps: HashMap<u32, u64>,
+    /// (dialog key, gesture) of the last coalescable dialog edit; see `coalesced_scene_tx`.
+    undo_coalesce: Option<(egui::Id, egui::Id)>,
     roundtrip_saved_on_close: bool,
+    /// The user chose to quit despite unsaved documents; let the next close request through.
+    exit_confirmed: bool,
     clipboard_mols: Vec<ChemMolecule>,
     hovered_atom: Option<(usize, usize)>,
     hovered_bond: Option<(usize, usize)>,
@@ -513,7 +728,9 @@ impl ChiralCraftApp {
             sel_drag_start_mols: None,
             last_desk_size: Vec2::new(1180.0, 680.0),
             pending_pubchem_caps: HashMap::new(),
+            undo_coalesce: None,
             roundtrip_saved_on_close: false,
+            exit_confirmed: false,
             clipboard_mols: Vec::new(),
             hovered_atom: None,
             hovered_bond: None,
@@ -867,15 +1084,20 @@ impl ChiralCraftApp {
         app
     }
 
-    /// Atomically flush the active document back to `roundtrip_svg_path` (called on Ctrl+S & window exit).
+    /// Atomically flush the round-trip tab's document back to `roundtrip_svg_path` (called on Ctrl+S & window exit).
     fn save_roundtrip_svg(&mut self) -> Result<(), String> {
         let Some(ref path) = self.roundtrip_svg_path.clone() else {
             return Ok(());
         };
+        // Write the tab bound to the host SVG, not whichever tab happens to be active
+        // (other tabs may have been opened since launch).
+        let Some(ti) = self.tabs.iter().position(|t| t.file_path.as_deref() == Some(path.as_str())) else {
+            return Ok(());
+        };
         let dark_ink = self.ui_theme == UiTheme::DarkSlide;
-        let svg = self.doc().to_svg_styled(true, dark_ink, self.rear_opacity, self.crossing_clearance_pt);
+        let svg = self.tabs[ti].doc.to_svg_styled(true, dark_ink, self.rear_opacity, self.crossing_clearance_pt);
         atomic_write_text(path, &svg)?;
-        self.doc_mut().save();
+        self.tabs[ti].doc.save();
         self.status_msg = format!("Applied editable SVG updates to {path}");
         Ok(())
     }
@@ -897,7 +1119,13 @@ impl ChiralCraftApp {
 
     #[inline]
     fn doc_mut(&mut self) -> &mut InteractiveDocument {
-        &mut self.tabs[self.active_tab].doc
+        let t = &mut self.tabs[self.active_tab];
+        // A step was recorded since the last sync (several edits in one frame): snapshot its side
+        // tables now, before this access can record the next one.
+        if t.doc.undo_cursor() != t.side_cursor {
+            t.sync_side_history();
+        }
+        &mut t.doc
     }
 
     /// Indices of molecules targeted by an edit/transform: selected molecules if any, else all.
@@ -1003,9 +1231,9 @@ impl ChiralCraftApp {
                 match InteractiveDocument::from_svg(&svg) {
                     Ok(imported) => {
                         let count = imported.scene.molecules.len();
-                        for m in imported.scene.molecules {
-                            self.doc_mut().stamp_molecule_tx(m, "Paste Editable SVG");
-                        }
+                        let start = self.doc().scene.molecules.len();
+                        stamp_molecules_tx(self.doc_mut(), imported.scene.molecules, "Paste Editable SVG");
+                        self.tab_mut().selected_mols = (start..start + count).collect();
                         self.status_msg = format!("Pasted {count} editable structure(s) from SVG clipboard");
                         return;
                     }
@@ -1017,15 +1245,15 @@ impl ChiralCraftApp {
             }
         }
         if !self.clipboard_mols.is_empty() {
-            let clip = self.clipboard_mols.clone();
+            let mut clip = self.clipboard_mols.clone();
             let n = clip.len();
-            for mut m in clip {
-                for a in &mut m.atoms {
-                    a.x += 20.0;
-                    a.y += 20.0;
-                }
-                self.doc_mut().stamp_molecule_tx(m, "Paste");
+            for a in clip.iter_mut().flat_map(|m| m.atoms.iter_mut()) {
+                a.x += 20.0;
+                a.y += 20.0;
             }
+            let start = self.doc().scene.molecules.len();
+            stamp_molecules_tx(self.doc_mut(), clip, "Paste");
+            self.tab_mut().selected_mols = (start..start + n).collect();
             self.status_msg = format!("Pasted {n} structure(s)");
         }
     }
@@ -1044,13 +1272,15 @@ impl ChiralCraftApp {
         targets.sort_unstable();
         targets.dedup();
         targets.reverse();
+        let nmols = self.doc().scene.molecules.len();
+        targets.retain(|&mi| mi < nmols);
+        let removed = targets.clone();
         self.doc_mut().apply_scene_tx("Cut", |s, _| {
             for mi in targets {
-                if mi < s.molecules.len() {
-                    s.molecules.remove(mi);
-                }
+                s.molecules.remove(mi);
             }
         });
+        self.tab_mut().remap_after_mol_removal(&removed);
         self.tab_mut().selected_mols.clear();
         self.sanitize_state();
         self.status_msg = format!("Cut {n} structure(s)");
@@ -1063,14 +1293,16 @@ impl ChiralCraftApp {
             sel.sort_unstable();
             sel.dedup();
             sel.reverse();
+            let nmols = self.doc().scene.molecules.len();
+            sel.retain(|&mi| mi < nmols);
             let n = sel.len();
+            let removed = sel.clone();
             self.doc_mut().apply_scene_tx("Clear Selection", |s, _| {
                 for mi in sel {
-                    if mi < s.molecules.len() {
-                        s.molecules.remove(mi);
-                    }
+                    s.molecules.remove(mi);
                 }
             });
+            self.tab_mut().remap_after_mol_removal(&removed);
             self.tab_mut().selected_mols.clear();
             self.sanitize_state();
             self.status_msg = format!("Cleared {n} selected structure(s)");
@@ -1096,13 +1328,14 @@ impl ChiralCraftApp {
 
     /// Real disk-backed `File > Save` (`Ctrl+S`): writes to existing `file_path` (or round-trip SVG) or prompts `Save As`.
     fn do_save_action(&mut self) {
-        if self.roundtrip_svg_path.is_some() {
+        if self.roundtrip_svg_path.is_some() && self.tab().file_path == self.roundtrip_svg_path {
             if let Err(e) = self.save_roundtrip_svg() {
                 self.status_msg = format!("Round-trip save failed: {e}");
             }
             return;
         }
-        if let Some(path) = self.tab().file_path.clone() {
+        let current = self.tab().file_path.clone();
+        if let Some(path) = current.filter(|p| !save_as_format_is_lossy(self.doc(), p)) {
             let dark_ink = self.ui_theme == UiTheme::DarkSlide;
             match save_document_any_styled(
                 self.doc(),
@@ -1120,6 +1353,12 @@ impl ChiralCraftApp {
                     self.status_msg = format!("Save failed: {e}");
                 }
             }
+        } else if let Some(path) = self.tab().file_path.clone() {
+            // Current file's format cannot hold the whole drawing: re-saving there and marking the
+            // document clean would silently lose data, so ask for a lossless target instead.
+            self.file_path_buf = std::path::Path::new(&path).with_extension("cdxml").to_string_lossy().into_owned();
+            self.status_msg = format!("{path} cannot hold the whole drawing — choose a CDXML/CDX file to save");
+            self.dialog = ActiveDialog::SaveAs;
         } else {
             self.file_path_buf = format!(
                 "{}.cdxml",
@@ -1824,7 +2063,17 @@ impl ChiralCraftApp {
         self.status_msg = format!("Created {name}");
     }
 
+    /// Close the active tab, asking first when it has unsaved changes.
     fn close_active_tab(&mut self) {
+        if self.doc().is_dirty() {
+            self.dialog = ActiveDialog::ConfirmCloseTab;
+        } else {
+            self.force_close_active_tab();
+        }
+    }
+
+    /// Close the active tab, discarding any unsaved changes.
+    fn force_close_active_tab(&mut self) {
         let closing_path = self.tabs.get(self.active_tab).and_then(|t| t.file_path.clone());
         if closing_path.is_some() && closing_path == self.roundtrip_svg_path {
             self.roundtrip_svg_path = None;
@@ -2267,7 +2516,7 @@ impl ChiralCraftApp {
             PaletteCommandAction::ApplyStyle(q) => {
                 let qlow = q.to_ascii_lowercase();
                 if let Some((lbl, st)) = self.stylesheets.iter().find(|(n, _)| n.to_ascii_lowercase().contains(&qlow)).cloned() {
-                    self.doc_mut().settings = st;
+                    replace_settings_tx(self.doc_mut(), st, "Apply Stylesheet");
                     self.do_clean_up_structure();
                     self.status_msg = format!("Applied stylesheet: {lbl}");
                 } else {
@@ -2470,6 +2719,7 @@ impl ChiralCraftApp {
                 tab.file_path = Some(path.to_string());
                 self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
+                self.reset_transient_interaction_state();
                 if let Some(cell) = cell_opt {
                     self.viewer_3d.unit_cell = Some(cell);
                     self.viewer_3d.open = true;
@@ -3803,6 +4053,7 @@ impl ChiralCraftApp {
             }
             Tool::Eraser => {
                 if let Some((mi, ai)) = self.hit_atom(dx, dy, 6.0) {
+                    let mut mol_removed = false;
                     self.doc_mut().apply_scene_tx("Erase Atom", |scene, _| {
                         if let Some(mol) = scene.molecules.get_mut(mi) {
                             mol.bonds.retain(|b| b.begin_atom != ai && b.end_atom != ai);
@@ -3813,9 +4064,14 @@ impl ChiralCraftApp {
                             }
                             if mol.atoms.is_empty() {
                                 scene.molecules.remove(mi);
+                                mol_removed = true;
                             }
                         }
                     });
+                    self.tab_mut().remap_after_atom_removal(mi, ai);
+                    if mol_removed {
+                        self.tab_mut().remap_after_mol_removal(&[mi]);
+                    }
                     self.sanitize_state();
                 } else if let Some((mi, bi)) = self.hit_bond(dx, dy, 5.0) {
                     self.doc_mut().apply_scene_tx("Erase Bond", |scene, _| {
@@ -3825,6 +4081,7 @@ impl ChiralCraftApp {
                             }
                         }
                     });
+                    self.tab_mut().remap_after_bond_removal(mi, bi);
                 } else if let Some(ci) = self.hit_caption(dx, dy) {
                     self.doc_mut().apply_scene_tx("Erase Caption", |scene, _| {
                         if ci < scene.captions.len() {
@@ -4171,6 +4428,8 @@ impl ChiralCraftApp {
                 // Single-atom vertex drag (with auto-weld if dropped onto another atom in the same molecule!)
                 if let Some((mi, ai)) = self.dragging_single_atom {
                     let drop_hit = self.hit_atom(ex, ey, atol);
+                    let mut welded = false;
+                    let mut dropped_bonds: Vec<usize> = Vec::new();
                     self.doc_mut().apply_scene_tx("Move Atom", |scene, _| {
                         if let Some(mol) = scene.molecules.get_mut(mi) {
                             if ai < mol.atoms.len() {
@@ -4182,17 +4441,22 @@ impl ChiralCraftApp {
                                             if b.end_atom == ai { b.end_atom = tai; }
                                         }
                                         // Remove self-loops and duplicate bonds
-                                        mol.bonds.retain(|b| b.begin_atom != b.end_atom);
                                         let mut seen_pairs = std::collections::BTreeSet::new();
-                                        mol.bonds.retain(|b| {
+                                        for (bi, b) in mol.bonds.iter().enumerate() {
                                             let key = (b.begin_atom.min(b.end_atom), b.begin_atom.max(b.end_atom));
-                                            seen_pairs.insert(key)
-                                        });
+                                            if key.0 == key.1 || !seen_pairs.insert(key) {
+                                                dropped_bonds.push(bi);
+                                            }
+                                        }
+                                        for &bi in dropped_bonds.iter().rev() {
+                                            mol.bonds.remove(bi);
+                                        }
                                         mol.atoms.remove(ai);
                                         for b in &mut mol.bonds {
                                             if b.begin_atom > ai { b.begin_atom -= 1; }
                                             if b.end_atom > ai { b.end_atom -= 1; }
                                         }
+                                        welded = true;
                                         return;
                                     }
                                 }
@@ -4201,6 +4465,12 @@ impl ChiralCraftApp {
                             }
                         }
                     });
+                    if welded {
+                        for &bi in dropped_bonds.iter().rev() {
+                            self.tab_mut().remap_after_bond_removal(mi, bi);
+                        }
+                        self.tab_mut().remap_after_atom_removal(mi, ai);
+                    }
                     self.sanitize_state();
                     self.status_msg = "Moved atom vertex".to_string();
                     return;
@@ -4281,9 +4551,17 @@ impl ChiralCraftApp {
                             continue;
                         }
                         let (mx1, my1, mx2, my2) = mol_bbox(mol);
-                        let ow = (rx2.min(mx2) - rx1.max(mx1)).max(0.0);
-                        let oh = (ry2.min(my2) - ry1.max(my1)).max(0.0);
-                        if (ow / (mx2 - mx1).max(1.0)) > 0.5 && (oh / (my2 - my1).max(1.0)) > 0.5 {
+                        // Overlap fraction per axis; a degenerate (zero-span) axis — single atom,
+                        // vertical/horizontal chain — counts as covered when its centre is inside.
+                        let frac = |a1: f64, a2: f64, r1: f64, r2: f64| {
+                            if a2 - a1 < 1.0 {
+                                let c = (a1 + a2) * 0.5;
+                                if c >= r1 && c <= r2 { 1.0 } else { 0.0 }
+                            } else {
+                                (r2.min(a2) - r1.max(a1)).max(0.0) / (a2 - a1)
+                            }
+                        };
+                        if frac(mx1, mx2, rx1, rx2) > 0.5 && frac(my1, my2, ry1, ry2) > 0.5 {
                             picked.push(mi);
                         }
                     }
@@ -4380,6 +4658,11 @@ impl ChiralCraftApp {
                 }
                 if !hit_atoms.is_empty() || !hit_bonds.is_empty() {
                     let erased_cnt = hit_atoms.len() + hit_bonds.len();
+                    hit_atoms.sort_by(|a, b| b.cmp(a));
+                    let erased_atoms = hit_atoms.clone();
+                    hit_bonds.sort_by(|a, b| b.cmp(a));
+                    let erased_bonds = hit_bonds.clone();
+                    let mut emptied: Vec<usize> = Vec::new();
                     self.doc_mut().apply_scene_tx("Erase Stroke", |scene, _| {
                         // Erase bonds first (reverse index order per molecule)
                         hit_bonds.sort_by(|a, b| b.cmp(a));
@@ -4404,8 +4687,16 @@ impl ChiralCraftApp {
                                 }
                             }
                         }
+                        emptied = (0..scene.molecules.len()).filter(|&i| scene.molecules[i].atoms.is_empty()).collect();
                         scene.molecules.retain(|m| !m.atoms.is_empty());
                     });
+                    for &(mi, bi) in &erased_bonds {
+                        self.tab_mut().remap_after_bond_removal(mi, bi);
+                    }
+                    for &(mi, ai) in &erased_atoms {
+                        self.tab_mut().remap_after_atom_removal(mi, ai);
+                    }
+                    self.tab_mut().remap_after_mol_removal(&emptied);
                     self.sanitize_state();
                     self.status_msg = format!("Erased {erased_cnt} atom(s)/bond(s)");
                 }
@@ -4543,6 +4834,15 @@ impl ChiralCraftApp {
                         }
                     }
                     let mut merged_other = false;
+                    // (keep, drop, atom_off, bond_off) recorded for side-table re-keying after a merge.
+                    let merge_plan = end_hit.and_then(|(emi, _)| {
+                        let mols = &self.doc().scene.molecules;
+                        if emi == mi || mi >= mols.len() || emi >= mols.len() {
+                            return None;
+                        }
+                        let (k, d) = if mi < emi { (mi, emi) } else { (emi, mi) };
+                        Some((k, d, mols[k].atoms.len(), mols[k].bonds.len()))
+                    });
                     self.doc_mut().apply_scene_tx("Bond", |scene, next_id| {
                         // Case A: Connecting atoms across TWO distinct molecules (e.g. drawn + imported!) -> merge!
                         if let Some((emi, eai)) = end_hit {
@@ -4555,10 +4855,16 @@ impl ChiralCraftApp {
                                 let dropped = scene.molecules.remove(drop_i);
                                 if let Some(mol) = scene.molecules.get_mut(keep_i) {
                                     let offset = mol.atoms.len();
-                                    for a in dropped.atoms {
+                                    // Fresh ids: separately imported structures reuse 1..n, and
+                                    // duplicate ids inside one molecule confuse id-keyed lookups.
+                                    for mut a in dropped.atoms {
+                                        a.id = *next_id;
+                                        *next_id += 1;
                                         mol.atoms.push(a);
                                     }
                                     for mut b in dropped.bonds {
+                                        b.id = *next_id;
+                                        *next_id += 1;
                                         b.begin_atom += offset;
                                         b.end_atom += offset;
                                         mol.bonds.push(b);
@@ -4632,6 +4938,9 @@ impl ChiralCraftApp {
                         }
                     });
                     if merged_other {
+                        if let Some((k, d, ao, bo)) = merge_plan {
+                            self.tab_mut().remap_after_mol_merge(k, d, ao, bo);
+                        }
                         self.sanitize_state();
                         self.status_msg = "Connected structures with bond".to_string();
                     }
@@ -4696,6 +5005,8 @@ impl ChiralCraftApp {
     }
 
     fn join_close_atoms_tx(&mut self) {
+        let mut removed_mol: Option<usize> = None;
+        let mut removed_atom: Option<(usize, usize)> = None;
         self.doc_mut().apply_scene_tx("Join", |scene, _| {
             if scene.molecules.len() >= 2 {
                 let mut best: Option<(usize, usize, usize, usize, f64)> = None;
@@ -4714,10 +5025,11 @@ impl ChiralCraftApp {
                 if let Some((m1, a1, m2, a2, _)) = best {
                     let mol_b = scene.molecules.remove(m2);
                     let _ = join_molecules_at_atoms(&mut scene.molecules[m1], a1, &mol_b, a2);
+                    removed_mol = Some(m2);
                     return;
                 }
             }
-            for mol in &mut scene.molecules {
+            for (mi, mol) in scene.molecules.iter_mut().enumerate() {
                 let mut pair = None;
                 for i in 0..mol.atoms.len() {
                     for j in (i + 1)..mol.atoms.len() {
@@ -4729,11 +5041,20 @@ impl ChiralCraftApp {
                     if pair.is_some() { break; }
                 }
                 if let Some((i, j)) = pair {
-                    let _ = join_atoms(mol, i, j);
+                    if join_atoms(mol, i, j) {
+                        removed_atom = Some((mi, j));
+                    }
                     break;
                 }
             }
         });
+        if let Some(m2) = removed_mol {
+            self.tab_mut().remap_after_mol_removal(&[m2]);
+        }
+        if let Some((mi, ai)) = removed_atom {
+            self.tab_mut().remap_after_atom_removal(mi, ai);
+        }
+        self.sanitize_state();
     }
 
     fn run_repeat_action(&mut self) {
@@ -4944,8 +5265,8 @@ impl ChiralCraftApp {
             else { None };
         });
 
-        if do_undo { self.doc_mut().undo(); self.sanitize_state(); }
-        if do_redo { self.doc_mut().redo(); self.sanitize_state(); }
+        if do_undo { self.tab_mut().undo_redo(false); self.sanitize_state(); }
+        if do_redo { self.tab_mut().undo_redo(true); self.sanitize_state(); }
         if do_repeat { self.run_repeat_action(); }
         if do_new { self.new_document_tab(DocumentSettings::acs_document_1996()); }
         if do_name_to_struct { self.dialog = ActiveDialog::PasteNameAsStructure; }
@@ -5020,6 +5341,7 @@ impl ChiralCraftApp {
                     }
                 });
                 if let Some(ni) = moved_to {
+                    self.tab_mut().remap_after_mol_move(mi, ni);
                     self.tab_mut().selected_mols = vec![ni];
                 }
             }
@@ -5035,6 +5357,7 @@ impl ChiralCraftApp {
                     }
                 });
                 if moved {
+                    self.tab_mut().remap_after_mol_move(mi, 0);
                     self.tab_mut().selected_mols = vec![0];
                 }
             }
@@ -5091,12 +5414,17 @@ impl ChiralCraftApp {
         if do_delete && !self.tab().selected_mols.is_empty() {
             let mut sel = self.tab().selected_mols.clone();
             sel.sort_unstable();
+            sel.dedup(); // a duplicate index would delete an extra, unselected molecule
             sel.reverse();
+            let nmols = self.doc().scene.molecules.len();
+            sel.retain(|&mi| mi < nmols);
+            let removed = sel.clone();
             self.doc_mut().apply_scene_tx("Delete", |scene, _| {
                 for mi in sel {
-                    if mi < scene.molecules.len() { scene.molecules.remove(mi); }
+                    scene.molecules.remove(mi);
                 }
             });
+            self.tab_mut().remap_after_mol_removal(&removed);
             self.tab_mut().selected_mols.clear();
             self.sanitize_state();
         }
@@ -5191,6 +5519,189 @@ fn mol_bbox(mol: &ChemMolecule) -> (f64, f64, f64, f64) {
     if x1.is_finite() { (x1, y1, x2, y2) } else { (0.0, 0.0, 0.0, 0.0) }
 }
 
+#[cfg(test)]
+mod audit_a_tests {
+    use super::*;
+
+    fn tab_with_side_tables() -> OpenDocTab {
+        let d = InteractiveDocument::new_saved_seed("t", DocumentSettings::acs_document_1996());
+        let mut t = OpenDocTab::new_at(d, 0);
+        for mi in 0..4 {
+            t.ring_fills.insert(mi, Color32::from_rgb(mi as u8, 0, 0));
+            t.reaction_atom_maps.insert((mi, 1), mi as u32 + 10);
+            t.linked_captions.push(LinkedCaption {
+                caption_id: mi as u32,
+                molecule_idx: mi,
+                kind: LinkedCaptionKind::Formula,
+                decimals: 2,
+            });
+        }
+        t.selected_mols = vec![1, 3];
+        t.groups = vec![vec![0, 1], vec![2, 3]];
+        t
+    }
+
+    #[test]
+    fn mol_removal_rekeys_side_tables() {
+        let mut t = tab_with_side_tables();
+        t.remap_after_mol_removal(&[1]);
+        assert_eq!(t.ring_fills.len(), 3);
+        assert_eq!(t.ring_fills[&1], Color32::from_rgb(2, 0, 0));
+        assert_eq!(t.ring_fills[&2], Color32::from_rgb(3, 0, 0));
+        assert_eq!(t.reaction_atom_maps[&(2, 1)], 13);
+        let lc: Vec<(u32, usize)> = t.linked_captions.iter().map(|l| (l.caption_id, l.molecule_idx)).collect();
+        assert_eq!(lc, vec![(0, 0), (2, 1), (3, 2)]);
+        assert_eq!(t.selected_mols, vec![2]);
+        assert_eq!(t.groups, vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn undo_redo_revert_restore_side_tables() {
+        let mut t = tab_with_side_tables();
+        t.doc.apply_scene_tx("Seed", |s, _| {
+            for _ in 0..4 {
+                s.molecules.push(ChemMolecule::default());
+            }
+        });
+        t.doc.save();
+        t.sync_side_history(); // frame boundary
+        let before = t.ring_fills.clone();
+        // Delete molecule 1 (as Edit > Clear does), then a frame passes.
+        t.doc.apply_scene_tx("Clear Selection", |s, _| {
+            s.molecules.remove(1);
+        });
+        t.remap_after_mol_removal(&[1]);
+        t.sync_side_history();
+        let after = t.ring_fills.clone();
+        assert!(t.undo_redo(false));
+        assert_eq!(t.ring_fills, before, "undo must re-key fills back onto the restored molecules");
+        assert!(t.undo_redo(true));
+        assert_eq!(t.ring_fills, after);
+        t.ring_fills.insert(0, Color32::WHITE);
+        assert!(t.revert());
+        assert_eq!(t.ring_fills, before);
+        assert_eq!(t.doc.scene.molecules.len(), 4);
+    }
+
+    #[test]
+    fn paste_of_several_structures_is_one_undo_and_selects_them() {
+        let mut app = ChiralCraftApp::new();
+        let m = smiles_to_molecule("CC").unwrap();
+        app.clipboard_mols = vec![m.clone(), m];
+        app.do_paste_action();
+        assert_eq!(app.doc().scene.molecules.len(), 2);
+        assert_eq!(app.tab().selected_mols, vec![0, 1]);
+        assert!(app.doc_mut().undo());
+        assert!(app.doc().scene.molecules.is_empty());
+    }
+
+    #[test]
+    fn closing_dirty_tab_asks_first() {
+        let mut app = ChiralCraftApp::new();
+        app.new_document_tab(DocumentSettings::acs_document_1996());
+        app.doc_mut().apply_scene_tx("Bond", |s, _| s.molecules.push(ChemMolecule::default()));
+        app.close_active_tab();
+        assert_eq!(app.tabs.len(), 2, "dirty tab must not close silently");
+        assert_eq!(app.dialog, ActiveDialog::ConfirmCloseTab);
+        app.force_close_active_tab();
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn two_steps_in_one_frame_keep_side_tables_for_each_undo() {
+        let mut app = ChiralCraftApp::new();
+        app.doc_mut().apply_scene_tx("Seed", |s, _| {
+            for _ in 0..3 {
+                s.molecules.push(ChemMolecule::default());
+            }
+        });
+        app.tab_mut().sync_side_history(); // frame boundary
+        app.tab_mut().ring_fills.insert(2, Color32::RED);
+        app.tab_mut().selected_mols = vec![0];
+        app.tab_mut().sync_side_history(); // frame boundary
+        // F2 then F3 handled in the same frame (no frame-boundary sync between them).
+        app.doc_mut().apply_scene_tx("Bring to Front", |s, _| {
+            let m = s.molecules.remove(0);
+            s.molecules.push(m);
+        });
+        app.tab_mut().remap_after_mol_move(0, 2);
+        app.tab_mut().selected_mols = vec![2];
+        app.doc_mut().apply_scene_tx("Send to Back", |s, _| {
+            let m = s.molecules.remove(2);
+            s.molecules.insert(0, m);
+        });
+        app.tab_mut().remap_after_mol_move(2, 0);
+        app.tab_mut().selected_mols = vec![0];
+        assert!(app.tab_mut().undo_redo(false));
+        assert_eq!(app.tab().ring_fills.get(&1), Some(&Color32::RED), "fill must follow the molecule after Bring to Front");
+        assert_eq!(app.tab().selected_mols, vec![2]);
+        assert!(app.tab_mut().undo_redo(false));
+        assert_eq!(app.tab().ring_fills.get(&2), Some(&Color32::RED));
+        assert_eq!(app.tab().selected_mols, vec![0]);
+    }
+
+    #[test]
+    fn mol_move_and_merge_rekey_side_tables() {
+        let mut t = tab_with_side_tables();
+        t.remap_after_mol_move(0, 3); // bring to front
+        assert_eq!(t.ring_fills[&3], Color32::from_rgb(0, 0, 0));
+        assert_eq!(t.ring_fills[&0], Color32::from_rgb(1, 0, 0));
+        t.remap_after_mol_move(3, 0); // send back: identity again
+        assert_eq!(t.ring_fills[&0], Color32::from_rgb(0, 0, 0));
+        assert_eq!(t.ring_fills[&3], Color32::from_rgb(3, 0, 0));
+
+        let mut t = tab_with_side_tables();
+        t.remap_after_mol_merge(0, 2, 5, 4);
+        assert_eq!(t.reaction_atom_maps[&(0, 6)], 12); // (2,1) -> (0, 1+5)
+        assert_eq!(t.reaction_atom_maps[&(2, 1)], 13); // mol 3 shifted down
+        assert!(t.linked_captions.iter().any(|l| l.caption_id == 2 && l.molecule_idx == 0));
+        assert_eq!(t.ring_fills[&0], Color32::from_rgb(0, 0, 0), "keep's own fill wins");
+        let mut u = tab_with_side_tables();
+        u.ring_fills.remove(&0);
+        u.remap_after_mol_merge(0, 2, 5, 4);
+        assert_eq!(u.ring_fills[&0], Color32::from_rgb(2, 0, 0), "unfilled keep adopts the absorbed fill");
+
+        t.remap_after_atom_removal(0, 1);
+        assert!(!t.reaction_atom_maps.contains_key(&(0, 1)));
+        assert_eq!(t.reaction_atom_maps[&(0, 5)], 12);
+    }
+
+    #[test]
+    fn roundtrip_save_writes_bound_tab_not_active_tab() {
+        let path = std::env::temp_dir().join(format!("cc_audit_rt_{}.svg", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let ps = path.to_str().unwrap().to_string();
+        let mut app = ChiralCraftApp::new_with_file(&ps, true);
+        assert_eq!(app.roundtrip_svg_path.as_deref(), Some(ps.as_str()));
+        app.new_document_tab(DocumentSettings::acs_document_1996());
+        let m = smiles_to_molecule("CCO").unwrap();
+        app.doc_mut().stamp_molecule_tx(m, "x");
+        // Ctrl+S on the unrelated tab must not touch the host SVG.
+        app.tabs[app.active_tab].file_path = None;
+        app.do_save_action();
+        assert!(!path.exists());
+        app.save_roundtrip_svg().unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        let expected = app.tabs[0].doc.to_svg_styled(true, false, app.rear_opacity, app.crossing_clearance_pt);
+        assert_eq!(written, expected);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plain_save_to_lossy_format_falls_back_to_save_as() {
+        let path = std::env::temp_dir().join(format!("cc_audit_lossy_{}.eps", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut app = ChiralCraftApp::new();
+        let m = smiles_to_molecule("CCO").unwrap();
+        app.doc_mut().stamp_molecule_tx(m, "x");
+        app.tab_mut().file_path = Some(path.to_string_lossy().into_owned());
+        app.do_save_action();
+        assert!(!path.exists(), "lossy re-save must not write and mark clean");
+        assert!(matches!(app.dialog, ActiveDialog::SaveAs));
+        assert!(app.file_path_buf.ends_with(".cdxml"));
+    }
+}
+
 impl eframe::App for ChiralCraftApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.roundtrip_svg_path.is_some() && !self.roundtrip_saved_on_close {
@@ -5206,6 +5717,9 @@ impl eframe::App for ChiralCraftApp {
 
 impl ChiralCraftApp {
     fn render_ui_frame(&mut self, ctx: &egui::Context) {
+        for tab in &mut self.tabs {
+            tab.sync_side_history();
+        }
         if !self.style_initialized {
             Self::apply_theme(ctx, self.ui_theme);
             self.style_initialized = true;
@@ -5237,6 +5751,7 @@ impl ChiralCraftApp {
                     std::process::exit(1);
                 }
                 self.screenshot_out_path = None;
+                self.exit_confirmed = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
                 self.screenshot_frames = self.screenshot_frames.saturating_add(1);
@@ -5250,8 +5765,23 @@ impl ChiralCraftApp {
             && self.roundtrip_svg_path.is_some()
             && !self.roundtrip_saved_on_close
         {
-            self.roundtrip_saved_on_close = true;
-            let _ = self.save_roundtrip_svg();
+            match self.save_roundtrip_svg() {
+                Ok(()) => self.roundtrip_saved_on_close = true,
+                Err(e) => {
+                    // Abort the close so the edits are not silently discarded.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.status_msg = format!("Round-trip save failed: {e} — window kept open");
+                }
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.exit_confirmed
+            && self.tabs.iter().any(|t| t.doc.is_dirty())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = ActiveDialog::ConfirmExit;
+            // Staying open: later round-trip edits must be written again on the next close.
+            self.roundtrip_saved_on_close = false;
         }
         self.sanitize_state();
         self.sync_linked_captions();
@@ -5289,11 +5819,19 @@ impl ChiralCraftApp {
                         ui.label("— Save (Ctrl+S) or close window to apply edits back to host document.");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Save & Return").clicked() {
-                                let _ = self.save_roundtrip_svg();
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                match self.save_roundtrip_svg() {
+                                    Ok(()) => {
+                                        self.roundtrip_saved_on_close = true;
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    }
+                                    // Keep the window open so unsaved edits are not lost.
+                                    Err(e) => self.status_msg = format!("Round-trip save failed: {e}"),
+                                }
                             }
                             if ui.button("Save Now").clicked() {
-                                let _ = self.save_roundtrip_svg();
+                                if let Err(e) = self.save_roundtrip_svg() {
+                                    self.status_msg = format!("Round-trip save failed: {e}");
+                                }
                             }
                         });
                     });
@@ -5306,6 +5844,8 @@ impl ChiralCraftApp {
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
                     ui.menu_button("File", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         if ui.button("New ACS Document 1996\tCtrl+N").clicked() {
                             self.new_document_tab(DocumentSettings::acs_document_1996());
                             ui.close_menu();
@@ -5370,6 +5910,7 @@ impl ChiralCraftApp {
                                             let idx = self.tabs.len();
                                             self.tabs.push(OpenDocTab::new_at(d, idx));
                                             self.active_tab = self.tabs.len() - 1;
+                                            self.reset_transient_interaction_state();
                                         } else {
                                             self.doc_mut().name = lbl.to_string();
                                         }
@@ -5427,7 +5968,7 @@ impl ChiralCraftApp {
                         }
                         let can_revert = self.doc().is_dirty();
                         if ui.add_enabled(can_revert, egui::Button::new("Revert")).clicked() {
-                            self.doc_mut().revert();
+                            self.tab_mut().revert();
                             self.sanitize_state();
                             self.status_msg = "Reverted to last saved state".to_string();
                             ui.close_menu();
@@ -5452,7 +5993,7 @@ impl ChiralCraftApp {
                             let styles = self.stylesheets.clone();
                             for (lbl, settings) in styles {
                                 if ui.button(format!("{} ({:.2} pt)", lbl, settings.bond_length_pt)).clicked() {
-                                    self.doc_mut().settings = settings;
+                                    replace_settings_tx(self.doc_mut(), settings, "Apply Document Settings");
                                     self.status_msg = format!("Applied document settings from {lbl}");
                                     ui.close_menu();
                                 }
@@ -5465,9 +6006,12 @@ impl ChiralCraftApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             ui.close_menu();
                         }
+                        }); }
                     });
 
                     ui.menu_button("Edit", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         let u_raw = self.doc().undo_menu_label();
                         let r_raw = self.doc().redo_menu_label();
                         let can_undo = !u_raw.contains("not available");
@@ -5485,8 +6029,8 @@ impl ChiralCraftApp {
                         let has_clip = !self.clipboard_mols.is_empty();
                         let u_lbl = format!("{u_raw}\tCtrl+Z");
                         let r_lbl = format!("{r_raw}\tShift+Ctrl+Z");
-                        if ui.add_enabled(can_undo, egui::Button::new(u_lbl)).clicked() { self.doc_mut().undo(); self.sanitize_state(); ui.close_menu(); }
-                        if ui.add_enabled(can_redo, egui::Button::new(r_lbl)).clicked() { self.doc_mut().redo(); self.sanitize_state(); ui.close_menu(); }
+                        if ui.add_enabled(can_undo, egui::Button::new(u_lbl)).clicked() { self.tab_mut().undo_redo(false); self.sanitize_state(); ui.close_menu(); }
+                        if ui.add_enabled(can_redo, egui::Button::new(r_lbl)).clicked() { self.tab_mut().undo_redo(true); self.sanitize_state(); ui.close_menu(); }
                         ui.separator();
                         if ui.add_enabled(has_mols, egui::Button::new("Cut\tCtrl+X")).clicked() {
                             self.do_cut_action();
@@ -5721,9 +6265,12 @@ impl ChiralCraftApp {
                         } else {
                             let _ = ui.add_enabled(false, egui::Button::new("Object"));
                         }
+                        }); }
                     });
 
                     ui.menu_button("View", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         ui.checkbox(&mut self.show_crosshair, "Show Crosshair\tCtrl+H");
                         ui.checkbox(&mut self.show_rulers, "Show Rulers\tF11");
                         ui.separator();
@@ -5841,9 +6388,12 @@ impl ChiralCraftApp {
                         }
                         if ui.button("Magnify\tF7").clicked() { self.zoom = (self.zoom * 1.25).min(6.0); ui.close_menu(); }
                         if ui.button("Reduce\tF8").clicked() { self.zoom = (self.zoom * 0.8).max(0.4); ui.close_menu(); }
+                        }); }
                     });
 
                     ui.menu_button("Object", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         let has_mols = !self.doc().scene.molecules.is_empty();
                         let can_group = self.tab().selected_mols.len() >= 2;
                         let can_ungroup = self.tab().groups.iter().any(|g| g.iter().any(|mi| self.tab().selected_mols.contains(mi)));
@@ -5862,7 +6412,7 @@ impl ChiralCraftApp {
                             let styles = self.stylesheets.clone();
                             for (lbl, settings) in styles {
                                 if ui.button(&lbl).clicked() {
-                                    self.doc_mut().settings = settings;
+                                    replace_settings_tx(self.doc_mut(), settings, "Apply Object Settings");
                                     self.do_clean_up_structure();
                                     self.status_msg = format!("Applied object settings from {lbl}");
                                     ui.close_menu();
@@ -5970,6 +6520,7 @@ impl ChiralCraftApp {
                                     }
                                 });
                                 if let Some(ni) = moved_to {
+                                    self.tab_mut().remap_after_mol_move(mi, ni);
                                     self.tab_mut().selected_mols = vec![ni];
                                 }
                             }
@@ -5986,6 +6537,7 @@ impl ChiralCraftApp {
                                     }
                                 });
                                 if moved {
+                                    self.tab_mut().remap_after_mol_move(mi, 0);
                                     self.tab_mut().selected_mols = vec![0];
                                 }
                             }
@@ -6014,9 +6566,12 @@ impl ChiralCraftApp {
                         }
                         if ui.add_enabled(has_mols, egui::Button::new("Rotate...\tCtrl+R")).clicked() { self.dialog = ActiveDialog::RotateDialog; ui.close_menu(); }
                         if ui.add_enabled(has_mols, egui::Button::new("Scale...\tCtrl+K")).clicked() { self.dialog = ActiveDialog::ScaleDialog; ui.close_menu(); }
+                        }); }
                     });
 
                     ui.menu_button("Structure", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         let has_mols = !self.doc().scene.molecules.is_empty();
                         if ui.add_enabled(has_mols, egui::Button::new("Atom Properties...")).clicked() {
                             if let Some((mi, ai)) = self.hovered_atom {
@@ -6214,13 +6769,14 @@ impl ChiralCraftApp {
                                 self.status_msg = "No generic ElementList sites found to expand".to_string();
                             } else {
                                 let n = expanded.len();
-                                for (k, mut m) in expanded.into_iter().enumerate() {
+                                let mut expanded = expanded;
+                                for (k, m) in expanded.iter_mut().enumerate() {
                                     for a in &mut m.atoms {
                                         a.x += ((k % 3) as f64) * 90.0;
                                         a.y += 95.0 + ((k / 3) as f64) * 80.0;
                                     }
-                                    self.doc_mut().stamp_molecule_tx(m, "Expand Generic");
                                 }
+                                stamp_molecules_tx(self.doc_mut(), expanded, "Expand Generic");
                                 self.status_msg = format!("Expanded generic structure into {n} concrete product(s)");
                             }
                             ui.close_menu();
@@ -6429,9 +6985,12 @@ impl ChiralCraftApp {
                             self.do_structure_to_name_hybrid(ctx, true);
                             ui.close_menu();
                         }
+                        }); }
                     });
 
                     ui.menu_button("Text", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         ui.menu_button("Font", |ui| {
                             for f in ["Arial", "Helvetica", "Symbol", "Times"] {
                                 ui.selectable_value(&mut self.doc_mut().settings.label_font, f.to_string(), f);
@@ -6455,8 +7014,12 @@ impl ChiralCraftApp {
                             ui.checkbox(&mut self.text_italic, "Italic\tCtrl+I");
                             ui.checkbox(&mut self.text_underline, "Underline\tCtrl+U");
                             ui.separator();
-                            ui.checkbox(&mut self.text_sub, "Subscript\tF9");
-                            ui.checkbox(&mut self.text_sup, "Superscript\tF10");
+                            if ui.checkbox(&mut self.text_sub, "Subscript\tF9").changed() && self.text_sub {
+                                self.text_sup = false;
+                            }
+                            if ui.checkbox(&mut self.text_sup, "Superscript\tF10").changed() && self.text_sup {
+                                self.text_sub = false;
+                            }
                             ui.checkbox(&mut self.text_formula, "Formula\tShift+F9");
                         });
                         ui.menu_button("Size", |ui| {
@@ -6483,9 +7046,12 @@ impl ChiralCraftApp {
                             self.dialog = ActiveDialog::LineSpacing;
                             ui.close_menu();
                         }
+                        }); }
                     });
 
                     ui.menu_button("Curves", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         if ui.button("Plain").clicked() {
                             self.curve_dashed = false;
                             self.curve_bold = false;
@@ -6521,9 +7087,12 @@ impl ChiralCraftApp {
                         ui.checkbox(&mut self.curve_filled, "Filled");
                         ui.checkbox(&mut self.curve_shaded, "Shaded");
                         ui.checkbox(&mut self.curve_faded, "Faded");
+                        }); }
                     });
 
                     ui.menu_button("Colors", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         for (name, col) in [
                             ("Foreground", Color32::BLACK),
                             ("Other # 1", Color32::from_rgb(255, 0, 0)),
@@ -6552,9 +7121,12 @@ impl ChiralCraftApp {
                         ui.checkbox(&mut self.color_by_element, "By Element");
                         ui.separator();
                         ui.checkbox(&mut self.show_ring_fill_toolbar, "Show Ring Fill & Highlight Colors");
+                        }); }
                     });
 
                     ui.menu_button("Search", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         let has_mol = self.active_mol().is_some();
                         if ui.button("Search PubChem / ChEMBL...   Shift+Ctrl+F").clicked() {
                             self.show_chem_db = true;
@@ -6587,9 +7159,12 @@ impl ChiralCraftApp {
                             self.dialog = ActiveDialog::FindElement;
                             ui.close_menu();
                         }
+                        }); }
                     });
 
                     ui.menu_button("Window", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         if ui.button("Cascade").clicked() {
                             for (i, t) in self.tabs.iter_mut().enumerate() {
                                 let c = ((i % 8) as f32) * 26.0;
@@ -6651,9 +7226,12 @@ impl ChiralCraftApp {
                                 ui.close_menu();
                             }
                         }
+                        }); }
                     });
 
                     ui.menu_button("Help", |ui| {
+                        // Tall menus (Structure) overflow an 860 px window: keep every item reachable.
+                        { let h = ui.ctx().screen_rect().height() - 48.0; egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
                         if ui.button("Contents\tF1").clicked() {
                             self.dialog = ActiveDialog::Shortcuts;
                             ui.close_menu();
@@ -6702,6 +7280,7 @@ impl ChiralCraftApp {
                             self.dialog = ActiveDialog::About;
                             ui.close_menu();
                         }
+                        }); }
                     });
                 });
             });
@@ -6733,11 +7312,11 @@ impl ChiralCraftApp {
                             let u_lbl = self.doc().undo_menu_label();
                             let r_lbl = self.doc().redo_menu_label();
                             if toolbar_icon_button(ui, ToolbarIcon::Undo, false, &u_lbl).clicked() {
-                                self.doc_mut().undo();
+                                self.tab_mut().undo_redo(false);
                                 self.sanitize_state();
                             }
                             if toolbar_icon_button(ui, ToolbarIcon::Redo, false, &r_lbl).clicked() {
-                                self.doc_mut().redo();
+                                self.tab_mut().undo_redo(true);
                                 self.sanitize_state();
                             }
                             if toolbar_icon_button(ui, ToolbarIcon::Cut, false, "Cut").clicked() {
@@ -7207,6 +7786,9 @@ impl ChiralCraftApp {
                             } else if let Some(&(ti, _)) = bg_rects.iter().rev().find(|(_, r)| r.contains(pos)) {
                                 self.active_tab = ti;
                                 self.tab_mut().minimized = false;
+                                // Atom indices of the previous tab must not leak into the newly activated document.
+                                self.inline_atom_edit = None;
+                                self.sanitize_state();
                             }
                         }
                     }
@@ -7428,8 +8010,17 @@ impl ChiralCraftApp {
                 }
 
                 // Right-click context menu on atom / bond / canvas!
+                // Capture the target at right-click time: hover keeps updating while the menu is open.
+                let ctx_target_id = egui::Id::new("cc_canvas_context_target");
+                if response.secondary_clicked() {
+                    let tgt = (self.hovered_atom, self.hovered_bond);
+                    ctx.data_mut(|d| d.insert_temp(ctx_target_id, tgt));
+                }
+                let (ctx_atom, ctx_bond): (Option<(usize, usize)>, Option<(usize, usize)>) = ctx
+                    .data_mut(|d| d.get_temp(ctx_target_id))
+                    .unwrap_or((self.hovered_atom, self.hovered_bond));
                 response.context_menu(|ui| {
-                    if let Some((mi, ai)) = self.hovered_atom {
+                    if let Some((mi, ai)) = ctx_atom {
                         ui.label(egui::RichText::new("Atom").strong());
                         if ui.button("Edit Label / Nickname... (Enter)").clicked() {
                             self.open_inline_atom_edit(mi, ai);
@@ -7473,7 +8064,7 @@ impl ChiralCraftApp {
                             }
                         }
                         ui.separator();
-                    } else if let Some((mi, bi)) = self.hovered_bond {
+                    } else if let Some((mi, bi)) = ctx_bond {
                         ui.label(egui::RichText::new("Bond").strong());
                         for (lbl, ord, disp) in [
                             ("Single", 1, BondDisplay::Solid),
@@ -7575,7 +8166,10 @@ impl ChiralCraftApp {
                     }
                 }
                 if response.drag_started_by(egui::PointerButton::Primary) {
-                    if let Some(pos) = response.interact_pointer_pos() {
+                    // Drags start after egui's movement threshold; hit-test where the button went
+                    // down, or a drag begun on an atom/handle starts beside it.
+                    let press = ctx.input(|i| i.pointer.press_origin());
+                    if let Some(pos) = press.or_else(|| response.interact_pointer_pos()) {
                         let zone = classify_mdi_zone(pos);
                         if zone != MdiDragMode::None {
                             self.mdi_drag = zone;
@@ -7825,6 +8419,7 @@ impl ChiralCraftApp {
                             if let Some(&(ti, _)) = bg_rects.iter().rev().find(|(_, r)| r.contains(pos)) {
                                 self.active_tab = ti;
                                 self.tab_mut().minimized = false;
+                                self.inline_atom_edit = None;
                                 self.sanitize_state();
                             }
                         }
@@ -9024,11 +9619,17 @@ impl ChiralCraftApp {
                     } else {
                         self.tabs.get_mut(self.active_tab)
                     };
+                    // Record as an undo step: mutating the scene in place left the tab clean and
+                    // let Undo/Redo resurrect the stale offline name.
                     if let Some(tab) = target_tab {
-                        for cap in &mut tab.doc.scene.captions {
-                            if cap.id == cid {
-                                cap.text = disp.clone();
-                            }
+                        if tab.doc.scene.captions.iter().any(|c| c.id == cid && c.text != disp) {
+                            tab.doc.apply_scene_tx("PubChem Name", |s, _| {
+                                for cap in &mut s.captions {
+                                    if cap.id == cid {
+                                        cap.text = disp.clone();
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -9537,8 +10138,11 @@ impl ChiralCraftApp {
                                 molfile_to_molecule(&txt).map(|m| vec![m])
                             };
                             match mols_res {
-                                Ok(mols) => {
-                                    for m in mols { self.doc_mut().stamp_molecule_tx(m, "Paste MOL/SDF"); }
+                                Ok(mut mols) => {
+                                    let bl = self.doc().settings.bond_length_pt;
+                                    chiralcraft_doc::rescale_angstrom_molecules(&mut mols, bl);
+                                    chiralcraft_doc::layout_imported_molecules(&mut mols, 540.0, 719.75);
+                                    stamp_molecules_tx(self.doc_mut(), mols, "Paste MOL/SDF");
                                     self.dialog = ActiveDialog::None;
                                 }
                                 Err(e) => self.status_msg = format!("MOL/SDF parse error: {e}"),
@@ -9558,9 +10162,7 @@ impl ChiralCraftApp {
                             match InteractiveDocument::from_svg(&self.multiline_input) {
                                 Ok(d) => {
                                     let cnt = d.scene.molecules.len();
-                                    for m in d.scene.molecules {
-                                        self.doc_mut().stamp_molecule_tx(m, "Paste Editable SVG");
-                                    }
+                                    stamp_molecules_tx(self.doc_mut(), d.scene.molecules, "Paste Editable SVG");
                                     self.status_msg = format!("Imported {cnt} editable structure(s) from SVG");
                                     self.dialog = ActiveDialog::None;
                                 }
@@ -9581,7 +10183,7 @@ impl ChiralCraftApp {
                             match CdxmlDocument::parse(&self.multiline_input) {
                                 Ok(cdxml) => {
                                     let d = InteractiveDocument::from_cdxml(&cdxml);
-                                    for m in d.scene.molecules { self.doc_mut().stamp_molecule_tx(m, "Paste CDXML"); }
+                                    stamp_molecules_tx(self.doc_mut(), d.scene.molecules, "Paste CDXML");
                                     self.dialog = ActiveDialog::None;
                                 }
                                 Err(e) => self.status_msg = format!("CDXML parse error: {e:?}"),
@@ -9715,9 +10317,7 @@ impl ChiralCraftApp {
                             match load_document_any(&self.file_path_buf) {
                                 Ok(d) => {
                                     let cnt = d.scene.molecules.len();
-                                    for m in d.scene.molecules {
-                                        self.doc_mut().stamp_molecule_tx(m, "Insert File");
-                                    }
+                                    stamp_molecules_tx(self.doc_mut(), d.scene.molecules, "Insert File");
                                     self.status_msg = format!("Inserted {cnt} structure(s) from {}", self.file_path_buf);
                                     self.dialog = ActiveDialog::None;
                                 }
@@ -9754,11 +10354,14 @@ impl ChiralCraftApp {
                         ui.checkbox(&mut a.ignore_warnings, "Ignore Chemical Warnings");
                         ui.checkbox(&mut a.is_query, "Query / Generic Atom");
                         if Some(&a) != orig.as_ref() {
-                            self.doc_mut().apply_scene_tx("Atom Properties", |s, _| {
+                            let key = egui::Id::new(("cc_atom_props", self.tab().tab_id, mol_idx, atom_idx));
+                            let (gesture, mut last) = (undo_gesture_token(ctx), self.undo_coalesce);
+                            coalesced_scene_tx(self.doc_mut(), gesture, &mut last, key, "Atom Properties", |s| {
                                 if let Some(slot) = s.molecules.get_mut(mol_idx).and_then(|m| m.atoms.get_mut(atom_idx)) {
                                     *slot = a;
                                 }
                             });
+                            self.undo_coalesce = last;
                         }
                     } else {
                         ui.label("No atom selected.");
@@ -9859,7 +10462,21 @@ impl ChiralCraftApp {
                                 self.file_path_buf = p;
                             }
                         }
-                        if ui.button("Save").clicked() {
+                        // Typed paths bypass the native dialog's overwrite prompt: require a second click.
+                        let overwrite_id = egui::Id::new("cc_save_as_overwrite_confirm");
+                        let typed = self.file_path_buf.clone();
+                        let confirmed: Option<String> = ctx.data_mut(|d| d.get_temp(overwrite_id));
+                        let is_confirmed = confirmed.as_deref() == Some(typed.as_str());
+                        let needs_confirm = !typed.trim().is_empty()
+                            && std::path::Path::new(&typed).exists()
+                            && self.tab().file_path.as_deref() != Some(typed.as_str())
+                            && !is_confirmed;
+                        let save_clicked = ui.button(if is_confirmed { "Overwrite" } else { "Save" }).clicked();
+                        if save_clicked && needs_confirm {
+                            ctx.data_mut(|d| d.insert_temp(overwrite_id, typed.clone()));
+                            self.status_msg = format!("{typed} already exists — click Overwrite to replace it");
+                        } else if save_clicked {
+                            ctx.data_mut(|d| d.remove::<String>(overwrite_id));
                             let dark_ink = self.ui_theme == UiTheme::DarkSlide;
                             match save_document_any_styled(
                                 self.doc(),
@@ -9869,6 +10486,14 @@ impl ChiralCraftApp {
                                 self.rear_opacity,
                                 self.crossing_clearance_pt,
                             ) {
+                                Ok(()) if save_as_format_is_lossy(self.doc(), &self.file_path_buf) => {
+                                    // Export only: keep the tab's real file and dirty state (see save_as_format_is_lossy).
+                                    self.status_msg = format!(
+                                        "Exported {} (format cannot hold the whole drawing; document still unsaved)",
+                                        self.file_path_buf
+                                    );
+                                    self.dialog = ActiveDialog::None;
+                                }
                                 Ok(()) => {
                                     let path = self.file_path_buf.clone();
                                     if self.roundtrip_svg_path.as_deref() != Some(path.as_str()) {
@@ -9964,6 +10589,7 @@ impl ChiralCraftApp {
             }
             ActiveDialog::ObjectSettings => {
                 egui::Window::new("Object Settings").collapsible(false).default_width(340.0).show(ctx, |ui| {
+                    let settings_before = self.doc().settings.clone();
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.bond_length_pt).speed(0.2).range(4.0..=72.0).prefix("Fixed Length (pt): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.bond_spacing_pct).speed(0.5).range(5.0..=50.0).prefix("Bond Spacing (%): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.chain_angle_deg).speed(1.0).range(30.0..=180.0).prefix("Chain Angle (°): "));
@@ -9971,6 +10597,12 @@ impl ChiralCraftApp {
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.bold_width_pt).speed(0.05).range(0.5..=10.0).prefix("Bold Width (pt): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.hash_spacing_pt).speed(0.05).range(0.5..=10.0).prefix("Hash Spacing (pt): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.margin_width_pt).speed(0.05).range(0.2..=10.0).prefix("Margin Width (pt): "));
+                    if self.doc().settings != settings_before {
+                        let key = egui::Id::new(("cc_object_settings", self.tab().tab_id));
+                        let (gesture, mut last) = (undo_gesture_token(ctx), self.undo_coalesce);
+                        coalesced_settings_changed(self.doc_mut(), gesture, &mut last, key, "Object Settings");
+                        self.undo_coalesce = last;
+                    }
                     if ui.button("OK").clicked() {
                         self.status_msg = format!("Updated Object Settings (Fixed Length {:.2} pt)", self.doc().settings.bond_length_pt);
                         self.dialog = ActiveDialog::None;
@@ -9980,12 +10612,19 @@ impl ChiralCraftApp {
             ActiveDialog::DocumentSettings => {
                 egui::Window::new("Document Settings").collapsible(false).default_width(360.0).show(ctx, |ui| {
                     ui.strong("Drawing");
+                    let settings_before = self.doc().settings.clone();
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.bond_length_pt).speed(0.2).range(4.0..=72.0).prefix("Fixed Length (pt): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.bond_spacing_pct).speed(0.5).range(5.0..=50.0).prefix("Bond Spacing (%): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.chain_angle_deg).speed(1.0).range(30.0..=180.0).prefix("Chain Angle (°): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.line_width_pt).speed(0.05).range(0.1..=6.0).prefix("Line Width (pt): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.bold_width_pt).speed(0.05).range(0.5..=10.0).prefix("Bold Width (pt): "));
                     ui.add(egui::DragValue::new(&mut self.doc_mut().settings.hash_spacing_pt).speed(0.05).range(0.5..=10.0).prefix("Hash Spacing (pt): "));
+                    let doc_settings_key = egui::Id::new(("cc_document_settings", self.tab().tab_id));
+                    if self.doc().settings != settings_before {
+                        let (gesture, mut last) = (undo_gesture_token(ctx), self.undo_coalesce);
+                        coalesced_settings_changed(self.doc_mut(), gesture, &mut last, doc_settings_key, "Document Settings");
+                        self.undo_coalesce = last;
+                    }
                     ui.separator();
                     ui.strong("Header / Footer & Layout");
                     let mut wp = self.doc().scene.header_footer.width_pages;
@@ -10005,12 +10644,14 @@ impl ChiralCraftApp {
                         || new_hdr != self.doc().scene.header_footer.header
                         || new_ftr != self.doc().scene.header_footer.footer
                     {
-                        self.doc_mut().apply_scene_tx("Document Settings", |s, _| {
+                        let (gesture, mut last) = (undo_gesture_token(ctx), self.undo_coalesce);
+                        coalesced_scene_tx(self.doc_mut(), gesture, &mut last, doc_settings_key, "Document Settings", |s| {
                             s.header_footer.width_pages = wp;
                             s.header_footer.height_pages = hp;
                             s.header_footer.header = new_hdr;
                             s.header_footer.footer = new_ftr;
                         });
+                        self.undo_coalesce = last;
                     }
                     if ui.button("OK").clicked() { self.dialog = ActiveDialog::None; }
                 });
@@ -10258,7 +10899,7 @@ impl ChiralCraftApp {
                         if ui.button("Apply").clicked() {
                             match load_document_any(&self.file_path_buf) {
                                 Ok(d) => {
-                                    self.doc_mut().settings = d.settings;
+                                    replace_settings_tx(self.doc_mut(), d.settings, "Apply Settings");
                                     self.status_msg = format!("Applied settings from {}", self.file_path_buf);
                                     self.dialog = ActiveDialog::None;
                                 }
@@ -10305,11 +10946,14 @@ impl ChiralCraftApp {
                             });
                         ui.checkbox(&mut b.ignore_warnings, "Ignore Chemical Warnings");
                         if Some(&b) != orig.as_ref() {
-                            self.doc_mut().apply_scene_tx("Bond Properties", |s, _| {
+                            let key = egui::Id::new(("cc_bond_props", self.tab().tab_id, mol_idx, bond_idx));
+                            let (gesture, mut last) = (undo_gesture_token(ctx), self.undo_coalesce);
+                            coalesced_scene_tx(self.doc_mut(), gesture, &mut last, key, "Bond Properties", |s| {
                                 if let Some(slot) = s.molecules.get_mut(mol_idx).and_then(|m| m.bonds.get_mut(bond_idx)) {
                                     *slot = b;
                                 }
                             });
+                            self.undo_coalesce = last;
                         }
                     } else {
                         ui.label("No bond selected.");
@@ -10404,6 +11048,48 @@ impl ChiralCraftApp {
                     });
                     ui.add_space(6.0);
                     if ui.button("OK").clicked() { self.dialog = ActiveDialog::None; }
+                });
+            }
+            ActiveDialog::ConfirmCloseTab => {
+                let title = self.doc().name.clone();
+                egui::Window::new("Unsaved Changes").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label(format!("Save changes to \"{title}\" before closing?"));
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            self.dialog = ActiveDialog::None;
+                            self.do_save_action();
+                            // Closes only once the save really happened (a Save As prompt or a failed
+                            // write leaves the tab open).
+                            if !self.doc().is_dirty() {
+                                self.force_close_active_tab();
+                            }
+                        }
+                        if ui.button("Don't Save").clicked() {
+                            self.force_close_active_tab();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.dialog = ActiveDialog::None;
+                        }
+                    });
+                });
+            }
+            ActiveDialog::ConfirmExit => {
+                let dirty: Vec<String> = self.tabs.iter().filter(|t| t.doc.is_dirty()).map(|t| t.doc.name.clone()).collect();
+                egui::Window::new("Unsaved Changes").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label(format!("{} document(s) have unsaved changes:", dirty.len()));
+                    for n in &dirty {
+                        ui.label(format!("• {n}"));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard Changes & Exit").clicked() {
+                            self.exit_confirmed = true;
+                            self.dialog = ActiveDialog::None;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.dialog = ActiveDialog::None;
+                        }
+                    });
                 });
             }
             ActiveDialog::None => {}
@@ -10745,7 +11431,7 @@ fn main() -> eframe::Result<()> {
             eframe::run_native(
                 "ChiralCraft",
                 opts,
-                Box::new(move |_cc| Ok(Box::new(ChiralCraftApp::new_showcase_preset(&preset, &out_path)))),
+                Box::new(move |cc| Ok(Box::new({ install_glyph_fallback(&cc.egui_ctx); ChiralCraftApp::new_showcase_preset(&preset, &out_path) }))),
             )
         }
         Some("--edit-svg") => {
@@ -10772,7 +11458,7 @@ fn main() -> eframe::Result<()> {
             eframe::run_native(
                 &title,
                 opts,
-                Box::new(move |_cc| Ok(Box::new(ChiralCraftApp::new_with_file(&target_path, true)))),
+                Box::new(move |cc| Ok(Box::new({ install_glyph_fallback(&cc.egui_ctx); ChiralCraftApp::new_with_file(&target_path, true) }))),
             )
         }
         Some(flag) if flag.starts_with('-') => {
@@ -10794,7 +11480,7 @@ fn main() -> eframe::Result<()> {
             eframe::run_native(
                 "ChiralCraft",
                 opts,
-                Box::new(move |_cc| Ok(Box::new(ChiralCraftApp::new_with_file(&open_path, false)))),
+                Box::new(move |cc| Ok(Box::new({ install_glyph_fallback(&cc.egui_ctx); ChiralCraftApp::new_with_file(&open_path, false) }))),
             )
         }
         _ => {
@@ -10811,9 +11497,188 @@ fn main() -> eframe::Result<()> {
             eframe::run_native(
                 "ChiralCraft",
                 opts,
-                Box::new(|_cc| Ok(Box::new(ChiralCraftApp::new()))),
+                Box::new(|cc| Ok(Box::new({ install_glyph_fallback(&cc.egui_ctx); ChiralCraftApp::new() }))),
             )
         }
+    }
+}
+
+/// egui's proportional font (Ubuntu-Light) lacks ⁺ ⁻ → ⇌ ⊕ etc., which rendered as tofu boxes in
+/// atom charges and labels; fall back to the bundled Hack font, which has them.
+fn install_glyph_fallback(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        prop.push("Hack".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// Stamps several molecules (multi-record paste/insert) as ONE undo transaction.
+fn stamp_molecules_tx(doc: &mut InteractiveDocument, mols: Vec<ChemMolecule>, label: &str) {
+    if mols.is_empty() {
+        return;
+    }
+    doc.apply_scene_tx(label, |scene, next_id| {
+        for mut mol in mols {
+            for a in &mut mol.atoms {
+                a.id = *next_id;
+                *next_id += 1;
+            }
+            for b in &mut mol.bonds {
+                b.id = *next_id;
+                *next_id += 1;
+            }
+            scene.molecules.push(mol);
+        }
+    });
+}
+
+/// Identifies the widget gesture in progress: the pressed pointer (a drag) or else the
+/// keyboard-focused widget (typing into a DragValue/TextEdit). `None` once the gesture ends.
+fn undo_gesture_token(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.input(|i| {
+        if i.pointer.any_down() {
+            i.pointer.press_origin().map(|p| egui::Id::new(("cc_press", p.x.to_bits(), p.y.to_bits())))
+        } else {
+            None
+        }
+    })
+    .or_else(|| ctx.memory(|m| m.focused()))
+}
+
+/// Records a scene edit made from a live dialog widget. Edits continuing the same gesture
+/// (same `key`, same drag/focus) are merged into the previous step, so one drag or one typed
+/// value is ONE undo entry instead of one per frame/keystroke.
+fn coalesced_scene_tx(
+    doc: &mut InteractiveDocument,
+    gesture: Option<egui::Id>,
+    last: &mut Option<(egui::Id, egui::Id)>,
+    key: egui::Id,
+    label: &str,
+    f: impl FnOnce(&mut chiralcraft_doc::DocumentScene),
+) {
+    let mut next = doc.scene.clone();
+    f(&mut next);
+    let merge = gesture.is_some()
+        && *last == gesture.map(|g| (key, g))
+        && doc.is_dirty()
+        && doc.undo_menu_label() == format!("Undo {label}")
+        && doc.redo_menu_label() == "Redo not available";
+    if merge {
+        // undo() restores the pre-gesture settings; keep the live widget values for this step.
+        let live = doc.settings.clone();
+        doc.undo();
+        doc.settings = live;
+    }
+    doc.record_transaction(label, next);
+    *last = gesture.map(|g| (key, g));
+}
+
+/// Records a settings-only step (scene unchanged); the doc's undo history snapshots settings,
+/// so Undo restores them and the tab is marked unsaved.
+fn coalesced_settings_changed(
+    doc: &mut InteractiveDocument,
+    gesture: Option<egui::Id>,
+    last: &mut Option<(egui::Id, egui::Id)>,
+    key: egui::Id,
+    label: &str,
+) {
+    coalesced_scene_tx(doc, gesture, last, key, label, |_| {});
+}
+
+/// Replaces the document settings (stylesheet apply) as one undoable step.
+fn replace_settings_tx(doc: &mut InteractiveDocument, settings: DocumentSettings, label: &str) {
+    if doc.settings != settings {
+        doc.settings = settings;
+        doc.apply_scene_tx(label, |_, _| {});
+    }
+}
+
+/// True when writing `doc` to `path` would drop content (format keeps only molecules, only the
+/// first molecule, or cannot be re-opened). Such a "Save As" is an export: the tab must not be
+/// retargeted to that file nor marked clean, or closing silently loses the rest of the drawing.
+fn save_as_format_is_lossy(doc: &InteractiveDocument, path: &str) -> bool {
+    let low = path.to_ascii_lowercase();
+    let full = [".cdxml", ".cdx", ".cds", ".svg", ".png", ".pdf"];
+    if full.iter().any(|e| low.ends_with(e)) {
+        return false;
+    }
+    let write_only = [".eps", ".emf", ".sln", ".inchi"];
+    if write_only.iter().any(|e| low.ends_with(e)) {
+        return true;
+    }
+    let s = &doc.scene;
+    let has_non_molecule = !s.arrows.is_empty()
+        || !s.captions.is_empty()
+        || !s.curves.is_empty()
+        || !s.graphics.is_empty()
+        || !s.tables.is_empty()
+        || !s.tlc_plates.is_empty();
+    let multi_mol_ok = [".sdf", ".sd", ".smi", ".smiles", ".rxn"].iter().any(|e| low.ends_with(e));
+    has_non_molecule || (!multi_mol_ok && s.molecules.len() > 1)
+}
+
+#[cfg(test)]
+mod audit_b_tests {
+    use super::*;
+
+    #[test]
+    fn test_stamp_molecules_tx_is_single_undo_with_unique_ids() {
+        let mut d = InteractiveDocument::new_saved_seed("t", DocumentSettings::acs_document_1996());
+        let m1 = smiles_to_molecule("CCO").unwrap();
+        let m2 = smiles_to_molecule("CC").unwrap();
+        stamp_molecules_tx(&mut d, vec![m1, m2], "Paste MOL/SDF");
+        assert_eq!(d.scene.molecules.len(), 2);
+        let mut ids: Vec<u32> = d.scene.molecules.iter().flat_map(|m| m.atoms.iter().map(|a| a.id)).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n);
+        d.undo();
+        assert!(d.scene.molecules.is_empty(), "one Undo must remove the whole paste");
+    }
+
+    #[test]
+    fn test_coalesced_scene_tx_one_undo_per_gesture() {
+        let mut d = InteractiveDocument::new_saved_seed("t", DocumentSettings::acs_document_1996());
+        d.scene.molecules.push(smiles_to_molecule("CCO").unwrap());
+        d.save();
+        let key = egui::Id::new("k");
+        let (g1, g2) = (Some(egui::Id::new("drag1")), Some(egui::Id::new("drag2")));
+        let mut last = None;
+        for c in 1..=5 {
+            coalesced_scene_tx(&mut d, g1, &mut last, key, "Atom Properties", |s| s.molecules[0].atoms[0].charge = c);
+        }
+        coalesced_scene_tx(&mut d, g2, &mut last, key, "Atom Properties", |s| s.molecules[0].atoms[0].isotope = 13);
+        assert!(d.is_dirty());
+        assert!(d.undo());
+        assert_eq!(d.scene.molecules[0].atoms[0].charge, 5, "second gesture is its own step");
+        assert!(d.undo());
+        assert_eq!(d.scene.molecules[0].atoms[0].charge, 0, "whole first drag undone in one step");
+        assert!(!d.undo());
+        assert!(!d.is_dirty());
+    }
+
+    #[test]
+    fn test_replace_settings_tx_marks_unsaved_only_on_change() {
+        let mut d = InteractiveDocument::new_saved_seed("t", DocumentSettings::acs_document_1996());
+        replace_settings_tx(&mut d, DocumentSettings::acs_document_1996(), "Apply");
+        assert!(!d.is_dirty());
+        replace_settings_tx(&mut d, DocumentSettings::standard_30pt_document(), "Apply");
+        assert!(d.is_dirty());
+    }
+
+    #[test]
+    fn test_save_as_lossy_format_detection() {
+        let mut d = InteractiveDocument::new_saved_seed("t", DocumentSettings::acs_document_1996());
+        d.scene.molecules.push(smiles_to_molecule("CCO").unwrap());
+        assert!(!save_as_format_is_lossy(&d, "a.mol"));
+        assert!(!save_as_format_is_lossy(&d, "a.CDXML"));
+        assert!(save_as_format_is_lossy(&d, "a.eps"));
+        d.scene.molecules.push(smiles_to_molecule("CC").unwrap());
+        assert!(save_as_format_is_lossy(&d, "a.mol"));
+        assert!(!save_as_format_is_lossy(&d, "a.sdf"));
+        assert!(!save_as_format_is_lossy(&d, "a.cdx"));
     }
 }
 
@@ -10895,7 +11760,7 @@ mod tests {
         assert_eq!(app.hovered_bond, None);
         assert_eq!(app.inline_atom_edit, None);
         app.close_active_tab();
-        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs.len(), 1, "a clean tab closes without asking");
 
         // Aromatic toggle & binary CDX roundtrip
         app.toggle_aromatic_display_tx();
@@ -11771,6 +12636,7 @@ mod tests {
             ActiveDialog::NewCaption { x_tenths: 1000, y_tenths: 1000 },
             ActiveDialog::HelpTopic { title: "Test".into(), body: "Body".into() },
             ActiveDialog::Shortcuts, ActiveDialog::Licensing, ActiveDialog::About,
+            ActiveDialog::ConfirmExit,
         ];
         for dlg in all_dialogs {
             app.dialog = dlg;

@@ -297,13 +297,16 @@ fn parse_systematic_iupac_to_smiles(raw: &str) -> Option<String> {
                 } else {
                     out.push('c');
                 }
+                // OpenSMILES: ring-closure digits must precede branches (`c1(X)`, not `c(X)1`)
+                if i == 5 {
+                    out.push('1');
+                }
                 for sub in &ring_subs[i] {
                     out.push('(');
                     out.push_str(sub);
                     out.push(')');
                 }
             }
-            out.push('1');
             return Some(out);
         }
     }
@@ -351,19 +354,15 @@ fn parse_systematic_iupac_to_smiles(raw: &str) -> Option<String> {
                         }
                         out.push('C');
                     }
+                    if i == n - 1 {
+                        out.push('1'); // ring closure before branches (OpenSMILES)
+                    }
                     for sub in &ring_subs[i] {
-                        if sub.starts_with('=') {
-                            out.push('(');
-                            out.push_str(sub);
-                            out.push(')');
-                        } else {
-                            out.push('(');
-                            out.push_str(sub);
-                            out.push(')');
-                        }
+                        out.push('(');
+                        out.push_str(sub);
+                        out.push(')');
                     }
                 }
-                out.push('1');
                 return Some(out);
             }
         }
@@ -553,6 +552,13 @@ pub fn molecule_to_name(mol: &ChemMolecule, smiles: &str, dict: &NameDictionary)
     }
     let norm_smi = smiles.trim();
     let formula = mol.compute_formula_properties().get_formula();
+    // The structural namers below ignore charges and radicals ([CH2+]C was named "ethane");
+    // ions and radicals go to the fallback (live PubChem lookup). Net-neutral charge-separated
+    // drawings (nitro, zwitterions) keep their names.
+    let net_charge: i32 = mol.atoms.iter().map(|a| a.charge as i32).sum();
+    if net_charge != 0 || mol.atoms.iter().any(|a| a.radical != 0) {
+        return format!("Compound ({formula})");
+    }
     let arom = CcAromaticityInfo::perceive(mol);
     let val = CcVal::compute(mol);
     let heavy_n = mol.atoms.iter().filter(|a| a.z != 1).count();
@@ -581,6 +587,29 @@ pub fn molecule_to_name(mol: &ChemMolecule, smiles: &str, dict: &NameDictionary)
         .iter()
         .filter(|b| b.begin_atom < mol.atoms.len() && b.end_atom < mol.atoms.len() && mol.atoms[b.begin_atom].z != 1 && mol.atoms[b.end_atom].z != 1)
         .count();
+    // Structural guards for the formula fast paths below (a formula alone matches many isomers)
+    let zat = |i: usize| mol.atoms.get(i).map_or(1, |a| a.z);
+    let hdeg = |i: usize| mol.neighbors(i).iter().filter(|&&(nb, _)| zat(nb) != 1).count();
+    // one saturated monocycle containing every heavy atom (cyclobutanol / N-methylpyrrolidine fail this)
+    let plain_ring = heavy_n >= 3
+        && heavy_bonds == heavy_n
+        && (0..mol.atoms.len()).all(|i| zat(i) == 1 || hdeg(i) == 2)
+        && mol.bonds.iter().all(|b| b.order == 1);
+    // heteroatoms in 1,4 relation: no hetero–hetero bond and no carbon flanked by two heteroatoms
+    let hetero_para = mol.bonds.iter().all(|b| matches!(zat(b.begin_atom), 1 | 6) || matches!(zat(b.end_atom), 1 | 6))
+        && (0..mol.atoms.len())
+            .filter(|&i| zat(i) == 6)
+            .all(|i| mol.neighbors(i).iter().filter(|&&(nb, _)| !matches!(zat(nb), 1 | 6)).count() <= 1);
+    // exocyclic heavy atoms attached to the benzene carbons (mono-substitution check)
+    let benz_exo: Vec<usize> = arom_c
+        .iter()
+        .flat_map(|&i| mol.neighbors(i).iter().map(|&(nb, _)| nb).collect::<Vec<_>>())
+        .filter(|&nb| zat(nb) != 1 && !arom_c.contains(&nb))
+        .collect();
+    let mono_c = benz_exo.len() == 1 && zat(benz_exo[0]) == 6;
+    let has_c_eq_o = mol.bonds.iter().any(|b| {
+        b.order == 2 && matches!((zat(b.begin_atom), zat(b.end_atom)), (6, 8) | (8, 6))
+    });
     if arom_c.is_empty() && arom_n.is_empty() && mol.bonds.iter().all(|b| b.order == 1) {
         if formula == "C10H16" && heavy_n == 10 && heavy_bonds == 12 && c_deg3 == 4 && c_deg2 == 6 {
             return "adamantane".to_string();
@@ -636,17 +665,17 @@ pub fn molecule_to_name(mol: &ChemMolecule, smiles: &str, dict: &NameDictionary)
         ("C7H8O", 6, 0, 8) if mol.atoms.iter().any(|a| a.z == 8 && mol.neighbors(mol.atoms.iter().position(|x| x.id == a.id).unwrap_or(0)).len() >= 2) => {
             return "methoxybenzene (anisole)".to_string();
         }
-        ("C7H6O2", 6, 0, 9) => return "benzoic acid".to_string(),
-        ("C7H6O", 6, 0, 8) => return "benzaldehyde".to_string(),
-        ("C8H8", 6, 0, 8) => return "styrene".to_string(),
-        ("C7H5N", 6, 0, 8) => return "benzonitrile".to_string(),
-        ("C6H5NO2", 6, 0, 9) => return "nitrobenzene".to_string(),
-        ("C5H11N", 0, 0, 6) if mol.bonds.len() == 6 => return "piperidine".to_string(),
-        ("C4H10N2", 0, 0, 6) if mol.bonds.len() == 6 => return "piperazine".to_string(),
-        ("C4H9NO", 0, 0, 6) if mol.bonds.len() == 6 => return "morpholine".to_string(),
-        ("C4H9N", 0, 0, 5) if mol.bonds.len() == 5 => return "pyrrolidine".to_string(),
-        ("C4H8O", 0, 0, 5) if mol.bonds.len() == 5 => return "oxolane (THF)".to_string(),
-        ("C4H8O2", 0, 0, 6) if mol.bonds.len() == 6 => return "1,4-dioxane".to_string(),
+        ("C7H6O2", 6, 0, 9) if mono_c => return "benzoic acid".to_string(),
+        ("C7H6O", 6, 0, 8) if mono_c => return "benzaldehyde".to_string(),
+        ("C8H8", 6, 0, 8) if mono_c => return "styrene".to_string(),
+        ("C7H5N", 6, 0, 8) if mono_c => return "benzonitrile".to_string(),
+        ("C6H5NO2", 6, 0, 9) if benz_exo.len() == 1 && zat(benz_exo[0]) == 7 => return "nitrobenzene".to_string(),
+        ("C5H11N", 0, 0, 6) if plain_ring => return "piperidine".to_string(),
+        ("C4H10N2", 0, 0, 6) if plain_ring && hetero_para => return "piperazine".to_string(),
+        ("C4H9NO", 0, 0, 6) if plain_ring && hetero_para => return "morpholine".to_string(),
+        ("C4H9N", 0, 0, 5) if plain_ring => return "pyrrolidine".to_string(),
+        ("C4H8O", 0, 0, 5) if plain_ring => return "oxolane (THF)".to_string(),
+        ("C4H8O2", 0, 0, 6) if plain_ring && hetero_para => return "1,4-dioxane".to_string(),
         ("H2O", 0, 0, 1) => return "water".to_string(),
         ("H3N", 0, 0, 1) => return "ammonia".to_string(),
         ("CH4", 0, 0, 1) => return "methane".to_string(),
@@ -660,15 +689,15 @@ pub fn molecule_to_name(mol: &ChemMolecule, smiles: &str, dict: &NameDictionary)
         ("C3H7NO", 0, 0, 5) if norm_smi.contains("CN(C)C=O") => return "N,N-dimethylformamide (DMF)".to_string(),
         ("C2H6O", 0, 0, 3) if norm_smi.contains("CCO") || norm_smi.contains("OCC") => return "ethanol".to_string(),
         ("C2H6O", 0, 0, 3) if norm_smi == "COC" => return "methoxymethane (dimethyl ether)".to_string(),
-        ("C2H4O", 0, 0, 3) if mol.bonds.iter().any(|b| b.order == 2) => return "ethanal (acetaldehyde)".to_string(),
+        ("C2H4O", 0, 0, 3) if has_c_eq_o => return "ethanal (acetaldehyde)".to_string(),
         ("C2H3N", 0, 0, 3) if mol.bonds.iter().any(|b| b.order == 3) => return "acetonitrile".to_string(),
-        ("C2H4O2", 0, 0, 4) if mol.atoms.iter().filter(|a| a.z == 8).count() == 2 && mol.bonds.iter().any(|b| b.order == 2) => {
+        ("C2H4O2", 0, 0, 4) if has_c_eq_o && (0..mol.atoms.len()).any(|i| zat(i) == 6 && mol.neighbors(i).iter().filter(|&&(nb, _)| zat(nb) == 8).count() == 2) => {
             if let Some(est) = name_simple_ester(mol) {
                 return est;
             }
             return "acetic acid".to_string();
         }
-        ("C3H6O", 0, 0, 4) if mol.bonds.iter().any(|b| b.order == 2) && mol.atoms.iter().any(|a| a.z == 8) => {
+        ("C3H6O", 0, 0, 4) if has_c_eq_o => {
             let is_ketone = mol.atoms.iter().enumerate().any(|(i, a)| {
                 a.z == 6
                     && mol.neighbors(i).iter().any(|&(nb, bi)| mol.atoms[nb].z == 8 && mol.bonds[bi].order == 2)
@@ -793,8 +822,9 @@ fn name_simple_ester(mol: &ChemMolecule) -> Option<String> {
         let arom = CcAromaticityInfo::perceive(mol);
         let alk_name = if alk_c_cnt == 6 && alk_sub.iter().all(|&i| mol.atoms[i].z != 6 || arom.is_atom_aromatic(i)) {
             "phenyl".to_string()
-        } else if let Some(&(r, _)) = CHAIN_ROOTS.iter().find(|&&(_, n)| n == alk_c_cnt) {
-            format!("{r}yl")
+        } else if let Some(a) = alkyl_prefix(mol, alk_c, oi) {
+            // was named by carbon count alone (isopropyl acetate → "propyl acetate", vinyl → "ethyl")
+            a
         } else {
             continue;
         };
@@ -803,8 +833,22 @@ fn name_simple_ester(mol: &ChemMolecule) -> Option<String> {
         if acyl_o_cnt != 1 {
             continue; // only the single =O on acyl side
         }
+        // acyl side beyond C(=O) must be H, phenyl, or an unbranched saturated chain
+        let acyl_r: Vec<usize> = mol
+            .neighbors(acyl_c)
+            .iter()
+            .filter(|&&(nb, _)| nb != oi && mol.atoms[nb].z == 6)
+            .map(|&(nb, _)| nb)
+            .collect();
+        let acyl_linear = match acyl_r.as_slice() {
+            [] => true,
+            [r] => alkyl_prefix(mol, *r, acyl_c).is_some_and(|p| !p.starts_with("iso") && !p.starts_with("tert")),
+            _ => false,
+        };
         let acid_part = if acyl_c_cnt == 7 && acyl_sub.iter().filter(|&&i| arom.is_atom_aromatic(i)).count() == 6 {
             "benzoate".to_string()
+        } else if !acyl_linear {
+            continue;
         } else if acyl_c_cnt == 1 {
             "formate".to_string()
         } else if acyl_c_cnt == 2 {
@@ -844,15 +888,26 @@ fn name_simple_ether(mol: &ChemMolecule) -> Option<String> {
     if s1.iter().any(|x| s2.contains(x)) {
         return None; // cyclic ether
     }
+    // Name each side structurally (was by carbon count only: isopropyl/branched sides misnamed, no locant)
     let n1 = s1.iter().filter(|&&i| mol.atoms[i].z == 6).count();
     let n2 = s2.iter().filter(|&&i| mol.atoms[i].z == 6).count();
-    let (small, large) = if n1 <= n2 { (n1, n2) } else { (n2, n1) };
-    let r_small = CHAIN_ROOTS.iter().find(|&&(_, n)| n == small)?.0;
-    let r_large = CHAIN_ROOTS.iter().find(|&&(_, n)| n == large)?.0;
-    if small == large {
-        Some(format!("{r_small}oxy{r_large}ane (di{r_small}yl ether)"))
+    let (small, large) = if n1 <= n2 { (nbrs[0], nbrs[1]) } else { (nbrs[1], nbrs[0]) };
+    let p_small = alkyl_prefix(mol, small, oi)?;
+    let p_large = alkyl_prefix(mol, large, oi)?;
+    let alkoxy = format!("{}oxy", p_small.trim_end_matches("yl"));
+    let parent = match p_large.as_str() {
+        "isopropyl" => "2-{X}propane".to_string(),
+        "tert-butyl" => "2-{X}-2-methylpropane".to_string(),
+        l => {
+            let root = l.trim_end_matches("yl");
+            if matches!(root, "meth" | "eth") { format!("{{X}}{root}ane") } else { format!("1-{{X}}{root}ane") }
+        }
+    };
+    let name = parent.replace("{X}", &alkoxy);
+    if p_small == p_large {
+        Some(format!("{name} (di{p_small} ether)"))
     } else {
-        Some(format!("{r_small}oxy{r_large}ane"))
+        Some(name)
     }
 }
 
@@ -945,11 +1000,20 @@ fn classify_substituent(mol: &ChemMolecule, sub_root: usize, parent_atom: usize)
             if nbrs.is_empty() {
                 "hydroxy".to_string()
             } else if nbrs.len() == 1 && mol.atoms[nbrs[0].0].z == 6 {
-                let c_sub = count_subtree_carbons(mol, nbrs[0].0, sub_root);
-                match c_sub {
-                    1 => "methoxy".to_string(),
-                    2 => "ethoxy".to_string(),
-                    _ => "alkoxy".to_string(),
+                let c = nbrs[0].0;
+                let acyl = mol.neighbors(c).iter().any(|&(k, bi)| mol.atoms[k].z == 8 && mol.bonds[bi].order == 2);
+                if acyl {
+                    // O-C(=O)R is acyloxy, not alkoxy
+                    match count_subtree_carbons(mol, c, sub_root) {
+                        1 => "formyloxy".to_string(),
+                        2 => "acetoxy".to_string(),
+                        _ => "acyloxy".to_string(),
+                    }
+                } else {
+                    match alkyl_prefix(mol, c, sub_root) {
+                        Some(a) => format!("{}oxy", a.trim_end_matches("yl")),
+                        None => "alkoxy".to_string(),
+                    }
                 }
             } else {
                 "oxy".to_string()
@@ -969,8 +1033,20 @@ fn classify_substituent(mol: &ChemMolecule, sub_root: usize, parent_atom: usize)
                 } else {
                     "amido".to_string()
                 }
-            } else {
+            } else if nbrs.is_empty() {
                 "amino".to_string()
+            } else {
+                // N-alkylated amines: methylamino, diethylamino, ...
+                let alk: Vec<String> = nbrs.iter().filter_map(|&(nb, _)| alkyl_prefix(mol, nb, sub_root)).collect();
+                if alk.len() != nbrs.len() || alk.len() > 2 {
+                    "alkylamino".to_string()
+                } else if alk.len() == 2 && alk[0] == alk[1] {
+                    format!("di{}amino", alk[0])
+                } else {
+                    let mut a = alk;
+                    a.sort();
+                    format!("{}amino", a.join(""))
+                }
             }
         }
         16 => "sulfanyl".to_string(),
@@ -978,25 +1054,83 @@ fn classify_substituent(mol: &ChemMolecule, sub_root: usize, parent_atom: usize)
             let has_dbl_o = nbrs.iter().any(|&(nb, bi)| mol.atoms[nb].z == 8 && mol.bonds[bi].order == 2);
             let has_sgl_o = nbrs.iter().any(|&(nb, bi)| mol.atoms[nb].z == 8 && mol.bonds[bi].order == 1);
             let has_trp_n = nbrs.iter().any(|&(nb, bi)| mol.atoms[nb].z == 7 && mol.bonds[bi].order == 3);
+            let f_cnt = nbrs.iter().filter(|&&(nb, _)| mol.atoms[nb].z == 9).count();
             if has_dbl_o && has_sgl_o {
-                "carboxy".to_string()
+                // carboxy needs a free OH; C(=O)OR is alkoxycarbonyl
+                let o_sgl = nbrs.iter().find(|&&(nb, bi)| mol.atoms[nb].z == 8 && mol.bonds[bi].order == 1).map(|&(nb, _)| nb);
+                let o_alk = o_sgl.and_then(|o| {
+                    mol.neighbors(o).iter().find(|&&(k, _)| k != sub_root && mol.atoms[k].z != 1).map(|&(k, _)| (o, k))
+                });
+                match o_alk {
+                    None => "carboxy".to_string(),
+                    Some((o, k)) => match alkyl_prefix(mol, k, o) {
+                        Some(a) => format!("{}oxycarbonyl", a.trim_end_matches("yl")),
+                        None => "alkoxycarbonyl".to_string(),
+                    },
+                }
             } else if has_dbl_o && nbrs.len() == 1 {
                 "formyl".to_string()
+            } else if has_dbl_o && nbrs.len() == 2 && nbrs.iter().any(|&(nb, _)| alkyl_prefix(mol, nb, sub_root).as_deref() == Some("methyl")) {
+                "acetyl".to_string()
             } else if has_trp_n {
                 "cyano".to_string()
+            } else if f_cnt == 3 && nbrs.len() == 3 {
+                "trifluoromethyl".to_string()
+            } else if nbrs.len() == 1 && mol.atoms[nbrs[0].0].z == 6 && nbrs[0].0 != parent_atom && {
+                let bo = mol.bonds[nbrs[0].1].order;
+                (bo == 2 || bo == 3) && mol.neighbors(nbrs[0].0).iter().filter(|&&(k, _)| k != sub_root && mol.atoms[k].z != 1).count() == 0
+            } {
+                if mol.bonds[nbrs[0].1].order == 2 { "ethenyl".to_string() } else { "ethynyl".to_string() }
             } else {
-                let cnt = count_subtree_carbons(mol, sub_root, parent_atom);
-                match cnt {
-                    1 => "methyl".to_string(),
-                    2 => "ethyl".to_string(),
-                    3 => "propyl".to_string(),
-                    4 => "butyl".to_string(),
-                    _ => "alkyl".to_string(),
-                }
+                alkyl_prefix(mol, sub_root, parent_atom).unwrap_or_else(|| "alkyl".to_string())
             }
         }
         _ => "substituted".to_string(),
     }
+}
+
+/// Prefix for a saturated, all-carbon alkyl group rooted at `root` (attached via `from`):
+/// linear C1–C12 ("methyl".."dodecyl"), "isopropyl", "tert-butyl"; `None` for anything else.
+fn alkyl_prefix(mol: &ChemMolecule, root: usize, from: usize) -> Option<String> {
+    const ROOTS: [&str; 12] = ["meth", "eth", "prop", "but", "pent", "hex", "hept", "oct", "non", "dec", "undec", "dodec"];
+    let heavy_next = |u: usize, prev: usize| -> Option<Vec<usize>> {
+        let mut out = Vec::new();
+        for &(v, bi) in &mol.neighbors(u) {
+            if v == prev || mol.atoms[v].z == 1 {
+                continue;
+            }
+            if mol.atoms[v].z != 6 || mol.bonds[bi].order != 1 {
+                return None;
+            }
+            out.push(v);
+        }
+        Some(out)
+    };
+    if mol.atoms.get(root)?.z != 6 {
+        return None;
+    }
+    let first = heavy_next(root, from)?;
+    let is_methyl = |v: usize| heavy_next(v, root).is_some_and(|n| n.is_empty());
+    match first.len() {
+        2 if first.iter().all(|&v| is_methyl(v)) => return Some("isopropyl".to_string()),
+        3 if first.iter().all(|&v| is_methyl(v)) => return Some("tert-butyl".to_string()),
+        0 | 1 => {}
+        _ => return None,
+    }
+    let (mut prev, mut cur, mut n) = (from, root, 1usize);
+    loop {
+        let next = heavy_next(cur, prev)?;
+        match next.len() {
+            0 => break,
+            1 if n < ROOTS.len() => {
+                prev = cur;
+                cur = next[0];
+                n += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(format!("{}yl", ROOTS[n - 1]))
 }
 
 fn count_subtree_carbons(mol: &ChemMolecule, start: usize, blocked: usize) -> usize {
@@ -1170,6 +1304,52 @@ fn name_substituted_cycloalkane(mol: &ChemMolecule) -> Option<String> {
         }
     }
 
+    // Several ring C=C bonds (cyclopentadiene, cyclohexa-1,4-diene …) cannot be named by the
+    // single-"ene" logic below: name the bare ring here, or defer substituted ones.
+    let ring_dbls: Vec<usize> = (0..rlen)
+        .filter(|&i| {
+            let (a, b_atom) = (ring[i], ring[(i + 1) % rlen]);
+            mol.bonds.iter().any(|bd| {
+                ((bd.begin_atom == a && bd.end_atom == b_atom) || (bd.begin_atom == b_atom && bd.end_atom == a))
+                    && bd.order == 2
+            })
+        })
+        .collect();
+    if ring_dbls.len() >= 2 {
+        let has_subs = ring
+            .iter()
+            .any(|&ci| mol.neighbors(ci).iter().any(|&(nb, _)| !in_ring.contains_key(&nb) && mol.atoms[nb].z != 1));
+        if has_subs {
+            return None;
+        }
+        let mut best: Option<Vec<usize>> = None;
+        for anc in 0..rlen {
+            for dir in [1isize, -1] {
+                let loc = |r: usize| if dir == 1 { (r + rlen - anc) % rlen + 1 } else { (anc + rlen - r) % rlen + 1 };
+                let mut locs: Vec<usize> = ring_dbls
+                    .iter()
+                    .map(|&i| {
+                        let (x, y) = (loc(i), loc((i + 1) % rlen));
+                        if x.max(y) - x.min(y) == 1 { x.min(y) } else { x.max(y) }
+                    })
+                    .collect();
+                locs.sort_unstable();
+                if best.as_ref().map(|b| locs < *b).unwrap_or(true) {
+                    best = Some(locs);
+                }
+            }
+        }
+        let locs = best?;
+        let mult = match locs.len() {
+            2 => "di",
+            3 => "tri",
+            4 => "tetra",
+            _ => return None,
+        };
+        let joined: Vec<String> = locs.iter().map(|l| l.to_string()).collect();
+        return Some(format!("cyclo{root}a-{}-{mult}ene", joined.join(",")));
+    }
+
     let mut pos_subs: Vec<(usize, String, bool)> = Vec::new(); // (ring_idx, label, is_ketone)
     for (idx, &ci) in ring.iter().enumerate() {
         for &(nb, bi) in &mol.neighbors(ci) {
@@ -1338,30 +1518,30 @@ fn name_acyclic_chain(mol: &ChemMolecule, _val: &CcVal, carbons: &[usize]) -> Op
     }
 
     // Orient chain numbering to give lowest locant to principal functional group, unsaturation, or substituents!
-    let reverse = if let Some((_, gidx, _)) = best_group {
-        gidx > (n - 1) / 2
-    } else if let Some(&d) = dbl_locs.first() {
-        d >= n / 2
-    } else if let Some(&t) = trp_locs.first() {
-        t >= n / 2
-    } else {
-        let mut fwd_locs: Vec<usize> = Vec::new();
-        let mut rev_locs: Vec<usize> = Vec::new();
+    // Lowest-locant rule applied in order: principal group, all multiple bonds, double bonds, substituents
+    // (each criterion only breaks ties of the previous one; formerly the first criterion alone decided).
+    let locant_key = |rev: bool| {
+        let atom_loc = |i: usize| if rev { n - i } else { i + 1 };
+        let bond_loc = |d: usize| if rev { n - 1 - d } else { d + 1 };
+        let sorted = |mut v: Vec<usize>| {
+            v.sort_unstable();
+            v
+        };
+        let grp: Vec<usize> = best_group.iter().map(|&(_, g, _)| atom_loc(g)).collect();
+        let unsat = sorted(dbl_locs.iter().chain(trp_locs.iter()).map(|&d| bond_loc(d)).collect());
+        let dbl = sorted(dbl_locs.iter().map(|&d| bond_loc(d)).collect());
+        let mut subs = Vec::new();
         for (idx, &ci) in best_chain.iter().enumerate() {
             let sub_cnt = mol
                 .neighbors(ci)
                 .into_iter()
                 .filter(|&(nb, _)| !in_chain.contains_key(&nb) && mol.atoms[nb].z != 1)
                 .count();
-            for _ in 0..sub_cnt {
-                fwd_locs.push(idx + 1);
-                rev_locs.push(n - idx);
-            }
+            subs.extend(std::iter::repeat(atom_loc(idx)).take(sub_cnt));
         }
-        fwd_locs.sort_unstable();
-        rev_locs.sort_unstable();
-        rev_locs < fwd_locs
+        (grp, unsat, dbl, sorted(subs))
     };
+    let reverse = locant_key(true) < locant_key(false);
     if reverse {
         best_chain.reverse();
     }
@@ -1393,14 +1573,42 @@ fn name_acyclic_chain(mol: &ChemMolecule, _val: &CcVal, carbons: &[usize]) -> Op
         }
     }
 
-    let infix = if !trp_locs.is_empty() {
-        let l = if reverse { n - 1 - trp_locs[0] } else { trp_locs[0] + 1 };
-        if n <= 3 { "yn".to_string() } else { format!("-{l}-yn") }
-    } else if !dbl_locs.is_empty() {
-        let l = if reverse { n - 1 - dbl_locs[0] } else { dbl_locs[0] + 1 };
-        if n <= 3 { "en".to_string() } else { format!("-{l}-en") }
-    } else {
-        "an".to_string()
+    // Every C=C / C#C gets a locant (buta-1,3-diene, but-1-en-3-yne); previously only the first was named
+    let unsat_term = |locs: &[usize], stem: &str| -> Option<(String, bool)> {
+        if locs.is_empty() {
+            return None;
+        }
+        let mut l: Vec<usize> = locs.iter().map(|&d| if reverse { n - 1 - d } else { d + 1 }).collect();
+        l.sort_unstable();
+        let mult = match l.len() {
+            1 => "",
+            2 => "di",
+            3 => "tri",
+            4 => "tetra",
+            5 => "penta",
+            _ => "hexa",
+        };
+        let ls: Vec<String> = l.iter().map(|x| x.to_string()).collect();
+        Some((format!("-{}-{mult}{stem}", ls.join(",")), l.len() > 1))
+    };
+    let en = unsat_term(&dbl_locs, "en");
+    let yn = unsat_term(&trp_locs, "yn");
+    let infix = match (en, yn) {
+        (None, None) => "an".to_string(),
+        (Some(_), None) if n <= 3 && dbl_locs.len() == 1 => "en".to_string(),
+        (None, Some(_)) if n <= 3 && trp_locs.len() == 1 => "yn".to_string(),
+        (e, y) => {
+            // "a" is inserted after the root before a multiplied first term (buta-1,3-diene)
+            let first_mult = e.as_ref().or(y.as_ref()).is_some_and(|t| t.1);
+            let mut s = if first_mult { "a".to_string() } else { String::new() };
+            if let Some((t, _)) = e {
+                s.push_str(&t);
+            }
+            if let Some((t, _)) = y {
+                s.push_str(&t);
+            }
+            s
+        }
     };
 
     let parent = match grp_pos {
@@ -1436,8 +1644,22 @@ fn format_substituents(subs: &[(usize, String)]) -> String {
             1 => "",
             2 => "di",
             3 => "tri",
-            4 => "tetra",
-            _ => "poly",
+            k => {
+                // was "poly" for ≥5 (not an IUPAC prefix); e.g. perfluorododecane has 26 F
+                const U: [&str; 10] = ["", "hen", "do", "tri", "tetra", "penta", "hexa", "hepta", "octa", "nona"];
+                let s = match k {
+                    5..=9 => U[k].to_string(),
+                    10 => "deca".to_string(),
+                    11 => "undeca".to_string(),
+                    12..=19 => format!("{}deca", U[k - 10]),
+                    20 => "icosa".to_string(),
+                    21 => "henicosa".to_string(),
+                    22..=29 => format!("{}cosa", U[k - 20]),
+                    _ => format!("{k}×"),
+                };
+                parts.push(format!("{}-{s}{name}", locs.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",")));
+                continue;
+            }
         };
         let loc_s: Vec<String> = locs.iter().map(|l| l.to_string()).collect();
         parts.push(format!("{}-{mult}{name}", loc_s.join(",")));
@@ -1499,6 +1721,64 @@ pub fn make_simple_chain(n: usize) -> ChemMolecule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mol_from(zs: &[i32], bonds: &[(usize, usize, i32)]) -> ChemMolecule {
+        let mut m = ChemMolecule::new();
+        for (i, &z) in zs.iter().enumerate() {
+            m.add_atom(ChemAtom::new(i as u32 + 1, z));
+        }
+        for (k, &(a, b, o)) in bonds.iter().enumerate() {
+            m.add_bond(k as u32 + 100, a, b, o, BondDisplay::Solid);
+        }
+        m
+    }
+
+    #[test]
+    fn test_substituent_prefixes_and_locants() {
+        let dict = NameDictionary::with_builtins();
+        // acetyl / methoxycarbonyl / trifluoromethyl / isopropyl on parent atom 0
+        let acetyl = mol_from(&[6, 6, 8, 6], &[(0, 1, 1), (1, 2, 2), (1, 3, 1)]);
+        assert_eq!(classify_substituent(&acetyl, 1, 0), "acetyl");
+        let ester = mol_from(&[6, 6, 8, 8, 6], &[(0, 1, 1), (1, 2, 2), (1, 3, 1), (3, 4, 1)]);
+        assert_eq!(classify_substituent(&ester, 1, 0), "methoxycarbonyl");
+        let cf3 = mol_from(&[6, 6, 9, 9, 9], &[(0, 1, 1), (1, 2, 1), (1, 3, 1), (1, 4, 1)]);
+        assert_eq!(classify_substituent(&cf3, 1, 0), "trifluoromethyl");
+        let ipr = mol_from(&[6, 6, 6, 6], &[(0, 1, 1), (1, 2, 1), (1, 3, 1)]);
+        assert_eq!(classify_substituent(&ipr, 1, 0), "isopropyl");
+        let acoxy = mol_from(&[6, 8, 6, 8, 6], &[(0, 1, 1), (1, 2, 1), (2, 3, 2), (2, 4, 1)]);
+        assert_eq!(classify_substituent(&acoxy, 1, 0), "acetoxy");
+        // every multiple bond gets a locant
+        let mut diene = make_simple_chain(4);
+        diene.bonds[0].order = 2;
+        diene.bonds[2].order = 2;
+        assert_eq!(molecule_to_name(&diene, "C=CC=C", &dict), "buta-1,3-diene");
+        // rings with several C=C must not be named as a mono-ene
+        let cpd = mol_from(&[6; 5], &[(0, 1, 2), (1, 2, 1), (2, 3, 2), (3, 4, 1), (4, 0, 1)]);
+        assert_eq!(molecule_to_name(&cpd, "C1=CC=CC1", &dict), "cyclopenta-1,3-diene");
+        let chd = mol_from(&[6; 6], &[(0, 1, 2), (1, 2, 1), (2, 3, 1), (3, 4, 2), (4, 5, 1), (5, 0, 1)]);
+        assert_eq!(molecule_to_name(&chd, "C1=CCC=CC1", &dict), "cyclohexa-1,4-diene");
+        // an ion is not its neutral parent
+        let mut cation = make_simple_chain(2);
+        cation.atoms[0].charge = 1;
+        assert!(is_fallback_chemical_name(&molecule_to_name(&cation, "[CH2+]C", &dict)));
+        // ester / ether sides named structurally
+        let ipr_ac = mol_from(&[6, 6, 8, 8, 6, 6, 6], &[(0, 1, 1), (1, 2, 2), (1, 3, 1), (3, 4, 1), (4, 5, 1), (4, 6, 1)]);
+        assert_eq!(molecule_to_name(&ipr_ac, "CC(=O)OC(C)C", &dict), "isopropyl acetate");
+        let mop = mol_from(&[6, 8, 6, 6, 6], &[(0, 1, 1), (1, 2, 1), (2, 3, 1), (3, 4, 1)]);
+        assert_eq!(molecule_to_name(&mop, "COCCC", &dict), "1-methoxypropane");
+        // formula fast paths must not swallow isomers
+        let hba = mol_from(
+            &[6, 6, 6, 6, 6, 6, 6, 8, 8],
+            &[(0, 1, 2), (1, 2, 1), (2, 3, 2), (3, 4, 1), (4, 5, 2), (5, 0, 1), (0, 6, 1), (6, 7, 2), (3, 8, 1)],
+        );
+        assert_ne!(molecule_to_name(&hba, "O=Cc1ccc(O)cc1", &dict), "benzoic acid");
+        let cbol = mol_from(&[6, 6, 6, 6, 8], &[(0, 1, 1), (1, 2, 1), (2, 3, 1), (3, 0, 1), (0, 4, 1)]);
+        assert_ne!(molecule_to_name(&cbol, "OC1CCC1", &dict), "oxolane (THF)");
+        let thf = mol_from(&[6, 6, 6, 6, 8], &[(0, 1, 1), (1, 2, 1), (2, 3, 1), (3, 4, 1), (4, 0, 1)]);
+        assert_eq!(molecule_to_name(&thf, "C1CCOC1", &dict), "oxolane (THF)");
+        let subs: Vec<(usize, String)> = (1..=5).map(|i| (i, "fluoro".to_string())).collect();
+        assert_eq!(format_substituents(&subs), "1,2,3,4,5-pentafluoro");
+    }
 
     #[test]
     fn test_iupac_name_to_smiles_and_structure_to_name() {

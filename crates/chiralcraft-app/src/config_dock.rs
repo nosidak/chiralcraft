@@ -156,27 +156,33 @@ impl UserConfig {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        let _ = crate::io_bridge::atomic_write_text(&path.to_string_lossy(), &self.to_json());
+    }
+
+    fn to_json(&self) -> String {
         let recents: Vec<String> = self
             .recent_files
             .iter()
             .take(10)
             .map(|r| format!("\"{}\"", json_esc(r)))
             .collect();
-        let json = format!(
+        let d = Self::default();
+        let finite_or = |v: f64, fallback: f64| if v.is_finite() { v } else { fallback };
+        format!(
             "{{\n  \"theme\": \"{}\",\n  \"png_dpi\": {},\n  \"svg_padding_pt\": {:.1},\n  \"copy_bg\": \"{}\",\n  \"rear_opacity\": {:.2},\n  \"crossing_clearance_pt\": {:.1},\n  \"show_right_dock\": {},\n  \"xtb_path\": \"{}\",\n  \"orca_path\": \"{}\",\n  \"gaussian_path\": \"{}\",\n  \"recent_files\": [{}]\n}}\n",
             json_esc(&self.theme),
             self.png_dpi,
-            self.svg_padding_pt,
+            // NaN/inf would print as invalid JSON and reset the whole config on next load
+            finite_or(self.svg_padding_pt, d.svg_padding_pt),
             json_esc(&self.copy_bg),
-            self.rear_opacity,
-            self.crossing_clearance_pt,
+            finite_or(self.rear_opacity as f64, d.rear_opacity as f64),
+            finite_or(self.crossing_clearance_pt, d.crossing_clearance_pt),
             self.show_right_dock,
             json_esc(&self.xtb_path),
             json_esc(&self.orca_path),
             json_esc(&self.gaussian_path),
             recents.join(", ")
-        );
-        let _ = crate::io_bridge::atomic_write_text(&path.to_string_lossy(), &json);
+        )
     }
 
     pub fn push_recent(&mut self, path: &str) {
@@ -242,6 +248,12 @@ fn quantum_preview_cache_key(mol: &ChemMolecule, spec: &QuantumJobSpec) -> Strin
     for a in &mol.atoms {
         mix(a.z as u64);
         mix(a.charge as u64);
+        mix(a.isotope as u64);
+        mix(a.radical as u64);
+        // Labels (nicknames) can change H-filling in prepare_molecule_for_quantum
+        for byte in a.label.as_deref().unwrap_or("").bytes().chain(std::iter::once(0xff)) {
+            mix(byte as u64);
+        }
         mix(a.x.to_bits());
         mix(a.y.to_bits());
         mix(a.z_coord.to_bits());
@@ -752,4 +764,33 @@ pub fn show_right_studio_dock(
             });
         });
     act
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_json_never_contains_non_finite_numbers() {
+        let mut cfg = UserConfig::default();
+        cfg.svg_padding_pt = f64::NAN;
+        cfg.rear_opacity = f32::INFINITY;
+        cfg.crossing_clearance_pt = f64::NEG_INFINITY;
+        cfg.theme = "dark".to_string();
+        let root = JsonValue::parse(&cfg.to_json()).expect("config JSON must stay parseable");
+        assert_eq!(root.get("theme").and_then(|v| v.as_str()), Some("dark"));
+    }
+
+    #[test]
+    fn test_quantum_preview_key_tracks_isotope_and_label() {
+        let mut mol = ChemMolecule::default();
+        mol.atoms.push(chiralcraft_chem::ChemAtom::new(1, 1));
+        let spec = QuantumJobSpec::default();
+        let base = quantum_preview_cache_key(&mol, &spec);
+        mol.atoms[0].isotope = 2;
+        let deut = quantum_preview_cache_key(&mol, &spec);
+        assert_ne!(base, deut);
+        mol.atoms[0].label = Some("Me".to_string());
+        assert_ne!(deut, quantum_preview_cache_key(&mol, &spec));
+    }
 }

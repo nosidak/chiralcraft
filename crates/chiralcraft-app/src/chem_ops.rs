@@ -605,7 +605,18 @@ pub fn inchi_to_molecule(inchi: &str) -> Result<ChemMolecule, String> {
                 next_bid += 1;
             }
         };
-        for (comp_i, seg) in c_layer[1..].split(';').enumerate() {
+        // Expand `N*` multipliers (e.g. `/2C2H6O/c2*1-2-3`) so every repeated component gets its bonds
+        let mut segs: Vec<&str> = Vec::new();
+        for seg in c_layer[1..].split(';') {
+            match seg.split_once('*') {
+                Some((n, body)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                    let reps = n.parse::<usize>().unwrap_or(1).clamp(1, comp_offsets.len().max(1));
+                    segs.extend(std::iter::repeat(body).take(reps));
+                }
+                _ => segs.push(seg),
+            }
+        }
+        for (comp_i, seg) in segs.into_iter().enumerate() {
             let offset = comp_offsets.get(comp_i).copied().unwrap_or(0);
             let bchars: Vec<char> = seg.chars().collect();
             let mut pos = 0usize;
@@ -650,4 +661,19 @@ pub fn inchi_to_molecule(inchi: &str) -> Result<ChemMolecule, String> {
         }
     }
     Ok(mol)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inchi_component_multiplier_bonds_every_copy() {
+        // Two ethanol molecules: 6 heavy atoms, 2 bonds per copy
+        let mol = inchi_to_molecule("InChI=1S/2C2H6O/c2*1-2-3/h2*3H,2H2,1H3").unwrap();
+        assert_eq!(mol.atoms.len(), 6);
+        assert_eq!(mol.bonds.len(), 4);
+        assert!(mol.bonds.iter().any(|b| (b.begin_atom, b.end_atom) == (3, 4)));
+        assert!(mol.bonds.iter().any(|b| (b.begin_atom, b.end_atom) == (4, 5)));
+    }
 }

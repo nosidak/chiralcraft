@@ -330,8 +330,34 @@ pub fn arrange_catalytic_cycle(
         return 0;
     }
 
-    // Remove previous cycle arrows so Clean Up Cycle is idempotent
-    scene.arrows.retain(|a| a.arrowhead_head != "Curved");
+    // Remove previous cycle arrows so Clean Up Cycle is idempotent. Only curved arrows whose tail and head
+    // sit at the trimmed rim of two *different* cycle members are ours; user mechanism arrows survive.
+    let old_centers: Vec<(f64, f64, f64)> = valid
+        .iter()
+        .filter_map(|&mi| {
+            let m = &scene.molecules[mi];
+            let (mut x1, mut y1, mut x2, mut y2) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for a in &m.atoms {
+                x1 = x1.min(a.x);
+                y1 = y1.min(a.y);
+                x2 = x2.max(a.x);
+                y2 = y2.max(a.y);
+            }
+            x1.is_finite().then(|| (0.5 * (x1 + x2), 0.5 * (y1 + y2), 0.5 * (x2 - x1).hypot(y2 - y1).max(20.0) + 12.0))
+        })
+        .collect();
+    let near = |p: (f64, f64), i: usize| {
+        let (x, y, r) = old_centers[i];
+        (p.0 - x).hypot(p.1 - y) <= r
+    };
+    let k = old_centers.len();
+    scene.arrows.retain(|a| {
+        if a.arrowhead_head != "Curved" {
+            return true;
+        }
+        let ours = (0..k).any(|i| near(a.tail, i) && (0..k).any(|j| j != i && near(a.head, j)));
+        !ours
+    });
 
     let mut centers = Vec::with_capacity(n);
     for (k, &mi) in valid.iter().enumerate() {
@@ -847,5 +873,31 @@ pub fn compare_documents(left: &crate::InteractiveDocument, right: &crate::Inter
         arrow_delta: (right.scene.arrows.len() as isize) - (left.scene.arrows.len() as isize),
         table_delta: (right.scene.tables.len() as isize) - (left.scene.tables.len() as isize),
         tlc_delta: (right.scene.tlc_plates.len() as isize) - (left.scene.tlc_plates.len() as isize),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_catalytic_cycle_cleanup_idempotent_and_keeps_user_curved_arrows() {
+        let mut scene = DocumentScene::default();
+        let mut nid = 1000u32;
+        // User mechanism arrow far from the cycle.
+        scene.arrows.push(SceneArrow {
+            id: 1,
+            tail: (600.0, 600.0),
+            head: (640.0, 620.0),
+            arrowhead_head: "Curved".to_string(),
+            arrowhead_tail: None,
+            no_go: None,
+            dipole: false,
+        });
+        let idxs = insert_starter_catalytic_cycle(&mut scene, &mut nid, 250.0, 210.0);
+        assert_eq!(scene.arrows.len(), 1 + 4);
+        arrange_catalytic_cycle(&mut scene, &mut nid, &idxs, 250.0, 210.0, 105.0, 88.0, true);
+        assert_eq!(scene.arrows.len(), 1 + 4, "re-running cleanup must replace, not duplicate");
+        assert!(scene.arrows.iter().any(|a| a.id == 1), "user curved arrow must survive");
     }
 }

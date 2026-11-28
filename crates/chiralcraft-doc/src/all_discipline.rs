@@ -68,13 +68,14 @@ impl EnergyProfile {
 
     /// Maximum activation barrier ΔG‡ (converted to kcal/mol) along `pathway_a`.
     pub fn max_barrier_kcal(&self) -> f64 {
-        let start = self.pathway_a.first().map(|s| s.energy).unwrap_or(0.0);
-        let peak = self
-            .pathway_a
-            .iter()
-            .map(|s| s.energy)
-            .fold(start, f64::max);
-        let raw = (peak - start).max(0.0);
+        // Barrier = highest point minus the lowest state preceding it (an intermediate that sinks below
+        // the starting material raises the effective barrier of the following TS).
+        let mut lowest = f64::INFINITY;
+        let mut raw = 0.0_f64;
+        for s in &self.pathway_a {
+            lowest = lowest.min(s.energy);
+            raw = raw.max(s.energy - lowest);
+        }
         if self.unit_kj { raw / 4.184 } else { raw }
     }
 
@@ -315,7 +316,12 @@ pub fn generate_si_experimental_block(
         reactants_desc.join(", ")
     };
 
-    let base_mmol = stoich.first().map(|r| r.mmol).unwrap_or(1.0);
+    // Theoretical yield is set by the limiting (1.00 equiv) reagent, never by a Product row.
+    let base_mmol = stoich
+        .iter()
+        .find(|r| r.role != "Product")
+        .map(|r| if r.equivalents > 0.0 { r.mmol / r.equivalents } else { r.mmol })
+        .unwrap_or(1.0);
     let prod_mmol = base_mmol * (yield_pct / 100.0);
     let prod_mg = prod_mmol * rep.mol_weight;
 
@@ -398,8 +404,11 @@ pub fn molecule_to_chemfig(mol: &ChemMolecule) -> String {
         let dy = -(mol.atoms[v].y - mol.atoms[u].y); // LaTeX Y is up!
         let ang = (dy.atan2(dx).to_degrees().rem_euclid(360.0) / 15.0).round() as i32 * 15;
         let bsym = match disp {
-            BondDisplay::WedgeBegin | BondDisplay::WedgeEnd => "<",
-            BondDisplay::WedgedHashBegin | BondDisplay::WedgedHashEnd | BondDisplay::Hash => "<:",
+            // chemfig `<` = narrow end at the emitting (u) atom, `>` = narrow end at v.
+            BondDisplay::WedgeBegin => "<",
+            BondDisplay::WedgeEnd => ">",
+            BondDisplay::WedgedHashBegin | BondDisplay::Hash => "<:",
+            BondDisplay::WedgedHashEnd => ">:",
             _ => match order {
                 2 => "=",
                 3 => "~",
@@ -409,46 +418,56 @@ pub fn molecule_to_chemfig(mol: &ChemMolecule) -> String {
         format!("{bsym}[:{ang}]")
     };
 
-    let mut visited = vec![false; n];
+    let mut visited = vec![usize::MAX; n];
+    let mut disc_counter = 0usize;
     let mut ring_id = 0usize;
     let mut ring_tags: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     let mut tree_edges: Vec<Vec<(usize, i32, BondDisplay)>> = vec![Vec::new(); n];
     let mut back_edges: Vec<(usize, usize, i32)> = Vec::new();
 
-    // First pass: build DFS spanning tree & discover ring closure hooks
+    // First pass: build DFS spanning tree & discover ring closure hooks.
+    // `disc[i]` = DFS discovery order (`usize::MAX` = unvisited); emission is preorder, so it equals output order.
     fn dfs_tree(
         u: usize,
         parent: Option<usize>,
         adj: &[Vec<(usize, i32, BondDisplay)>],
-        vis: &mut [bool],
+        disc: &mut [usize],
+        counter: &mut usize,
         tree: &mut [Vec<(usize, i32, BondDisplay)>],
         backs: &mut Vec<(usize, usize, i32)>,
     ) {
-        vis[u] = true;
+        disc[u] = *counter;
+        *counter += 1;
         for &(v, ord, disp) in &adj[u] {
             if Some(v) == parent {
                 continue;
             }
-            if !vis[v] {
+            if disc[v] == usize::MAX {
                 tree[u].push((v, ord, disp));
-                dfs_tree(v, Some(u), adj, vis, tree, backs);
-            } else if u < v {
-                backs.push((u, v, ord));
+                dfs_tree(v, Some(u), adj, disc, counter, tree, backs);
+            } else if disc[v] < disc[u] {
+                // Back edge to an ancestor: (earlier-emitted, later-emitted). Seen once per ring bond.
+                backs.push((v, u, ord));
             }
         }
     }
     let mut comp_roots = Vec::new();
     for start in 0..n {
-        if !visited[start] {
+        if visited[start] == usize::MAX {
             comp_roots.push(start);
-            dfs_tree(start, None, &adj, &mut visited, &mut tree_edges, &mut back_edges);
+            dfs_tree(start, None, &adj, &mut visited, &mut disc_counter, &mut tree_edges, &mut back_edges);
         }
     }
-    for (u, v, ord) in back_edges {
+    for (first, second, ord) in back_edges {
         ring_id += 1;
-        let bkind = if ord == 2 { ",=" } else { "" };
-        ring_tags.entry(u).or_default().push(format!("?[r{ring_id}]"));
-        ring_tags.entry(v).or_default().push(format!("?[r{ring_id}{bkind}]"));
+        // chemfig reads the closing bond type at the second occurrence of the hook.
+        let bkind = match ord {
+            2 => ",=",
+            3 => ",~",
+            _ => "",
+        };
+        ring_tags.entry(first).or_default().push(format!("?[r{ring_id}]"));
+        ring_tags.entry(second).or_default().push(format!("?[r{ring_id}{bkind}]"));
     }
 
     fn emit(
@@ -796,7 +815,8 @@ fn unesc_field(s: &str) -> String {
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            match &s[i..i + 3] {
+            // `get` (not slicing): `%` followed by a multi-byte char is not a char boundary at i+3.
+            match s.get(i..i + 3).unwrap_or("") {
                 "%25" => { out.push('%'); i += 3; continue; }
                 "%7C" => { out.push('|'); i += 3; continue; }
                 "%0D" => { out.push('\r'); i += 3; continue; }
@@ -1114,5 +1134,76 @@ mod tests {
             assert!(s_light.starts_with("<svg ") && s_light.contains("</svg>") && !s_light.contains("NaN"), "{name} light SVG valid");
             assert!(s_dark.contains("#F2F5F9") && !s_dark.contains("NaN"), "{name} dark SVG valid");
         }
+    }
+
+    #[test]
+    fn test_max_barrier_uses_lowest_preceding_state() {
+        let st = |e: f64, ts: bool| EnergyState { label: String::new(), energy: e, is_ts: ts };
+        let mut p = EnergyProfile::starter(1, 0.0, 0.0);
+        p.unit_kj = false;
+        // SM 0 → Int -10 → TS +12: span = 22, not 12.
+        p.pathway_a = vec![st(0.0, false), st(-10.0, false), st(12.0, true), st(-5.0, false)];
+        assert!((p.max_barrier_kcal() - 22.0).abs() < 1e-9);
+        p.pathway_a = vec![st(0.0, false), st(15.0, true), st(-20.0, false)];
+        assert!((p.max_barrier_kcal() - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_si_yield_from_limiting_reagent_not_product_row() {
+        let row = |role: &str, eq: f64, mmol: f64| StoichiometryRow {
+            mol_idx: 0,
+            role: role.into(),
+            label: role.into(),
+            formula: String::new(),
+            mw: 100.0,
+            equivalents: eq,
+            mmol,
+            mass_mg: mmol * 100.0,
+            density_g_ml: 0.0,
+            volume_ul: 0.0,
+            yield_pct: 0.0,
+        };
+        let benz = smiles_to_molecule("c1ccccc1O").unwrap();
+        let rows = vec![row("Product", 1.0, 9.0), row("Reactant", 2.0, 4.0)];
+        let si = generate_si_experimental_block(&benz, "Phenol", &rows, "THF", 5.0, "rt", "2 h", 50.0);
+        // limiting = 4.0 mmol / 2.0 equiv = 2.0 mmol → 50 % = 1.00 mmol.
+        assert!(si.contains("1.00 mmol, 50% yield"), "{si}");
+    }
+
+    #[test]
+    fn test_chemfig_wedge_direction_and_ring_closure_bond() {
+        // Ethene-in-ring: cyclohexene; closure bond type must be on the second hook.
+        let mut m = ChemMolecule::new();
+        for i in 0..6 {
+            let a = std::f64::consts::TAU * i as f64 / 6.0;
+            let mut at = ChemAtom::new((i + 1) as u32, 6);
+            at.x = 14.4 * a.cos();
+            at.y = 14.4 * a.sin();
+            m.add_atom(at);
+        }
+        for i in 0..5 {
+            m.add_bond(10 + i as u32, i, i + 1, 1, BondDisplay::Solid);
+        }
+        m.add_bond(20, 5, 0, 2, BondDisplay::Solid);
+        let cf = molecule_to_chemfig(&m);
+        assert!(cf.starts_with("\\chemfig{?[r1]") && cf.contains("?[r1,=]"), "{cf}");
+
+        let mut w = ChemMolecule::new();
+        let mut a0 = ChemAtom::new(1, 6);
+        a0.x = 0.0;
+        w.add_atom(a0);
+        let mut a1 = ChemAtom::new(2, 8);
+        a1.x = 14.4;
+        w.add_atom(a1);
+        w.add_bond(5, 0, 1, 1, BondDisplay::WedgeEnd);
+        assert!(molecule_to_chemfig(&w).contains(">[:0]"));
+        w.bonds[0].display = BondDisplay::WedgeBegin;
+        assert!(molecule_to_chemfig(&w).contains("<[:0]"));
+    }
+
+    #[test]
+    fn test_unesc_field_multibyte_after_percent() {
+        assert_eq!(unesc_field("%€x"), "%€x");
+        assert_eq!(unesc_field(&esc_field("a|b%c,€")), "a|b%c,€");
     }
 }

@@ -216,7 +216,8 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
         heavy_atoms += 1;
         let th = total_h_of(i);
         let heavy_deg = adj[i].iter().filter(|&&(nb, _)| mol.atoms[nb].z > 1).count();
-        let has_double = adj[i].iter().any(|&(_, o)| o == 2);
+        let n_double = adj[i].iter().filter(|&&(_, o)| o == 2).count();
+        let has_double = n_double > 0;
         let has_triple = adj[i].iter().any(|&(_, o)| o == 3);
         let is_arom = arom.is_atom_aromatic(i);
         let ring = in_ring[i];
@@ -234,9 +235,22 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
             7 => {
                 if atom.charge > 0 {
                     if is_arom {
-                        tpsa += 3.88;
+                        // Ertl: [nH+] 14.14, [n+](:)(:): 4.10, [n+](-)(:): 3.88
+                        tpsa += if th >= 1 {
+                            14.14
+                        } else if heavy_deg == 2 {
+                            4.10
+                        } else {
+                            3.88
+                        };
+                    } else if has_triple {
+                        tpsa += 4.36; // [N+]#* (isonitrile)
                     } else if has_double {
-                        tpsa += if th >= 1 { 13.97 } else { 3.01 };
+                        tpsa += match th {
+                            0 => 3.01,
+                            1 => 13.97,
+                            _ => 25.59, // [NH2+]=* (amidinium/guanidinium)
+                        };
                     } else {
                         tpsa += match th {
                             0 => 0.0,
@@ -255,6 +269,8 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
                     }
                 } else if has_triple {
                     tpsa += 23.79;
+                } else if n_double >= 2 {
+                    tpsa += 11.68; // [N](-*)(=*)=* (neutral pentavalent nitro)
                 } else if has_double {
                     tpsa += if th >= 1 { 23.85 } else { 12.36 };
                 } else {
@@ -280,13 +296,25 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
             }
             15 => {
                 if has_double {
-                    tpsa += if th >= 1 { 23.47 } else { 9.81 };
+                    tpsa += if th >= 1 {
+                        23.47
+                    } else if heavy_deg <= 2 {
+                        34.14 // [P](-*)=*
+                    } else {
+                        9.81 // [P](-*)(-*)(-*)=* (phosphate/phosphonate)
+                    };
                 } else {
                     tpsa += if th >= 1 { 27.31 } else { 13.59 };
                 }
             }
             16 => {
-                if has_double {
+                if is_arom {
+                    tpsa += if has_double { 21.70 } else { 28.24 }; // [s](=*)(:*):* / [s](:*):*
+                } else if n_double >= 2 {
+                    tpsa += 8.38; // [S](-*)(-*)(=*)=* sulfone/sulfonamide/sulfonate
+                } else if has_double && heavy_deg >= 3 {
+                    tpsa += 19.21; // [S](-*)(-*)=* sulfoxide
+                } else if has_double {
                     tpsa += 32.09;
                 } else if th >= 1 {
                     tpsa += 38.80;
@@ -565,5 +593,32 @@ pub fn estimate_chemical_properties(mol: &ChemMolecule) -> ChemicalProperties {
         tpsa: (tpsa * 100.0).round() / 100.0,
         log_s: (log_s * 1000.0).round() / 1000.0,
         pka,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BondDisplay, ChemAtom};
+
+    fn mol(atoms: &[i32], bonds: &[(usize, usize, i32)]) -> ChemMolecule {
+        let mut m = ChemMolecule::new();
+        for (i, &z) in atoms.iter().enumerate() {
+            m.add_atom(ChemAtom::new(i as u32 + 1, z));
+        }
+        for (i, &(a, b, o)) in bonds.iter().enumerate() {
+            m.add_bond(i as u32 + 1, a, b, o, BondDisplay::Solid);
+        }
+        m
+    }
+
+    #[test]
+    fn tpsa_sulfoxide_and_sulfone_use_ertl_values() {
+        // DMSO: S(-C)(-C)=O -> 19.21 + 17.07
+        let dmso = mol(&[6, 16, 6, 8], &[(0, 1, 1), (1, 2, 1), (1, 3, 2)]);
+        assert!((estimate_chemical_properties(&dmso).tpsa - 36.28).abs() < 0.01);
+        // Dimethyl sulfone: 8.38 + 2*17.07
+        let dms = mol(&[6, 16, 6, 8, 8], &[(0, 1, 1), (1, 2, 1), (1, 3, 2), (1, 4, 2)]);
+        assert!((estimate_chemical_properties(&dms).tpsa - 42.52).abs() < 0.01);
     }
 }

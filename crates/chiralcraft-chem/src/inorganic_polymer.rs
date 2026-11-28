@@ -58,7 +58,57 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
         let mut extra_e = 0i32;
         let mut details = Vec::new();
 
+        // Multi-hapto ligands drawn explicitly (e.g. η5-Cp as five M–C bonds, η2-alkene as two):
+        // mutually bonded unlabeled carbons on the metal form one η^k ligand (L_{k/2} or L_{(k-1)/2}X).
+        let hapto_cand: Vec<usize> = {
+            let mut v: Vec<usize> = adj[mi]
+                .iter()
+                .filter(|&&(k, o, d)| {
+                    mol.atoms[k].z == 6 && mol.atoms[k].label.is_none() && o == 1 && d != BondDisplay::Dative
+                })
+                .map(|&(k, _, _)| k)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let mut in_hapto = vec![false; n];
+        let mut hapto_ligands = 0usize;
+        let mut seen = vec![false; n];
+        for &s in &hapto_cand {
+            if seen[s] {
+                continue;
+            }
+            let mut comp = vec![s];
+            seen[s] = true;
+            let mut q = 0;
+            while q < comp.len() {
+                let u = comp[q];
+                q += 1;
+                for &(w, _, _) in &adj[u] {
+                    if !seen[w] && hapto_cand.binary_search(&w).is_ok() {
+                        seen[w] = true;
+                        comp.push(w);
+                    }
+                }
+            }
+            let k = comp.len();
+            if k >= 2 {
+                hapto_ligands += 1;
+                for &c in &comp {
+                    in_hapto[c] = true;
+                }
+                l_cnt += k / 2;
+                x_cnt += k % 2;
+                let kind = if k % 2 == 1 { format!("L{}X", k / 2) } else { format!("L{}", k / 2) };
+                details.push(format!("η{k}-C{k} ({kind}, {}e-)", 2 * (k / 2) + 2 * (k % 2)));
+            }
+        }
+
         for &(lig, order, disp) in &adj[mi] {
+            if in_hapto[lig] {
+                continue;
+            }
             let la = &mol.atoms[lig];
             let lsym = la
                 .label
@@ -138,7 +188,7 @@ pub fn analyze_organometallic_complexes(mol: &ChemMolecule) -> Vec<MetalComplexR
         // Neutral method: total valence e- = group - charge + x_cnt + 2*l_cnt + extra_e (never fabricates e- if ox > group)
         let lig_e = 2 * ((x_cnt + l_cnt) as i32) + extra_e;
         let total_e = (group - atom.charge + (x_cnt as i32) + 2 * (l_cnt as i32) + extra_e).max(0);
-        let cn = adj[mi].len();
+        let cn = adj[mi].iter().filter(|&&(k, _, _)| !in_hapto[k]).count() + hapto_ligands;
 
         let geometry = match cn {
             0 => "Unbound Metal Atom",
@@ -227,7 +277,8 @@ pub fn compute_polymer_metrics(
     let rep = compute_analysis_report(repeat_unit);
     // Subtract 2 H masses (2.016 Da) when converting drawn closed monomer into divalent repeat unit
     let ru_mw = (rep.mol_weight - 2.01588).max(12.0);
-    let fa = mol_frac_a.clamp(0.01, 1.0);
+    // f64::clamp propagates NaN; treat a NaN fraction as pure A
+    let fa = if mol_frac_a.is_nan() { 1.0 } else { mol_frac_a.clamp(0.01, 1.0) };
     let fb = 1.0 - fa;
     let eff_mw = match topology {
         CopolymerTopology::Homopolymer => ru_mw,
@@ -303,5 +354,29 @@ mod tests {
         assert!((poly.repeat_mw - 28.05).abs() < 0.2);
         assert!((poly.mn - 2807.0).abs() < 20.0);
         assert!(poly.big_smiles.contains("{[$]CC[$]}"));
+        let nan = compute_polymer_metrics(&pe, "CC", 100.0, 1.0, 0.0, 50.0, f64::NAN, CopolymerTopology::Random);
+        assert!(nan.mn.is_finite());
+    }
+
+    #[test]
+    fn test_ferrocene_explicit_eta5_bonds() {
+        let mut m = ChemMolecule::new();
+        m.add_atom(ChemAtom::new(1, 26)); // Fe
+        for ring in 0..2 {
+            let base = m.atoms.len();
+            for j in 0..5 {
+                m.add_atom(ChemAtom::new((base + j + 1) as u32, 6));
+            }
+            for j in 0..5 {
+                let o = if j % 2 == 0 && j < 4 { 2 } else { 1 };
+                m.add_bond((100 + ring * 10 + j) as u32, base + j, base + (j + 1) % 5, o, BondDisplay::Solid);
+                m.add_bond((200 + ring * 10 + j) as u32, 0, base + j, 1, BondDisplay::Solid);
+            }
+        }
+        let r = &analyze_organometallic_complexes(&m)[0];
+        assert_eq!(r.oxidation_state, 2);
+        assert_eq!(r.d_electrons, 6);
+        assert_eq!(r.total_valence_electrons, 18);
+        assert_eq!(r.coordination_number, 2);
     }
 }

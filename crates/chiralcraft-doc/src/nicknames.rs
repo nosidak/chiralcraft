@@ -308,6 +308,9 @@ impl NicknameTable {
             dst.charge = src.charge;
             dst.isotope = src.isotope;
             dst.radical = src.radical;
+            // Stale H-count/valence from the label atom would corrupt perception of the new attach atom.
+            dst.valence_override = src.valence_override;
+            dst.explicit_num_hydrogens = src.explicit_num_hydrogens;
             dst.label = None;
             dst.is_query = false;
             dst.is_unspecified_label = false;
@@ -385,6 +388,8 @@ impl NicknameTable {
             a.charge = 0;
             a.isotope = 0;
             a.radical = 0;
+            a.valence_override = None;
+            a.explicit_num_hydrogens = None;
             a.x = res.anchor_x;
             a.y = res.anchor_y;
             a.label = Some(res.name.clone());
@@ -541,4 +546,35 @@ fn builtin_functional_group_def(name: &str) -> Option<NicknameDef> {
         attach_dx: -l,
         attach_dy: 0.0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_contract_reset_stale_h_count_and_valence() {
+        let mut mol = ChemMolecule::new();
+        let mut c = ChemAtom::new(1, 6);
+        c.x = 0.0;
+        mol.add_atom(c);
+        let mut lab = ChemAtom::new(2, 6);
+        lab.x = 14.4;
+        lab.label = Some("OMe".to_string());
+        lab.explicit_num_hydrogens = Some(0);
+        lab.valence_override = Some(1);
+        mol.add_atom(lab);
+        mol.add_bond(10, 0, 1, 1, chiralcraft_chem::BondDisplay::Solid);
+        let table = NicknameTable::with_factory_defaults();
+        let mut nid = 100u32;
+        let res = table.expand_label_at_atom(&mut mol, 1, "OMe", 14.4, &mut nid).expect("OMe expands");
+        assert_eq!(mol.atoms[1].z, 8);
+        assert_eq!(mol.atoms[1].explicit_num_hydrogens, None);
+        assert_eq!(mol.atoms[1].valence_override, None);
+        mol.atoms[1].explicit_num_hydrogens = Some(1);
+        assert!(NicknameTable::contract_residue_group(&mut mol, &res));
+        assert_eq!(mol.atoms.len(), 2);
+        assert_eq!(mol.atoms[1].label.as_deref(), Some("OMe"));
+        assert_eq!(mol.atoms[1].explicit_num_hydrogens, None);
+    }
 }

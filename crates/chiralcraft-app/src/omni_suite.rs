@@ -1156,7 +1156,13 @@ pub fn show_energy_profile_window(
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut state.draft_profile.unit_kj, "Use kJ/mol");
+                if ui.checkbox(&mut state.draft_profile.unit_kj, "Use kJ/mol").changed() {
+                    // Energies are stored in the displayed unit: convert so the chemistry stays the same.
+                    let f = if state.draft_profile.unit_kj { 4.184 } else { 1.0 / 4.184 };
+                    for s in state.draft_profile.pathway_a.iter_mut().chain(state.draft_profile.pathway_b.iter_mut()) {
+                        s.energy *= f;
+                    }
+                }
                 ui.checkbox(&mut state.show_pathway_b, "Competing Pathway B");
                 ui.label("T (K):");
                 ui.add(egui::DragValue::new(&mut state.draft_profile.temp_k).speed(1.0).range(77.0..=1200.0));

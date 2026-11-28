@@ -15,8 +15,8 @@ if [[ ! -x "$BIN_SRC" ]]; then
 fi
 
 mkdir -p "$HOME/.local/bin" "$APP_DIR" "$ICON_SVG_DIR" "$ICON_PNG_DIR" "$MIME_DIR"
-cp -f "$BIN_SRC" "$BIN_DST"
-chmod +x "$BIN_DST"
+# install unlinks first, so a running chiralcraft does not fail with "Text file busy"
+install -m 755 "$BIN_SRC" "$BIN_DST"
 
 cp -f "$ROOT_DIR/assets/chiralcraft-icon.svg" "$ICON_SVG_DIR/chiralcraft.svg"
 cp -f "$ROOT_DIR/assets/chiralcraft-icon-128.png" "$ICON_PNG_DIR/chiralcraft.png"
@@ -28,7 +28,7 @@ Type=Application
 Name=ChiralCraft
 GenericName=Chemical Structure & Cheminformatics Studio
 Comment=Publication-grade 2D/3D chemical structure editor, spectroscopy, MedChem, and WordCraft/DeckCraft editable SVG studio
-Exec=$BIN_DST %f
+Exec="$BIN_DST" %f
 Icon=chiralcraft
 Terminal=false
 Categories=Science;Chemistry;Education;Graphics;

@@ -368,12 +368,11 @@ pub fn show_3d_viewer_window(
                                 let d = p2 - p1;
                                 let len = d.length().max(1e-3);
                                 let n = Vec2::new(-d.y / len, d.x / len);
-                                let offsets: &[f32] = if order == 2 {
-                                    &[-base_w * 0.55, base_w * 0.55]
-                                } else if order >= 3 {
-                                    &[-base_w * 0.85, 0.0, base_w * 0.85]
-                                } else {
-                                    &[0.0]
+                                // Order codes: 2 double, 3 triple, 4 quadruple; 5+ (dative/aromatic=6/H-bond/any) are not multiple bonds.
+                                let offsets: &[f32] = match order {
+                                    2 => &[-base_w * 0.55, base_w * 0.55],
+                                    3 | 4 => &[-base_w * 0.85, 0.0, base_w * 0.85],
+                                    _ => &[0.0],
                                 };
                                 for &off in offsets {
                                     let shift = n * off;

@@ -155,19 +155,19 @@ pub fn molecule_to_molfile_v3000(mol: &ChemMolecule, title: &str) -> String {
     out.push_str("M  V30 END ATOM\n");
     out.push_str("M  V30 BEGIN BOND\n");
     for (i, b) in mol.bonds.iter().enumerate() {
-        let mut line = format!(
-            "M  V30 {} {} {} {}",
-            i + 1,
-            b.order,
-            b.begin_atom + 1,
-            b.end_atom + 1
-        );
-        match b.display {
-            BondDisplay::WedgeBegin => line.push_str(" CFG=1"),
-            BondDisplay::Wavy => line.push_str(" CFG=2"),
-            BondDisplay::WedgedHashBegin => line.push_str(" CFG=3"),
-            _ => {}
-        }
+        // *End wedges have their narrow end at end_atom: swap so the stereo centre is atom 1.
+        let (a1, a2, cfg) = match b.display {
+            BondDisplay::WedgeBegin => (b.begin_atom, b.end_atom, " CFG=1"),
+            BondDisplay::WedgeEnd => (b.end_atom, b.begin_atom, " CFG=1"),
+            BondDisplay::Wavy => (b.begin_atom, b.end_atom, " CFG=2"),
+            BondDisplay::WedgedHashBegin => (b.begin_atom, b.end_atom, " CFG=3"),
+            BondDisplay::WedgedHashEnd => (b.end_atom, b.begin_atom, " CFG=3"),
+            _ => (b.begin_atom, b.end_atom, ""),
+        };
+        // Internal aromatic order 6 is MDL type 4 (V3000 type 6 means "single or aromatic" query).
+        let order = if b.order == 6 { 4 } else { b.order };
+        let mut line = format!("M  V30 {} {} {} {}", i + 1, order, a1 + 1, a2 + 1);
+        line.push_str(cfg);
         out.push_str(&line);
         out.push('\n');
     }
@@ -223,7 +223,10 @@ pub fn molfile_v3000_to_molecule(src: &str) -> Result<ChemMolecule, String> {
             mol.atoms.push(atom);
         } else if in_bond && toks.len() >= 4 {
             let id: u32 = toks[0].parse().unwrap_or((mol.bonds.len() + 1) as u32);
-            let order: i32 = toks[1].parse().unwrap_or(1);
+            let order: i32 = match toks[1].parse().unwrap_or(1) {
+                4 => 6,
+                o => o,
+            };
             let b_id: u32 = toks[2].parse().unwrap_or(1);
             let e_id: u32 = toks[3].parse().unwrap_or(1);
             let b = idx_by_v30_id
@@ -358,6 +361,9 @@ pub fn molecules_to_cml(mols: &[ChemMolecule]) -> String {
     out.push_str("<cml xmlns=\"http://www.xml-cml.org/schema\">\n");
     for mol in mols {
         let val = CcVal::compute(mol);
+        // atomRefs2 must resolve uniquely; fall back to 1-based indices when atom ids collide.
+        let ids_unique = mol.atoms.iter().map(|a| a.id).collect::<std::collections::HashSet<_>>().len() == mol.atoms.len();
+        let cml_id = |i: usize| if ids_unique { mol.atoms[i].id } else { (i + 1) as u32 };
         out.push_str("<molecule>\n<atomArray>\n");
         for (i, a) in mol.atoms.iter().enumerate() {
             let imp_h = val.implicit_h_counts.get(i).copied().unwrap_or(0);
@@ -376,7 +382,7 @@ pub fn molecules_to_cml(mols: &[ChemMolecule]) -> String {
                 elem_symbol(a.z),
                 chg_attr,
                 h_attr,
-                a.id,
+                cml_id(i),
                 a.x / CHIRALCRAFT_PT_PER_ANGSTROM,
                 -a.y / CHIRALCRAFT_PT_PER_ANGSTROM
             ));
@@ -393,11 +399,13 @@ pub fn molecules_to_cml(mols: &[ChemMolecule]) -> String {
                 BondDisplay::WedgedHashEnd => (b.end_atom, b.begin_atom, " bondStereo=\"H\""),
                 _ => (b.begin_atom, b.end_atom, ""),
             };
-            let a1 = mol.atoms[i1].id;
-            let a2 = mol.atoms[i2].id;
+            let a1 = cml_id(i1);
+            let a2 = cml_id(i2);
+            // CML has no numeric order 6; internal aromatic (6) is written as "A".
+            let order = if b.order == 6 { "A".to_string() } else { b.order.to_string() };
             out.push_str(&format!(
                 "<bond atomRefs2=\"a{} a{}\"{} id=\"b{}\" order=\"{}\"/>\n",
-                a1, a2, stereo, b.id, b.order
+                a1, a2, stereo, b.id, order
             ));
         }
         out.push_str("</bondArray>\n</molecule>\n");
@@ -415,23 +423,54 @@ pub fn cml_to_molecules(src: &str) -> Result<Vec<ChemMolecule>, String> {
     let mut cur: Option<ChemMolecule> = None;
     let mut id_map = HashMap::<String, usize>::new();
     let get_attr = |line: &str, k: &str| -> Option<String> {
-        let pat = format!(" {}=\"", k);
-        let s = line.find(&pat)? + pat.len();
-        let e = line[s..].find('"')? + s;
-        Some(line[s..e].to_string())
+        ['"', '\''].iter().find_map(|&q| {
+            let pat = format!(" {}={}", k, q);
+            let s = line.find(&pat)? + pat.len();
+            let e = line[s..].find(q)? + s;
+            Some(line[s..e].to_string())
+        })
     };
-    for raw in src.lines() {
-        let l = raw.trim();
-        if l.starts_with("<molecule") {
+    // Walk XML tags rather than lines so minified/single-line CML, attributes split across lines and
+    // `cml:`-prefixed element names parse too. Each tag is normalised to "<name attr=.. ...>".
+    for piece in src.split('<').skip(1) {
+        let (tag_raw, text_after) = piece.split_once('>').unwrap_or((piece, ""));
+        let mut tag_toks = tag_raw.split_whitespace();
+        let raw_name = tag_toks.next().unwrap_or("");
+        let (close, raw_name) = match raw_name.strip_prefix('/') {
+            Some(n) => ("/", n),
+            None => ("", raw_name),
+        };
+        let local = raw_name.rsplit_once(':').map(|(_, n)| n).unwrap_or(raw_name);
+        let name_owned = format!("{close}{local}");
+        let name = name_owned.as_str();
+        let rest: Vec<&str> = tag_toks.collect();
+        let l_owned = if rest.is_empty() {
+            format!("<{}>", name)
+        } else {
+            format!("<{} {}>", name, rest.join(" "))
+        };
+        let l = l_owned.as_str();
+        if name == "bondStereo" {
+            // Standard CML: `<bond ...><bondStereo>W</bondStereo></bond>`
+            if let Some(bond) = cur.as_mut().and_then(|m| m.bonds.last_mut()) {
+                match text_after.trim() {
+                    "W" => bond.display = BondDisplay::WedgeBegin,
+                    "H" => bond.display = BondDisplay::WedgedHashBegin,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if name == "molecule" {
             cur = Some(ChemMolecule::default());
             id_map.clear();
-        } else if l.starts_with("</molecule>") {
+        } else if name == "/molecule" {
             if let Some(m) = cur.take() {
                 if !m.atoms.is_empty() {
                     mols.push(m);
                 }
             }
-        } else if l.starts_with("<atom ") {
+        } else if name == "atom" {
             if let Some(m) = cur.as_mut() {
                 let aid = get_attr(l, "id").unwrap_or_else(|| format!("a{}", m.atoms.len() + 1));
                 let num_id = aid
@@ -440,10 +479,12 @@ pub fn cml_to_molecules(src: &str) -> Result<Vec<ChemMolecule>, String> {
                     .unwrap_or((m.atoms.len() + 1) as u32);
                 let sym = get_attr(l, "elementType").unwrap_or_else(|| "C".to_string());
                 let x = get_attr(l, "x2")
+                    .or_else(|| get_attr(l, "x3"))
                     .and_then(|v| v.parse::<f64>().ok())
                     .unwrap_or(0.0)
                     * CHIRALCRAFT_PT_PER_ANGSTROM;
                 let y = -get_attr(l, "y2")
+                    .or_else(|| get_attr(l, "y3"))
                     .and_then(|v| v.parse::<f64>().ok())
                     .unwrap_or(0.0)
                     * CHIRALCRAFT_PT_PER_ANGSTROM;
@@ -454,7 +495,7 @@ pub fn cml_to_molecules(src: &str) -> Result<Vec<ChemMolecule>, String> {
                 id_map.insert(aid, m.atoms.len());
                 m.atoms.push(atom);
             }
-        } else if l.starts_with("<bond ") {
+        } else if name == "bond" {
             if let Some(m) = cur.as_mut() {
                 if let Some(refs) = get_attr(l, "atomRefs2") {
                     let parts: Vec<&str> = refs.split_whitespace().collect();
@@ -1740,4 +1781,52 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         png::ColorType::Indexed => return None,
     };
     Some((rgba, info.width, info.height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wedge_mol() -> ChemMolecule {
+        let mut m = ChemMolecule::default();
+        m.atoms.push(mk_atom(0, 6, 0.0, 0.0));
+        m.atoms.push(mk_atom(0, 8, 20.0, 0.0));
+        m.atoms.push(mk_atom(0, 6, 0.0, 20.0));
+        let mut b0 = mk_bond(1, 0, 1, 1);
+        b0.display = BondDisplay::WedgeEnd; // stereo centre is atom 1 (end)
+        m.bonds.push(b0);
+        m.bonds.push(mk_bond(2, 0, 2, 6));
+        m
+    }
+
+    #[test]
+    fn test_v3000_end_wedge_and_aromatic_order() {
+        let v3 = molecule_to_molfile_v3000(&wedge_mol(), "t");
+        assert!(v3.contains("M  V30 1 1 2 1 CFG=1"), "{v3}");
+        assert!(v3.contains("M  V30 2 4 1 3"), "{v3}");
+        let back = molfile_v3000_to_molecule(&v3).unwrap();
+        assert_eq!(back.bonds[1].order, 6);
+        assert_eq!(back.bonds[0].display, BondDisplay::WedgeBegin);
+        assert_eq!(back.bonds[0].begin_atom, 1);
+    }
+
+    #[test]
+    fn test_cml_duplicate_ids_aromatic_minified_and_child_bond_stereo() {
+        // All atom ids are 0: refs must still resolve to distinct atoms.
+        let cml = molecule_to_cml(&wedge_mol());
+        assert!(cml.contains("order=\"A\""), "{cml}");
+        let back = cml_to_molecules(&cml).unwrap();
+        assert_eq!(back[0].atoms.len(), 3);
+        assert_eq!(back[0].bonds.len(), 2);
+        assert_eq!(back[0].bonds[1].order, 6);
+        assert_eq!((back[0].bonds[0].begin_atom, back[0].bonds[0].end_atom), (1, 0));
+
+        let mini = "<cml:cml xmlns:cml='x'><cml:molecule id='m'><cml:atomArray><cml:atom id='a1' elementType='O' x3='1.0' y3='0' z3='0'/><cml:atom\n id='a2' elementType='C' x3='0' y3='0' z3='0'/></cml:atomArray><cml:bondArray><cml:bond atomRefs2='a1 a2' order='2'><cml:bondStereo>W</cml:bondStereo></cml:bond></cml:bondArray></cml:molecule></cml:cml>";
+        let m = cml_to_molecules(mini).unwrap();
+        assert_eq!(m[0].atoms.len(), 2);
+        assert_eq!(m[0].atoms[0].z, 8);
+        assert!(m[0].atoms[0].x > 0.0);
+        assert_eq!(m[0].bonds[0].order, 2);
+        assert_eq!(m[0].bonds[0].display, BondDisplay::WedgeBegin);
+    }
 }

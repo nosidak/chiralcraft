@@ -308,6 +308,9 @@ pub struct UndoTransaction {
     pub action_label: String,
     pub before: DocumentScene,
     pub after: DocumentScene,
+    /// `settings` live outside the scene; snapshot them so Undo/Redo of a settings edit restores them.
+    pub settings_before: DocumentSettings,
+    pub settings_after: DocumentSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +327,9 @@ pub struct InteractiveDocument {
     saved_cursor: Option<usize>,
     /// Snapshot of `scene` at the last `Save` (used by `File > Revert` in P01-V5).
     saved_scene: DocumentScene,
+    /// `settings` as of the last recorded/undone/redone step (callers may mutate `settings` before recording).
+    committed_settings: DocumentSettings,
+    saved_settings: DocumentSettings,
     pub last_repeat_label: Option<String>,
     next_id: u32,
 }
@@ -332,6 +338,8 @@ impl InteractiveDocument {
     pub fn new_saved_seed(name: &str, settings: DocumentSettings) -> Self {
         Self {
             name: name.to_string(),
+            committed_settings: settings.clone(),
+            saved_settings: settings.clone(),
             settings,
             preferences: UserPreferences::default(),
             nicknames: NicknameTable::with_factory_defaults(),
@@ -347,6 +355,8 @@ impl InteractiveDocument {
 
     /// Record an undoable macro mutation on `self.scene`.
     pub fn apply_scene_tx<F: FnOnce(&mut DocumentScene, &mut u32)>(&mut self, action_label: &str, f: F) {
+        // Imported structures carry their own ids; never hand out one already in the scene.
+        self.next_id = self.next_id.max(max_scene_object_id(&self.scene).saturating_add(1));
         let mut next_scene = self.scene.clone();
         f(&mut next_scene, &mut self.next_id);
         self.record_transaction(action_label, next_scene);
@@ -381,6 +391,15 @@ impl InteractiveDocument {
         let mut trial_scene = self.scene.clone();
         let mut trial_next_id = self.next_id;
         let ok = if let Some(mol) = trial_scene.molecules.get_mut(mol_idx) {
+            // Atoms added by per-molecule editors (max id + 1) can exceed `next_id`; never reuse an id in `mol`.
+            let mol_max = mol
+                .atoms
+                .iter()
+                .map(|a| a.id)
+                .chain(mol.bonds.iter().map(|b| b.id))
+                .max()
+                .unwrap_or(0);
+            trial_next_id = trial_next_id.max(mol_max.saturating_add(1));
             if let Some(res) = nicks.expand_label_at_atom(mol, atom_idx, label, blen, &mut trial_next_id) {
                 trial_scene.expanded_residues.push(res);
                 true
@@ -436,6 +455,18 @@ impl InteractiveDocument {
         self.saved_cursor != Some(self.cursor)
     }
 
+    /// Current position in the undo history (number of applied transactions).
+    #[inline]
+    pub fn undo_cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Undo-history position of the last `Save` (`None` if that state is no longer reachable).
+    #[inline]
+    pub fn saved_undo_cursor(&self) -> Option<usize> {
+        self.saved_cursor
+    }
+
     /// Returns the exact Edit menu Undo label (`"Undo <label>"` or `"Undo not available"`).
     pub fn undo_menu_label(&self) -> String {
         if self.cursor > 0 {
@@ -480,7 +511,10 @@ impl InteractiveDocument {
             action_label: label.to_string(),
             before: self.scene.clone(),
             after: new_scene.clone(),
+            settings_before: self.committed_settings.clone(),
+            settings_after: self.settings.clone(),
         };
+        self.committed_settings = self.settings.clone();
         self.scene = new_scene;
         self.undo_stack.push(tx);
         self.cursor += 1;
@@ -494,6 +528,8 @@ impl InteractiveDocument {
         }
         self.cursor -= 1;
         self.scene = self.undo_stack[self.cursor].before.clone();
+        self.settings = self.undo_stack[self.cursor].settings_before.clone();
+        self.committed_settings = self.settings.clone();
         self.last_repeat_label = None;
         true
     }
@@ -504,6 +540,8 @@ impl InteractiveDocument {
             return false;
         }
         self.scene = self.undo_stack[self.cursor].after.clone();
+        self.settings = self.undo_stack[self.cursor].settings_after.clone();
+        self.committed_settings = self.settings.clone();
         self.cursor += 1;
         self.last_repeat_label = None;
         true
@@ -516,6 +554,7 @@ impl InteractiveDocument {
     pub fn save(&mut self) {
         self.saved_cursor = Some(self.cursor);
         self.saved_scene = self.scene.clone();
+        self.saved_settings = self.settings.clone();
         self.last_repeat_label = Some("Save".to_string());
     }
 
@@ -525,6 +564,8 @@ impl InteractiveDocument {
             return false;
         }
         self.scene = self.saved_scene.clone();
+        self.settings = self.saved_settings.clone();
+        self.committed_settings = self.settings.clone();
         self.undo_stack.clear();
         self.cursor = 0;
         self.saved_cursor = Some(0);
@@ -586,82 +627,48 @@ impl InteractiveDocument {
 
         let mut captions = Vec::new();
         let mut caption_frag_occs = HashSet::new();
-        let mut max_id = 1u32;
-
-        let collect_text = |occ: usize| -> String {
-            fn gather(doc: &CdxmlDocument, id: usize, buf: &mut String) {
-                if let Some(el) = doc.elements.get(id) {
-                    for child in &el.children {
-                        match child {
-                            CdxmlNodeChild::Text(t) => buf.push_str(t),
-                            CdxmlNodeChild::Element(cid) => gather(doc, *cid, buf),
-                        }
-                    }
-                }
-            }
-            let mut out = String::new();
-            gather(cdxml, occ, &mut out);
-            out
+        // Precompute so id-less captions get unique ids above every existing object id.
+        let mut max_id = cdxml
+            .elements
+            .iter()
+            .filter_map(|el| el.attr("id").and_then(|v| v.parse::<u32>().ok()))
+            .max()
+            .map_or(1, |m| m.saturating_add(1))
+            .max(1);
+        let mut alloc_id = || {
+            let id = max_id;
+            max_id = max_id.saturating_add(1);
+            id
         };
 
+        let collect_text = |occ: usize| gather_cdxml_text(cdxml, occ);
+
         for (occ, el) in cdxml.elements.iter().enumerate() {
-            if let Some(id_val) = el.attr("id").and_then(|v| v.parse::<u32>().ok()) {
-                max_id = max_id.max(id_val + 1);
-            }
             if el.tag == "fragment" {
-                let mut child_nodes = Vec::new();
-                let mut bond_count = 0usize;
-                for c in &el.children {
-                    if let CdxmlNodeChild::Element(cid) = c {
-                        if let Some(ce) = cdxml.elements.get(*cid) {
-                            if ce.tag == "n" {
-                                child_nodes.push(*cid);
-                            } else if ce.tag == "b" {
-                                bond_count += 1;
-                            }
-                        }
-                    }
-                }
-                if child_nodes.len() == 1 && bond_count == 0 {
-                    let node_occ = child_nodes[0];
+                if let Some((node_occ, t_occ, text)) = caption_fragment_parts(cdxml, el) {
                     let node_el = &cdxml.elements[node_occ];
-                    // Single-atom molecules serialized with CustomLabel (e.g. catalytic cycle Pd species) must stay molecules!
-                    if node_el.attr("CustomLabel").is_none() {
-                        let t_occ = node_el.children.iter().find_map(|c| {
-                            if let CdxmlNodeChild::Element(cid) = c {
-                                (cdxml.elements[*cid].tag == "t").then_some(*cid)
-                            } else {
-                                None
-                            }
-                        });
-                        if let Some(t_occ) = t_occ {
-                            let text = collect_text(t_occ);
-                            if !text.is_empty() {
-                                caption_frag_occs.insert(occ);
-                                let (x, y) = parse_xy_attr(node_el.attr("p"));
-                                let id = node_el
-                                    .attr("id")
-                                    .and_then(|v| v.parse::<u32>().ok())
-                                    .unwrap_or(max_id);
-                                let just = cdxml.elements[t_occ]
-                                    .attr("LabelJustification")
-                                    .map(LabelJustification::from_cdxml_str)
-                                    .unwrap_or(LabelJustification::Left);
-                                captions.push(CaptionNode {
-                                    id,
-                                    x,
-                                    y,
-                                    text,
-                                    element: node_el.attr("Element").and_then(|v| v.parse::<i32>().ok()),
-                                    generic_nickname: node_el
-                                        .attr("GenericNickname")
-                                        .map(str::to_string),
-                                    warning: node_el.attr("Warning").map(str::to_string),
-                                    justification: just,
-                                });
-                            }
-                        }
-                    }
+                    caption_frag_occs.insert(occ);
+                    let (x, y) = parse_xy_attr(node_el.attr("p"));
+                    let id = node_el
+                        .attr("id")
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or_else(&mut alloc_id);
+                    let just = cdxml.elements[t_occ]
+                        .attr("LabelJustification")
+                        .map(LabelJustification::from_cdxml_str)
+                        .unwrap_or(LabelJustification::Left);
+                    captions.push(CaptionNode {
+                        id,
+                        x,
+                        y,
+                        text,
+                        element: node_el.attr("Element").and_then(|v| v.parse::<i32>().ok()),
+                        generic_nickname: node_el
+                            .attr("GenericNickname")
+                            .map(str::to_string),
+                        warning: node_el.attr("Warning").map(str::to_string),
+                        justification: just,
+                    });
                 }
             } else if el.tag == "t" {
                 let is_page_caption = el
@@ -674,7 +681,7 @@ impl InteractiveDocument {
                     let id = el
                         .attr("id")
                         .and_then(|v| v.parse::<u32>().ok())
-                        .unwrap_or(max_id);
+                        .unwrap_or_else(&mut alloc_id);
                     let just = el
                         .attr("LabelJustification")
                         .or_else(|| el.attr("Justification"))
@@ -778,7 +785,9 @@ impl InteractiveDocument {
             page_attrs,
         ));
 
-        let mut next_xml_id = self.next_id.max(1000);
+        // Synthesized ids must not collide with real atom/bond/caption ids (same-fragment duplicates drop bonds on reload).
+        let max_scene_id = max_scene_object_id(&self.scene);
+        let mut next_xml_id = self.next_id.max(1000).max(max_scene_id.saturating_add(1));
         for cap in &self.scene.captions {
             if cap.element.is_some() || cap.generic_nickname.is_some() {
                 let frag_id = next_xml_id;
@@ -823,8 +832,10 @@ impl InteractiveDocument {
             next_xml_id += 1;
             out.push_str(&format!("<fragment id=\"{frag_id}\">"));
             let mut atom_xml_ids = Vec::with_capacity(mol.atoms.len());
+            let mut used_atom_ids = HashSet::new();
             for a in &mol.atoms {
-                let aid = if a.id != 0 { a.id } else { next_xml_id };
+                // Duplicate ids inside one fragment make bond endpoints ambiguous; re-id the repeats.
+                let aid = if a.id != 0 && used_atom_ids.insert(a.id) { a.id } else { next_xml_id };
                 next_xml_id = next_xml_id.max(aid.saturating_add(1));
                 atom_xml_ids.push(aid);
                 out.push_str(&format!(
@@ -978,6 +989,59 @@ fn parse_xy_attr(attr: Option<&str>) -> (f64, f64) {
     (x, y)
 }
 
+fn gather_cdxml_text(doc: &CdxmlDocument, occ: usize) -> String {
+    fn gather(doc: &CdxmlDocument, id: usize, buf: &mut String) {
+        if let Some(el) = doc.elements.get(id) {
+            for child in &el.children {
+                match child {
+                    CdxmlNodeChild::Text(t) => buf.push_str(t),
+                    CdxmlNodeChild::Element(cid) => gather(doc, *cid, buf),
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    gather(doc, occ, &mut out);
+    out
+}
+
+/// Returns `(node_occ, t_occ, text)` when `frag` is a single-node caption fragment (loaded as `CaptionNode`,
+/// not a molecule). Shared by `from_cdxml` and `check_enhanced_stereo_warnings` so molecule indices agree.
+fn caption_fragment_parts(cdxml: &CdxmlDocument, frag: &chiralcraft_formats::CdxmlElement) -> Option<(usize, usize, String)> {
+    let mut child_nodes = Vec::new();
+    let mut bond_count = 0usize;
+    for c in &frag.children {
+        if let CdxmlNodeChild::Element(cid) = c {
+            if let Some(ce) = cdxml.elements.get(*cid) {
+                if ce.tag == "n" {
+                    child_nodes.push(*cid);
+                } else if ce.tag == "b" {
+                    bond_count += 1;
+                }
+            }
+        }
+    }
+    if child_nodes.len() != 1 || bond_count != 0 {
+        return None;
+    }
+    let node_occ = child_nodes[0];
+    let node_el = cdxml.elements.get(node_occ)?;
+    // Single-atom molecules serialized with CustomLabel (e.g. catalytic cycle Pd species) must stay molecules!
+    if node_el.attr("CustomLabel").is_some() {
+        return None;
+    }
+    let t_occ = node_el.children.iter().find_map(|c| match c {
+        CdxmlNodeChild::Element(cid) => cdxml
+            .elements
+            .get(*cid)
+            .is_some_and(|e| e.tag == "t")
+            .then_some(*cid),
+        _ => None,
+    })?;
+    let text = gather_cdxml_text(cdxml, t_occ);
+    (!text.is_empty()).then_some((node_occ, t_occ, text))
+}
+
 fn escape_xml_attr(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1124,6 +1188,8 @@ fn format_formula_tokens(tokens: &[FormulaToken]) -> String {
     s
 }
 
+const MAX_LABEL_TOKEN_COUNT: usize = 999;
+
 fn tokenize_condensed_formula(label: &str) -> Option<Vec<FormulaToken>> {
     let trimmed = label.trim();
     if trimmed.is_empty() {
@@ -1162,7 +1228,8 @@ fn tokenize_condensed_formula(label: &str) -> Option<Vec<FormulaToken>> {
         } else {
             1
         };
-        if count == 0 {
+        // Absurd counts would make valence evaluation/expansion build millions of atoms (hang/OOM).
+        if count == 0 || count > MAX_LABEL_TOKEN_COUNT {
             return None;
         }
         tokens.push(FormulaToken {
@@ -1433,13 +1500,24 @@ pub fn expand_contracted_label(
             .clone()
             .unwrap_or_else(|| "Invalid valence in contracted label".to_string()));
     }
+    if atom_idx >= mol.atoms.len() {
+        return Err(format!("Atom index {atom_idx} out of range"));
+    }
     mol.atoms[atom_idx].z = parsed.attached_element_z;
     let cx = mol.atoms[atom_idx].x;
     let cy = mol.atoms[atom_idx].y;
     let angles = [std::f64::consts::PI, std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2];
     let mut created = Vec::new();
     let mut slot = 0usize;
-    let mut next_id = (mol.atoms.len() + mol.bonds.len() + 100) as u32;
+    // Fresh ids above every existing atom/bond id: duplicate atom ids in one fragment drop bonds on CDXML reload.
+    let mut next_id = mol
+        .atoms
+        .iter()
+        .map(|a| a.id)
+        .chain(mol.bonds.iter().map(|b| b.id))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
 
     for &(sub_z, count) in &parsed.terminal_substituents {
         for _ in 0..count {
@@ -2489,6 +2567,9 @@ pub fn fuse_ring_on_bond(
     }
     let u = mol.bonds[bond_idx].begin_atom;
     let v = mol.bonds[bond_idx].end_atom;
+    if u == v || u >= mol.atoms.len() || v >= mol.atoms.len() {
+        return Vec::new();
+    }
     let (ux, uy) = (mol.atoms[u].x, mol.atoms[u].y);
     let (vx, vy) = (mol.atoms[v].x, mol.atoms[v].y);
     let dx = vx - ux;
@@ -2496,15 +2577,23 @@ pub fn fuse_ring_on_bond(
     let len = (dx * dx + dy * dy).sqrt().max(1e-9);
     let tx = dx / len;
     let ty = dy / len;
-    let nx = -ty;
-    let ny = tx;
+    let midx = 0.5 * (ux + vx);
+    let midy = 0.5 * (uy + vy);
+    // Build the new ring on the side away from existing substituents of u/v (e.g. the ring being fused onto).
+    let side_load: f64 = [u, v]
+        .iter()
+        .flat_map(|&end| mol.neighbors(end))
+        .filter(|&(ni, _)| ni != u && ni != v)
+        .map(|(ni, _)| (mol.atoms[ni].x - midx) * -ty + (mol.atoms[ni].y - midy) * tx)
+        .sum();
+    let side = if side_load > 1e-9 { -1.0 } else { 1.0 };
+    let nx = -ty * side;
+    let ny = tx * side;
 
     let k_f = ring_size as f64;
     let half_angle = std::f64::consts::PI / k_f;
     let radius = len / (2.0 * half_angle.sin());
     let apothem = radius * half_angle.cos();
-    let midx = 0.5 * (ux + vx);
-    let midy = 0.5 * (uy + vy);
     let cx = midx + apothem * nx;
     let cy = midy + apothem * ny;
 
@@ -2841,6 +2930,102 @@ pub fn center_on_page(mols: &mut [ChemMolecule], page_width_pt: f64, page_height
     let dy = 0.5 * page_height_pt - 0.5 * (bounds.top + bounds.bottom);
     for m in mols.iter_mut() {
         shift_molecule(m, dx, dy);
+    }
+}
+
+/// MDL/CML/CT files from other programs store coordinates in angstroms (bonds ~1.5), which
+/// ChiralCraft would draw as 1.5 pt specks. Scale any molecule whose median bond is under 4 pt
+/// (no drawing style is that small) to `bond_length_pt`, about its own centre.
+pub fn rescale_angstrom_molecules(mols: &mut [ChemMolecule], bond_length_pt: f64) {
+    for m in mols {
+        let mut lens: Vec<f64> = m
+            .bonds
+            .iter()
+            .filter_map(|b| {
+                let (a1, a2) = (m.atoms.get(b.begin_atom)?, m.atoms.get(b.end_atom)?);
+                let d = (a2.x - a1.x).hypot(a2.y - a1.y);
+                (d > 1e-4).then_some(d)
+            })
+            .collect();
+        if lens.is_empty() {
+            continue;
+        }
+        lens.sort_by(|a, b| a.total_cmp(b));
+        let median = lens[lens.len() / 2];
+        if median >= 4.0 {
+            continue;
+        }
+        let k = bond_length_pt / median;
+        let n = m.atoms.len() as f64;
+        let cx = m.atoms.iter().map(|a| a.x).sum::<f64>() / n;
+        let cy = m.atoms.iter().map(|a| a.y).sum::<f64>() / n;
+        for a in &mut m.atoms {
+            a.x = cx + (a.x - cx) * k;
+            a.y = cy + (a.y - cy) * k;
+            a.z_coord *= k;
+        }
+    }
+}
+
+/// Largest atom/bond/caption id in `scene` (these share one id space in CDXML and warnings).
+pub fn max_scene_object_id(scene: &DocumentScene) -> u32 {
+    scene
+        .molecules
+        .iter()
+        .flat_map(|m| m.atoms.iter().map(|a| a.id).chain(m.bonds.iter().map(|b| b.id)))
+        .chain(scene.captions.iter().map(|c| c.id))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Give every atom and bond of `mols` a distinct id starting at `first` (separately parsed
+/// records all number from 1). Returns the next free id.
+pub fn renumber_molecule_ids(mols: &mut [ChemMolecule], first: u32) -> u32 {
+    let mut id = first.max(1);
+    for m in mols {
+        for a in &mut m.atoms {
+            a.id = id;
+            id += 1;
+        }
+        for b in &mut m.bonds {
+            b.id = id;
+            id += 1;
+        }
+    }
+    id
+}
+
+/// Places molecules imported from coordinate-less or per-record formats (SMILES lists, SDF, MOL,
+/// XYZ, ...) onto the page: overlapping records are spread into rows, and a drawing lying off the
+/// page (e.g. molfile coordinates centred on the origin) is centred on it.
+pub fn layout_imported_molecules(mols: &mut [ChemMolecule], page_width_pt: f64, page_height_pt: f64) {
+    const GAP: f64 = 28.8;
+    let bounds: Vec<Option<Rect2D>> = mols.iter().map(mol_bounds).collect();
+    let overlaps = bounds.iter().enumerate().any(|(i, a)| {
+        bounds[i + 1..].iter().any(|b| match (a, b) {
+            (Some(a), Some(b)) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom,
+            _ => false,
+        })
+    });
+    if overlaps {
+        let (mut x, mut y, mut row_h) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (m, b) in mols.iter_mut().zip(bounds.iter()) {
+            let Some(b) = b else { continue };
+            let (w, h) = (b.right - b.left, b.bottom - b.top);
+            if x > 0.0 && x + w > page_width_pt {
+                x = 0.0;
+                y += row_h + GAP;
+                row_h = 0.0;
+            }
+            shift_molecule(m, x - b.left, y - b.top);
+            x += w + GAP;
+            row_h = row_h.max(h);
+        }
+    }
+    if let Some(b) = selection_bounds(mols) {
+        if overlaps || b.left < 0.0 || b.top < 0.0 || b.right > page_width_pt || b.bottom > page_height_pt {
+            center_on_page(mols, page_width_pt, page_height_pt);
+        }
     }
 }
 
@@ -3349,30 +3534,14 @@ pub fn check_structure_scene(scene: &DocumentScene) -> Vec<SceneStructureWarning
 /// Checks enhanced-stereochemistry warnings in a CDXML document (e.g. `EnhancedStereoType="Or"`/`"And"`
 /// on an achiral compound -> `"This compound cannot possess relative stereochemistry."`).
 pub fn check_enhanced_stereo_warnings(cdxml: &CdxmlDocument) -> Vec<SceneStructureWarning> {
-    let mut caption_frag_occs = HashSet::new();
-    for (occ, el) in cdxml.elements.iter().enumerate() {
-        if el.tag == "fragment" {
-            let mut n_count = 0usize;
-            let mut b_count = 0usize;
-            let mut has_t = false;
-            for c in &el.children {
-                if let CdxmlNodeChild::Element(cid) = c {
-                    let ce = &cdxml.elements[*cid];
-                    if ce.tag == "n" {
-                        n_count += 1;
-                        has_t = ce.children.iter().any(|cc| {
-                            matches!(cc, CdxmlNodeChild::Element(tc) if cdxml.elements[*tc].tag == "t")
-                        });
-                    } else if ce.tag == "b" {
-                        b_count += 1;
-                    }
-                }
-            }
-            if n_count == 1 && b_count == 0 && has_t {
-                caption_frag_occs.insert(occ);
-            }
-        }
-    }
+    // Same criterion as `InteractiveDocument::from_cdxml`, so `molecule_idx` indexes `scene.molecules`.
+    let caption_frag_occs: HashSet<usize> = cdxml
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, el)| el.tag == "fragment" && caption_fragment_parts(cdxml, el).is_some())
+        .map(|(occ, _)| occ)
+        .collect();
 
     let markers_by_occ = cdxml.extract_enhanced_stereo();
     let mut out = Vec::new();
@@ -4677,6 +4846,21 @@ mod tests {
         center_on_page(&mut ms, 540.0, 719.75);
         assert!(join_atoms(&mut ms[0], 0, 1));
         assert!(ms[0].bonds.is_empty());
+
+        // Imported records stacked on the origin get spread out and moved onto the page.
+        let mut stacked = vec![bad_hb.clone(), bad_hb.clone(), bad_hb.clone()];
+        layout_imported_molecules(&mut stacked, 540.0, 719.75);
+        let bs: Vec<Rect2D> = stacked.iter().filter_map(mol_bounds).collect();
+        for (i, a) in bs.iter().enumerate() {
+            assert!(a.left >= 0.0 && a.top >= 0.0 && a.right <= 540.0 && a.bottom <= 719.75);
+            for b in &bs[i + 1..] {
+                assert!(!(a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom));
+            }
+        }
+        // Already on-page, non-overlapping drawings are left untouched.
+        let before = stacked.clone();
+        layout_imported_molecules(&mut stacked, 540.0, 719.75);
+        assert_eq!(before[2].atoms[0].x, stacked[2].atoms[0].x);
     }
 
     #[test]
@@ -6145,5 +6329,131 @@ mod tests {
         let suz = hits.iter().find(|h| h.reaction_name.contains("Suzuki")).expect("Suzuki hit");
         assert!(suz.synthon_b.atoms.iter().any(|a| a.z == 5), "Suzuki synthon_b must contain Boron");
         assert!(suz.synthon_b.atoms.iter().filter(|a| a.z == 8).count() >= 2, "Suzuki synthon_b must contain -B(OH)2");
+    }
+
+    #[test]
+    fn test_audit_expand_contracted_label_ids_unique_and_bounds() {
+        let f3c = analyze_left_endpoint_label("F3C", LabelJustification::Right, 1, true);
+        let mut mol = ChemMolecule::new();
+        // Ids >= 100 used to collide with `atoms.len() + bonds.len() + 100`.
+        let root = mol.add_atom(ChemAtom::new(103, 6));
+        let other = mol.add_atom(ChemAtom::new(104, 6));
+        mol.add_bond(105, root, other, 1, BondDisplay::Solid);
+        assert!(expand_contracted_label(&mut mol, 99, &f3c, 14.40).is_err());
+        expand_contracted_label(&mut mol, root, &f3c, 14.40).unwrap();
+        let mut ids: Vec<u32> = mol.atoms.iter().map(|a| a.id).chain(mol.bonds.iter().map(|b| b.id)).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "expanded atoms/bonds must get fresh ids");
+    }
+
+    #[test]
+    fn test_audit_from_cdxml_idless_captions_get_unique_ids() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" ?>
+<CDXML><page id="1">
+<fragment id="2"><n p="10 10"><t><s>Cap A</s></t></n></fragment>
+<fragment id="3"><n p="50 10"><t><s>Cap B</s></t></n></fragment>
+</page></CDXML>"#;
+        let cdxml = CdxmlDocument::parse(xml).unwrap();
+        let doc = InteractiveDocument::from_cdxml(&cdxml);
+        assert_eq!(doc.scene.captions.len(), 2);
+        assert_ne!(doc.scene.captions[0].id, doc.scene.captions[1].id);
+        assert!(doc.scene.captions.iter().all(|c| c.id > 3));
+    }
+
+    #[test]
+    fn test_audit_to_cdxml_roundtrip_keeps_bonds_with_zero_and_duplicate_ids() {
+        let mut doc = InteractiveDocument::new_saved_seed("ids.cdxml", DocumentSettings::acs_document_1996());
+        let mut mol = ChemMolecule::new();
+        let a = mol.add_atom(ChemAtom::new(0, 6));
+        let b = mol.add_atom(ChemAtom::new(1000, 6));
+        let c = mol.add_atom(ChemAtom::new(1000, 8));
+        let d = mol.add_atom(ChemAtom::new(0, 7));
+        mol.atoms[b].x = 14.4;
+        mol.atoms[c].x = 28.8;
+        mol.atoms[d].x = 43.2;
+        mol.add_bond(0, a, b, 1, BondDisplay::Solid);
+        mol.add_bond(0, b, c, 1, BondDisplay::Solid);
+        mol.add_bond(0, c, d, 1, BondDisplay::Solid);
+        doc.scene.molecules.push(mol);
+        let xml = doc.to_cdxml().to_xml_string();
+        let back = InteractiveDocument::from_cdxml(&CdxmlDocument::parse(&xml).unwrap());
+        assert_eq!(back.scene.molecules.len(), 1);
+        assert_eq!(back.scene.molecules[0].atoms.len(), 4);
+        assert_eq!(back.scene.molecules[0].bonds.len(), 3, "no bond may be lost to ambiguous atom ids");
+    }
+
+    #[test]
+    fn test_audit_enhanced_stereo_index_skips_only_real_captions() {
+        // Fragment 1 is a CustomLabel single-node molecule (kept as molecule 0); fragment 2 is achiral with an "Or" marker.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" ?>
+<CDXML><page id="1">
+<fragment id="2"><n id="3" p="10 10" Element="46" CustomLabel="Pd"><t><s>Pd</s></t></n></fragment>
+<fragment id="4"><n id="5" p="50 10" EnhancedStereoType="Or" EnhancedStereoGroupNum="1"/><n id="6" p="64 10"/><b id="7" B="5" E="6"/></fragment>
+</page></CDXML>"#;
+        let cdxml = CdxmlDocument::parse(xml).unwrap();
+        let doc = InteractiveDocument::from_cdxml(&cdxml);
+        assert_eq!(doc.scene.molecules.len(), 2);
+        let w = check_enhanced_stereo_warnings(&cdxml);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].molecule_idx, Some(1));
+        assert_eq!(w[0].object_id, 5);
+    }
+
+    #[test]
+    fn test_audit_tokenizer_rejects_absurd_counts() {
+        assert!(tokenize_condensed_formula("CH99999999").is_none());
+        assert!(tokenize_condensed_formula("CH3").is_some());
+    }
+
+    #[test]
+    fn test_audit_fuse_ring_builds_away_from_existing_ring() {
+        let mut mol = ChemMolecule::new();
+        let a0 = mol.add_atom(ChemAtom::new(1, 6));
+        let a1 = mol.add_atom(ChemAtom::new(2, 6));
+        mol.atoms[a1].x = 14.4;
+        let b0 = mol.add_bond(3, a0, a1, 1, BondDisplay::Solid);
+        let first = fuse_ring_on_bond(&mut mol, b0, 6, false);
+        assert_eq!(first.len(), 4);
+        let first_side: f64 = first.iter().map(|&i| mol.atoms[i].y).sum::<f64>().signum();
+        let second = fuse_ring_on_bond(&mut mol, b0, 6, false);
+        assert_eq!(second.len(), 4);
+        for &i in &second {
+            assert!(mol.atoms[i].y.signum() == -first_side, "fused ring must lie on the opposite side");
+        }
+    }
+
+    #[test]
+    fn test_rescale_angstrom_molecules_only_touches_tiny_drawings() {
+        let mut tiny = ChemMolecule::new();
+        tiny.add_atom(ChemAtom::new(1, 6));
+        let mut b = ChemAtom::new(2, 6);
+        b.x = 1.5;
+        tiny.add_atom(b);
+        tiny.add_bond(3, 0, 1, 1, BondDisplay::Solid);
+        let mut normal = tiny.clone();
+        normal.atoms[1].x = 14.4;
+        let mut mols = vec![tiny, normal];
+        rescale_angstrom_molecules(&mut mols, 14.4);
+        let len = |m: &ChemMolecule| (m.atoms[1].x - m.atoms[0].x).abs();
+        assert!((len(&mols[0]) - 14.4).abs() < 1e-9);
+        assert!((len(&mols[1]) - 14.4).abs() < 1e-9);
+        assert_eq!(mols[1].atoms[0].x, 0.0, "pt-scaled drawings stay where they are");
+    }
+
+    #[test]
+    fn test_undo_redo_revert_restore_settings() {
+        let mut doc = InteractiveDocument::new_saved_seed("t", DocumentSettings::acs_document_1996());
+        let orig = doc.settings.bond_length_pt;
+        doc.settings.bond_length_pt = orig + 5.0;
+        doc.apply_scene_tx("Settings", |_, _| {});
+        assert!(doc.undo());
+        assert_eq!(doc.settings.bond_length_pt, orig);
+        assert!(!doc.is_dirty());
+        assert!(doc.redo());
+        assert_eq!(doc.settings.bond_length_pt, orig + 5.0);
+        assert!(doc.revert());
+        assert_eq!(doc.settings.bond_length_pt, orig);
     }
 }
